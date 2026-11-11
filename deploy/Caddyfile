@@ -4,26 +4,48 @@
 # browser's same-origin rules simple: no CORS, no cross-site cookie saga, and a
 # content policy that can stay strict because every script comes from here.
 #
-# VEIL_TLS=internal swaps the public CA for Caddy's local one. That needs a
-# global option rather than a per-site one, and a global option cannot be
-# conditional - so internal mode is selected by editing the one line below rather
-# than by an environment variable. A deployment either has a public name or it
-# does not, and an operator reading this file should see which case they are in.
+# This deployment issues its own certificates from Caddy's internal CA.
 #
-#   public certificate (default):   leave this block commented out
-#   local CA (no DNS yet, or no public name):
-#
-#     {
-#         local_certs
-#     }
+# An IP address cannot have a public certificate - ACME only issues for names -
+# and this host has no DNS name. A self-signed certificate still gives an
+# https:// origin, which is what the web client needs: crypto.subtle requires a
+# secure context, and https://<ip> is one even when no public CA vouches for it.
+# The browser warns once; the client works after the warning is accepted.
 
 {
 	# An explicit default so Caddy does not try to be clever about which
-	# interface to bind. In a container that is always :80 and :443.
+	# interface to bind. In a container that is always :443 for this config.
 	admin off
 }
 
-{$VEIL_DOMAIN} {
+# The site, with the certificate loaded explicitly.
+#
+# Two things Caddy does not do on its own for a bare IP:
+#
+#   - It will not obtain a public certificate (ACME only issues for names), so
+#     the issuer is the internal CA.
+#   - An address-only site (`:443` with no host in the site key) gets no TLS
+#     connection policy at all. The log says "listening only on the HTTPS port
+#     but has no TLS connection policies", and every handshake fails with
+#     `tlsv1 alert internal error` before any HTTP is seen - so the failure looks
+#     like a broken certificate rather than a missing policy.
+#
+# `on_demand` makes Caddy issue and present a certificate for whatever SNI
+# arrives, which is what an IP-only host needs: there is no name to pre-issue
+# for, because the client connects to the address itself.
+#
+# The abuse warning Caddy logs for on-demand TLS is about a *public* deployment
+# where anyone can request a certificate for any hostname. Here the internal CA
+# only signs, nothing leaves the machine, and the certificate is refused by any
+# browser that has not trusted this CA - so the warning does not apply.
+:443 {
+	tls internal {
+		on_demand
+	}
+
+	@notThisHost not host {$VEIL_DOMAIN}
+	respond @notThisHost 421
+
 	# ---- Security headers ----
 	#
 	# The page is a self-contained application: it loads one script and one
@@ -92,10 +114,4 @@
 		output stdout
 		format console
 	}
-}
-
-# Anything that arrives on the bare IP rather than the name gets a redirect, so a
-# half-configured DNS record fails visibly instead of serving the app over http.
-:80 {
-	redir https://{$VEIL_DOMAIN}{uri} permanent
 }

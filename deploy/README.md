@@ -28,12 +28,42 @@ Three facts about the relay worth knowing before you deploy it:
   and how many devices each participant has. That is stated in the
   [threat model](threat-model.md) rather than glossed over.
 
+## Two deployment shapes
+
+| | with a DNS name | IP only |
+|---|---|---|
+| certificate | Let's Encrypt, trusted | Caddy's internal CA, browser warns |
+| port 80 | needed for the ACME challenge | not used |
+| `tls` line in Caddyfile | `tls {$VEIL_EMAIL}` or omitted | `tls internal { on_demand }` |
+| browser warning | none | once, then never again for that host |
+
+Both produce an `https://` origin, which is what the client actually needs. The
+difference is whether the certificate is vouched for by a public CA or only by
+this host.
+
+### IP only: the `on_demand` detail
+
+An address-only site in Caddy — `:443` with no host in the site key — gets no TLS
+connection policy on its own. The symptom is specific and misleading: the log says
+`listening only on the HTTPS port but has no TLS connection policies`, and every
+handshake fails with `tlsv1 alert internal error` *before any HTTP is seen*. It
+looks like a broken certificate; it is a missing policy.
+
+`tls internal { on_demand }` fixes it, because there is no name to pre-issue a
+certificate for — the client connects to the address, so the certificate has to be
+produced for whatever SNI arrives.
+
+Caddy logs an abuse warning for on-demand TLS. It does not apply here: the
+internal CA only signs, nothing leaves the machine, and the certificate is refused
+by any browser that has not trusted this CA.
+
 ## Requirements
 
 - A host with a public IPv4 address.
-- **A DNS name.** Caddy needs one to obtain a certificate; an IP address alone
-  cannot have one. Point an A record at the host.
-- Ports 80 and 443 reachable. ACME uses 80 for the HTTP challenge.
+- Docker with the compose plugin.
+- Port 443 free. Port 80 is only needed for a public certificate.
+- **A DNS name OR acceptance of a self-signed certificate.** There is no third
+  option: no public CA issues certificates for bare IP addresses.
 
 ## Deploy
 
@@ -48,58 +78,66 @@ $EDITOR .env          # set VEIL_DOMAIN
 ./up.sh
 ```
 
-`up.sh` does the preflight that catches the failures which otherwise look like
-application bugs:
+`up.sh` is safe to re-run — that is how an update is applied. It does the
+preflight that catches the failures which otherwise look like application bugs:
 
-1. the name resolves, and to this host
-2. ports 80/443 are free
-3. builds, starts, waits for the relay's own healthcheck
-4. waits for the certificate, then fetches `/health` over https
-5. checks that a **foreign Origin is refused** — the one websocket rule that is
+1. port 443 is free, or already held by this stack
+2. builds, starts, waits for the relay's own healthcheck
+3. waits for TLS, then fetches `/health` over https
+4. checks that a **foreign Origin is refused** — the one websocket rule that is
    invisible until a browser fails to connect
+5. checks that a real upgrade reaches the relay at all
 
-If it finishes, the deployment works. If it stops, it names which of those five
-is wrong.
+## Without a DNS name
 
-## Without a DNS name yet
+Uncomment nothing: set `VEIL_DOMAIN` to the IP and the Caddyfile's
+`tls internal { on_demand }` already covers it. The origin becomes
+`https://<ip>`, which *is* a secure context, so the web client works after the
+browser's certificate warning is accepted.
 
-Two options, both honest about the trade:
+To remove the warning, import the CA once. It lives in the caddy container at
+`/data/caddy/pki/authorities/local/root.crt`:
 
-**Use Caddy's local CA.** Uncomment the `local_certs` global option in
-`Caddyfile`, set `VEIL_DOMAIN=HOST_ADDRESS`, and start. The origin becomes
-`https://HOST_ADDRESS`, which *is* a secure context, so the web client works
-after the browser's certificate warning is accepted. Fine for testing and for a
-deployment with no public name.
+```bash
+docker cp veil-caddy:/data/caddy/pki/authorities/local/root.crt ./veil-ca.crt
+```
 
-**Use a name you control.** If you own any domain, a subdomain A record is
-enough and gives a real certificate with no warnings.
+Import `veil-ca.crt` into the OS trust store, or into the browser, on each device
+that will connect. This is a real trust decision — you are trusting this host to
+vouch for itself — and it is appropriate for a personal deployment, not for one
+whose users you cannot ask.
 
-What does not work is plain `http://HOST_ADDRESS:8080`. The page will load and
-the client will refuse to create keys, because `crypto.subtle` is undefined on an
-insecure origin. That is the client doing its job.
+What does not work is plain `http://<ip>:8080`. The page will load and the client
+will refuse to create keys, because `crypto.subtle` is undefined on an insecure
+origin. That is the client doing its job.
 
-### For HOST_ADDRESS specifically
+## This deployment: HOST_ADDRESS
 
-Because `VEIL_DOMAIN` also feeds the relay's origin allow-list, the two modes need
-matching values:
+Live and verified:
 
-| mode | `VEIL_DOMAIN` | `Caddyfile` | relay origin |
-|---|---|---|---|
-| local CA | `HOST_ADDRESS` | uncomment `local_certs` | `https://HOST_ADDRESS` |
-| real certificate | `chat.example.com` | unchanged | `https://chat.example.com` |
+| check | result |
+|---|---|
+| `/health` over public https | `200 ok` |
+| `/` (3.1 KB page) | `200` |
+| `/wasm/veil.wasm` | `200`, 180 KB |
+| `/app.js` | `200`, 76 KB |
+| certificate chain | `Verify return code: 0 (ok)` against the local CA |
+| foreign `Origin` on `/ws` | `403` |
+| deployment's own `Origin` on `/ws` | upgrade reaches the relay |
+| CSP / HSTS / `X-Frame-Options` | present on every response |
 
-The compose file derives the allow-list from `VEIL_DOMAIN`, so there is one value
-to get right rather than two that can disagree.
+Port 80 belongs to another service on this host, so Caddy binds 443 only. That is
+recorded in the compose file rather than left as a surprise.
 
 ## Operating it
 
 ```bash
 docker compose ps
 docker compose logs -f relay
-docker compose logs -f caddy      # certificate issuance lives here
+docker compose logs -f caddy      # TLS and certificate issuance live here
 
-# relay statistics, without exposing anything
-docker compose port caddy 443     # should be 0.0.0.0:443
+# confirm nothing but 443 is published
+docker compose ps --format '{{.Name}} {{.Ports}}'
 ```
 
 ### Backup
@@ -118,7 +156,7 @@ not bring back an identity: those live on devices, and the relay never had them.
 
 ```bash
 git pull
-cd deploy && docker compose up -d --build
+cd deploy && ./up.sh
 ```
 
 The relay's schema migrations run on startup and are additive, so an existing
@@ -130,7 +168,7 @@ database keeps working. Downgrading is not supported — the schema moves forwar
 |---|---|
 | relay image | distroless, non-root, read-only root filesystem |
 | relay exposure | no published ports; reachable only from Caddy |
-| caddy | non-root, no new privileges |
+| caddy | no new privileges |
 | websocket origins | explicit allow-list; empty means native clients only |
 | HSTS | one year, including subdomains |
 | content policy | `script-src 'self' 'wasm-unsafe-eval'`, no third-party anything |
@@ -145,3 +183,5 @@ database keeps working. Downgrading is not supported — the schema moves forwar
   store and a presence model, neither of which exists.
 - **No account recovery.** The identity lives on the device. Lose the device,
   lose the account; that is a property of the protocol, not of this deployment.
+- **No public trust for the certificate.** Any device that connects has to accept
+  the warning or import the CA once.

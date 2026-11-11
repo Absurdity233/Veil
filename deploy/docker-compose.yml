@@ -82,7 +82,9 @@ services:
         condition: service_healthy
 
     ports:
-      - "80:80"
+      # 443 only. Port 80 on this host is already serving something else, and an
+      # IP-only deployment cannot pass an ACME HTTP challenge, so holding 80
+      # would break the other service for no gain.
       - "443:443"
       - "443:443/udp"
 
@@ -96,7 +98,10 @@ services:
 
     environment:
       VEIL_DOMAIN: "${VEIL_DOMAIN}"
-      VEIL_TLS: "${VEIL_TLS:-}"
+      # The volume exists but nothing reads it: the Caddyfile hard-codes
+      # local_certs, and a global option cannot be selected by an environment
+      # variable. Present so the compose file and the Caddyfile agree about the
+      # deployment's shape.
 
     security_opt:
       - no-new-privileges:true
