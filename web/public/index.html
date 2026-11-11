@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veil</title>
+<!--
+  The same policy the Android client gets from its manifest: no third-party
+  script, no inline script, no eval. The wasm module is compiled without a JIT
+  path that would need 'unsafe-eval'.
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:;">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app" class="app">
+
+  <header class="topbar">
+    <div class="brand">Veil</div>
+    <div class="relay-controls">
+      <label class="field">
+        <span>Relay</span>
+        <input id="relay-url" type="url" value="ws://127.0.0.1:8080/ws" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>Your id</span>
+        <input id="user-id" type="text" placeholder="alice" spellcheck="false">
+      </label>
+      <button id="connect" class="primary">Connect</button>
+      <span id="link-badge" class="badge offline" role="status" aria-live="polite">offline</span>
+    </div>
+  </header>
+
+  <p id="status" class="status" role="alert" hidden></p>
+
+  <main class="split">
+    <aside class="peers">
+      <form id="add-peer" class="add-peer">
+        <input id="peer-id" type="text" placeholder="Add someone by id" spellcheck="false"
+               aria-label="Peer id to add">
+        <button type="submit">Add</button>
+      </form>
+      <ul id="peer-list" class="peer-list" aria-label="Conversations"></ul>
+      <p id="peers-empty" class="empty">
+        No conversations yet. Add someone by their id once both clients are
+        connected to the same relay.
+      </p>
+    </aside>
+
+    <section class="chat" id="chat" hidden>
+      <header class="chat-header">
+        <h2 id="chat-peer"></h2>
+        <button id="toggle-safety" class="ghost" aria-expanded="false"
+                aria-controls="safety">Verify</button>
+      </header>
+
+      <div id="safety" class="safety" hidden>
+        <p class="safety-title" id="safety-title"></p>
+        <p class="safety-number" id="safety-number"></p>
+        <p class="safety-hint">
+          Compare this with the same screen on the other device. If the digits
+          match, no one is sitting in the middle.
+        </p>
+      </div>
+
+      <ol id="transcript" class="transcript" aria-live="polite"></ol>
+
+      <form id="compose" class="compose">
+        <textarea id="draft" rows="1" placeholder="Message" aria-label="Message"></textarea>
+        <button type="submit" class="primary" id="send">Send</button>
+      </form>
+    </section>
+
+    <section class="chat placeholder" id="chat-placeholder">
+      <p>Select a conversation, or add someone by their id.</p>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span id="version"></span>
+    <span class="sep">·</span>
+    <span>
+      Keys are held in this browser only. Clearing site data destroys the
+      identity — there is no recovery.
+    </span>
+  </footer>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

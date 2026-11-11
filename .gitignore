@@ -14,7 +14,12 @@ captures/
 # Native build output
 *.o
 *.so
+*.dylib
+*.dll
+*.lib
+*.exp
 *.exe
+*.obj
 !build/host/*.exe
 
 # Go
@@ -22,6 +27,28 @@ server/veil.db
 server/veil.db-*
 server/veil-relay
 server/veil-relay.exe
+
+# Node
+node_modules/
+web/dist/
+web/build/
+
+# Test and build logs from local runs.
+*.log
+web/e2e-out.txt
+web/e2e-err.txt
+web/all-out.txt
+web/all-err.txt
+
+# Web build products are *checked in* on purpose.
+#
+# veil.wasm and app.js are the artifacts the page loads. Regenerating them needs
+# Emscripten, which is a 470 MB toolchain most people looking at this repository
+# will not have — so a clone that cannot build them would not run at all. The CI
+# job rebuilds both from source and would fail if they were stale or broken.
+!web/public/wasm/veil.js
+!web/public/wasm/veil.wasm
+!web/public/app.js
 
 # Vendored archives
 _vendor/

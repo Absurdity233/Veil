@@ -24,3 +24,4 @@ rootProject.name = "Veil"
 
 include(":app")
 include(":core-native")
+include(":desktop")

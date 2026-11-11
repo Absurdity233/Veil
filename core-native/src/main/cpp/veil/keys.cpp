@@ -124,8 +124,36 @@ bool PreKeys::rotate(const Identity& identity, uint32_t one_time_count) {
     crypto::ed25519_sign(current.signature, identity.sign_priv, message, len);
     veil::wipe(message, sizeof(message));
 
-    // One-time prekeys are keyed on the signed id so an id names exactly one
-    // generation. Spent ones from earlier generations stay as tombstones.
+    // One-time prekeys live and die with their generation.
+    //
+    // A rotation used to append a fresh batch on top of the previous one, so a
+    // device that rotated on a schedule accumulated private keys it could never
+    // use, and the published set grew with every rotation.
+    //
+    // But the *retired* generation has to be kept, for the same reason the
+    // retired signed prekey is: a peer that fetched the previous bundle just
+    // before the rotation names one of its one-time keys in its first message,
+    // and establishInbound() refuses a header it cannot match. So exactly two
+    // generations survive - current and retired - and everything older is
+    // wiped.
+    {
+        std::vector<OneTimePreKey> kept;
+        kept.reserve(kTombstoneKeep + one_time_count);
+
+        for (auto& ot : one_time) {
+            // The generation an id belongs to is its signed prekey id.
+            const uint32_t generation = ot.id / 1000u;
+            const bool live = generation == current.id ||
+                              (has_retired && generation == retired.id);
+            if (!live) {
+                veil::wipe(ot.priv, sizeof(ot.priv));
+                continue;
+            }
+            kept.push_back(ot);
+        }
+        one_time = std::move(kept);
+    }
+
     for (uint32_t i = 0; i < one_time_count; ++i) {
         OneTimePreKey ot;
         ot.id = current.id * 1000u + i;

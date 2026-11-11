@@ -4,9 +4,10 @@
 
 **End-to-end encrypted chat, with a relay that cannot read a single character.**
 
-A Signal-protocol engine written from the primitives up in C++17, an Android
-client in Kotlin and Compose, and a Go relay that routes ciphertext it has no
-key for.
+One Signal-protocol engine written from the primitives up in C++17, and three
+clients that all call it: Android (Kotlin + Compose, via JNI), desktop (JVM,
+via JNA) and browser (TypeScript, via WebAssembly). The Go relay routes
+ciphertext it holds no key for.
 
 [Architecture](docs/architecture.md) ·
 [Protocol](docs/protocol.md) ·
@@ -20,6 +21,25 @@ key for.
 
 ---
 
+## Three clients, one engine
+
+The interesting claim this repository makes is that the protocol lives in
+exactly one place. The same C++ compiles to an Android `.so`, a desktop shared
+library and a 121 KB `.wasm`; each client is a transport, a key store and a
+window.
+
+| | Android | Desktop | Web |
+|---|---|---|---|
+| Language | Kotlin + Compose | Kotlin + Swing | TypeScript |
+| Engine binding | JNI | JNA over a C ABI | WebAssembly |
+| Keys at rest | Android Keystore | owner-only files | non-extractable `CryptoKey` |
+| Tests | 3 interop | 6 interop | 4 e2e + 19 unit |
+
+The C ABI (`core-native/src/main/cpp/veil/veil_c.h`) is the seam. It exists so a
+new platform does not need to reimplement the protocol and does not need to link
+C++ — which is exactly why the desktop client is 600 lines of Kotlin instead of a
+second crypto implementation.
+
 ## What this is
 
 Most "encrypted chat" projects encrypt in the client and decrypt in the server,
@@ -28,24 +48,25 @@ Veil does the opposite: the server is a switchboard, and the cryptography lives
 where the keys live.
 
 ```
-   Alice's phone                                  Bob's phone
- ┌──────────────────────┐                     ┌──────────────────────┐
- │  Compose UI          │                     │  Compose UI          │
- │  ChatController      │                     │  ChatController      │
- │  ──────────────────  │                     │  ──────────────────  │
- │  X3DH                │                     │  X3DH                │
- │  Double Ratchet      │                     │  Double Ratchet      │
- └──────────┬───────────┘                     └──────────┬───────────┘
-            │          WebSocket, opaque bytes           │
-            └────────────────────┬───────────────────────┘
-                                 ▼
-                     ┌───────────────────────┐
-                     │  Go relay             │
-                     │  routes + outbox      │
-                     │  no keys, no plaintext│
-                     └───────────┬───────────┘
-                                 ▼
-                           SQLite file
+   Alice's phone            Alice's browser             Bob's phone
+ ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+ │  Compose UI      │    │  DOM             │    │  Compose UI      │
+ │  ──────────────  │    │  ──────────────  │    │  ──────────────  │
+ │  VeilEngine      │    │  VeilEngine      │    │  VeilEngine      │
+ │   (JNI)          │    │  (.wasm)         │    │  (JNI)           │
+ │  X3DH            │    │  X3DH            │    │  X3DH            │
+ │  Double Ratchet  │    │  Double Ratchet  │    │  Double Ratchet  │
+ └────────┬─────────┘    └────────┬─────────┘    └────────┬─────────┘
+          │      WebSocket, opaque bytes  │               │
+          └───────────────┬───────────────┴───────────────┘
+                          ▼
+              ┌───────────────────────┐
+              │  Go relay             │
+              │  routes + outbox      │
+              │  no keys, no plaintext│
+              └───────────┬───────────┘
+                          ▼
+                    SQLite file
 ```
 
 The relay knows *who* sent *how many bytes* to *whom*. It cannot recover message
@@ -70,7 +91,7 @@ to the reasoning.
 | A one-time prekey that is only popped at the relay can still be used twice | Every one-time key carries a persisted *consumed* flag — [why](docs/protocol.md#one-time-prekeys-are-spent-locally-not-only-at-the-relay) |
 | Duplicated delivery is normal on an at-least-once relay | `DUPLICATE` is acknowledged silently; only a real authentication failure is surfaced |
 | A dropped socket must not silently lose a message | The exact encrypted bytes are queued and replayed — re-encrypting would advance the chain twice — [why](docs/architecture.md#data-flow-for-one-message) |
-| Ratchet state on disk is as sensitive as the identity | Sessions, pins and prekey state go through Keystore-backed AES-GCM |
+| Ratchet state on disk is as sensitive as the identity | Sessions, pins and prekey state are AES-GCM sealed — Keystore on Android, files on desktop, a non-extractable `CryptoKey` in the browser |
 
 ## By the numbers
 
@@ -79,7 +100,8 @@ to the reasoning.
 | Protocol engine | C++17, no I/O, and no allocation between handshake and message |
 | Primitive layer | vendored Monocypher — X25519, XChaCha20-Poly1305, Ed25519, HKDF-SHA512, BLAKE2b |
 | Relay | Go, single static binary, distroless image, non-root, read-only root |
-| Tests | 226 host assertions, 29 relay tests, 3 end-to-end interop tests, 8 fuzz targets |
+| Clients | Android (JNI), desktop (JNA), browser (121 KB wasm) |
+| Tests | 226 host + 62 C ABI assertions, 29 relay tests, 13 interop, 24 web, 8 fuzz targets |
 | Wire overhead | 257 bytes on the first frame (prekey header), 57 bytes thereafter |
 
 ## Quick start
@@ -88,23 +110,37 @@ to the reasoning.
 # relay
 cd server && go build -o ../build/relay/veil-relay . && ./../build/relay/veil-relay
 
-# client
+# android
 ./gradlew :app:assembleDebug
+
+# desktop — needs the C ABI library first
+cmake -S desktop -B build/abi -DCMAKE_BUILD_TYPE=Release && cmake --build build/abi
+./gradlew :desktop:run
+
+# web
+cd web && npm ci && npm run build && npm run serve   # http://127.0.0.1:5173
 ```
 
-The client's default relay URL is `ws://10.0.2.2:8080/ws`, which is the host
-loopback as seen from an emulator. On a real device, point it at the relay's LAN
-or public address.
+The Android client's default relay URL is `ws://10.0.2.2:8080/ws`, which is the
+host loopback as seen from an emulator. The desktop and web clients default to
+`ws://127.0.0.1:8080/ws`.
+
+A browser page served from anywhere other than the relay's own origin has to be
+listed in `VEIL_ALLOWED_ORIGINS`, or the handshake is refused with a 403:
+
+```bash
+VEIL_ALLOWED_ORIGINS=http://127.0.0.1:5173 ./build/relay/veil-relay
+```
 
 Full instructions, including TLS, origins and the container healthcheck, are in
 [Building and running](docs/building.md).
 
 ## Design notes worth reading
 
-- **[Architecture](docs/architecture.md)** — what lives where, and why the crypto
-  engine has no I/O.
+- **[Architecture](docs/architecture.md)** — what lives where, why the crypto
+  engine has no I/O, and what the C ABI exists for.
 - **[Protocol](docs/protocol.md)** — every frame, field and state transition the
-  client and relay agree on.
+  clients and relay agree on.
 - **[Threat model](docs/threat-model.md)** — what is defended, what leaks, and
   what is simply not implemented.
 
@@ -116,11 +152,13 @@ techniques that address them and none of them are here.
 ## Status
 
 Working, tested, and honest about its limits: one-to-one only, no group
-messaging, no multi-device, no push notifications, no account recovery. The
-[session layer](docs/architecture.md) persists, so a restart keeps the ability to
-talk; conversation history does not, so a restart loses the transcript.
+messaging, no multi-device, no push notifications, no account recovery. Sessions
+persist, so a restart keeps the ability to talk; conversation history does not,
+so a restart loses the transcript.
 
-Contributions are welcome, particularly failing tests.
+The three clients are three separate identities, not three devices of one
+account. That is the real gap between this and a finished product, and it is a
+design question rather than an implementation one.
 
 ## Licence
 

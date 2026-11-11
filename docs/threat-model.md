@@ -94,12 +94,26 @@ send no `Origin` header and are accepted; a browser cannot forge its absence.
 ## What a compromised device gets
 
 A stolen, unlocked device with the app installed can read the transcript, because
-the plaintext is on it. The identity lives in the Android Keystore behind a
-non-exportable key, so the blob on disk is useless without the device — but the
-device itself is enough.
+the plaintext is on it. How much the *keys* are worth depends on the platform,
+and the three clients differ enough that the difference has to be stated:
 
-`FLAG_SECURE` keeps plaintext out of screenshots, screen recordings and the
-recents thumbnail. It does not stop a camera pointed at the screen.
+| | Key store | A stolen copy of the data is | Script on a live session |
+|---|---|---|---|
+| Android | hardware-backed Keystore | useless | — |
+| Desktop | `0600` file in `~/.veil` | **the identity** | — |
+| Web | non-extractable AES-GCM `CryptoKey` in IndexedDB | useless | **the identity** |
+
+The desktop is the weakest of the three: a file with owner-only permissions is
+all a JVM can offer without a platform-specific keystore, and anyone who can read
+that file as you can impersonate you. The web client is stronger against a stolen
+profile and weaker against script injection on the page, which is the opposite
+trade-off — a non-extractable key cannot be exfiltrated by a script that only
+gets its handle, but a script running in the page can just call `decrypt`.
+
+Neither is a hardware root of trust. Only the Android client has one.
+
+`FLAG_SECURE` keeps Android plaintext out of screenshots, screen recordings and
+the recents thumbnail. It does not stop a camera pointed at the screen.
 
 ## What is not implemented
 
@@ -108,11 +122,15 @@ Named plainly, because a threat model that omits its gaps is a sales document:
 - **No group messaging.** One-to-one only.
 - **No push notifications.** A message waits in the outbox until the client
   reconnects.
-- **No multi-device.** The identity is bound to one device's Keystore. Losing the
-  device loses the identity, and there is no recovery.
+- **No multi-device.** The three clients are three separate identities, not three
+  devices of one account. The identity is bound to one device's key store, and
+  losing it loses the account; there is no linking flow and no recovery.
 - **No sealed sender.** The relay knows the sender.
 - **No protection against a malicious client.** A modified app can leak whatever
   it can read. Nothing here prevents that, and nothing here claims to.
+- **No protection against a malicious page on the web client's origin.** The
+  content policy blocks third-party and inline script, which is a real barrier,
+  but a same-origin compromise is game over for any browser application.
 
 ## Reporting
 

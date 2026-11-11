@@ -1,4 +1,4 @@
-# Hashes and shell scripts must keep their exact bytes.
+﻿# Hashes and shell scripts must keep their exact bytes.
 #
 # The repository lives on Windows, where Git's default autocrlf rewrites line
 # endings on checkout. That is harmless for source and fatal for two things
@@ -21,3 +21,10 @@ core-native/src/main/cpp/third_party/monocypher/** -text
 *.jar binary
 *.png binary
 *.apk binary
+*.wasm binary -text -diff -merge
+
+# The Emscripten glue and the bundled page script are generated, but they are
+# checked in so a clone runs without the toolchain. They are text and LF is
+# their native form.
+web/public/app.js text eol=lf
+web/public/wasm/veil.js text eol=lf

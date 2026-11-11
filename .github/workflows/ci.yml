@@ -91,6 +91,111 @@ jobs:
       - name: Fuzz
         run: ./build-fuzz-parsers -max_total_time=90 -max_len=4096
 
+  # The same C ABI the desktop and web clients call. Tested through the header,
+  # with the caller owning every buffer, because that is how JNA and the wasm
+  # build both use it.
+  c-abi:
+    name: C ABI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S core-native/host -B build/host -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build/host --parallel
+
+      - name: Test
+        run: ctest --test-dir build/host --output-on-failure
+
+  # The desktop client. It reaches the engine through JNA rather than JNI, which
+  # is the point: same C ABI, different language binding.
+  desktop:
+    name: desktop client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Build the C ABI library
+        run: |
+          cmake -S desktop -B build/abi -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/abi --parallel
+
+      - name: Build the relay the tests start
+        run: |
+          mkdir -p build/relay
+          cd server && go build -trimpath -o ../build/relay/veil-relay .
+
+      - name: Test
+        run: |
+          chmod +x gradlew
+          ./gradlew :desktop:test --console=plain
+
+  # The web client: the engine compiled to wasm, plus the TypeScript that drives
+  # it. The e2e tests start the real relay and run a real handshake.
+  web:
+    name: web client
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.61
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the wasm module
+        run: npm run build:wasm
+
+      - name: Type-check
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Bundle
+        run: npm run build:bundle
+
+      - name: Build the relay the tests start
+        working-directory: .
+        run: |
+          mkdir -p build/relay
+          cd server && go build -trimpath -o ../build/relay/veil-relay .
+
+      - name: Test
+        run: node --test --test-timeout=60000 test/wire.test.mjs test/wasm.test.mjs test/e2e.test.mjs
+
+      - name: Upload the wasm module
+        uses: actions/upload-artifact@v4
+        with:
+          name: veil-wasm
+          path: |
+            web/public/wasm/veil.js
+            web/public/wasm/veil.wasm
+
   relay:
     name: relay (go)
     runs-on: ubuntu-latest

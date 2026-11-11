@@ -7,6 +7,9 @@
 #include <windows.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
+#elif defined(__EMSCRIPTEN__)
+// A wasm module has no syscall and no filesystem here. Entropy arrives through
+// the host callback installed with set_platform_random_source.
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -18,7 +21,13 @@
 namespace veil {
 namespace {
 
-#if !defined(_WIN32)
+// The external source, when one has been installed. Only the Emscripten build
+// needs it; keeping the variable on every platform costs a pointer and makes
+// the code path identical, which is easier to reason about than a #ifdef
+// ladder inside secure_random().
+RandomSource g_external_source = nullptr;
+
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 bool read_urandom(void* out, size_t n) {
     int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
@@ -46,11 +55,27 @@ bool read_urandom(void* out, size_t n) {
 
 }  // namespace
 
+void set_platform_random_source(RandomSource fn) {
+    g_external_source = fn;
+}
+
 bool secure_random(void* out, size_t n) {
     if (n == 0) return true;
     if (out == nullptr) return false;
 
-#if defined(_WIN32)
+    // An installed source takes precedence everywhere, not only on wasm: a
+    // host that has gone to the trouble of supplying entropy is usually doing
+    // so because it knows something the generic path does not.
+    if (g_external_source != nullptr) {
+        return g_external_source(static_cast<uint8_t*>(out), n) != 0;
+    }
+
+#if defined(__EMSCRIPTEN__)
+    // No built-in source exists in wasm. Failing here is the correct answer:
+    // generating keys from an uninitialised buffer would be worse than
+    // refusing to start.
+    return false;
+#elif defined(_WIN32)
     NTSTATUS st = ::BCryptGenRandom(nullptr, static_cast<PUCHAR>(out),
                                     static_cast<ULONG>(n),
                                     BCRYPT_USE_SYSTEM_PREFERRED_RNG);

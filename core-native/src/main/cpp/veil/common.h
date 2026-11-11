@@ -60,26 +60,36 @@ inline void wipe(Bytes& b) {
     b.clear();
 }
 
+// Multi-byte integers are big-endian, everywhere, with no exceptions.
+//
+// This is not a style preference. The wire format is shared with the Go relay
+// (which reads with be32) and the Kotlin client (which reads with a big-endian
+// Reader), so a little-endian producer on this side is a bug that only shows up
+// as "the relay rejected the prekeys" - every published prekey set was
+// unreadable because the count field arrived byte-swapped.
+//
+// Internal state serialisation uses the same helpers, deliberately: one
+// convention means a reader never has to remember which blob it is parsing.
 inline void put_u32(uint8_t* out, uint32_t v) {
-    out[0] = static_cast<uint8_t>(v);
-    out[1] = static_cast<uint8_t>(v >> 8);
-    out[2] = static_cast<uint8_t>(v >> 16);
-    out[3] = static_cast<uint8_t>(v >> 24);
+    out[0] = static_cast<uint8_t>(v >> 24);
+    out[1] = static_cast<uint8_t>(v >> 16);
+    out[2] = static_cast<uint8_t>(v >> 8);
+    out[3] = static_cast<uint8_t>(v);
 }
 
 inline uint32_t get_u32(const uint8_t* in) {
-    return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) |
-           (static_cast<uint32_t>(in[2]) << 16) | (static_cast<uint32_t>(in[3]) << 24);
+    return (static_cast<uint32_t>(in[0]) << 24) | (static_cast<uint32_t>(in[1]) << 16) |
+           (static_cast<uint32_t>(in[2]) << 8) | static_cast<uint32_t>(in[3]);
 }
 
 inline void put_u64(uint8_t* out, uint64_t v) {
-    put_u32(out, static_cast<uint32_t>(v));
-    put_u32(out + 4, static_cast<uint32_t>(v >> 32));
+    put_u32(out, static_cast<uint32_t>(v >> 32));
+    put_u32(out + 4, static_cast<uint32_t>(v));
 }
 
 inline uint64_t get_u64(const uint8_t* in) {
-    return static_cast<uint64_t>(get_u32(in)) |
-           (static_cast<uint64_t>(get_u32(in + 4)) << 32);
+    return (static_cast<uint64_t>(get_u32(in)) << 32) |
+           static_cast<uint64_t>(get_u32(in + 4));
 }
 
 inline bool constant_time_equal(const uint8_t* a, const uint8_t* b, size_t n) {

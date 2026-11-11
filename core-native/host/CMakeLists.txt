@@ -51,3 +51,29 @@ endif()
 
 enable_testing()
 add_test(NAME veil_host_tests COMMAND veil_host_tests)
+
+# The C ABI, tested the way the desktop and web clients use it: through the
+# header, with the caller owning every buffer.
+add_executable(veil_c_abi_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_c_abi.cpp
+        ${VEIL_SRC}/veil/veil_c.cpp
+        ${VEIL_SRC}/veil/crypto.cpp
+        ${VEIL_SRC}/veil/keys.cpp
+        ${VEIL_SRC}/veil/random.cpp
+        ${VEIL_SRC}/veil/ratchet.cpp
+        ${VEIL_SRC}/veil/engine.cpp)
+
+target_include_directories(veil_c_abi_tests PRIVATE ${VEIL_SRC})
+target_link_libraries(veil_c_abi_tests PRIVATE monocypher_host)
+
+if(MSVC)
+    target_compile_options(veil_c_abi_tests PRIVATE /W4)
+else()
+    target_compile_options(veil_c_abi_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
+if(WIN32)
+    target_link_libraries(veil_c_abi_tests PRIVATE bcrypt)
+endif()
+
+add_test(NAME veil_c_abi_tests COMMAND veil_c_abi_tests)

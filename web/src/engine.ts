@@ -1,0 +1,449 @@
+/**
+ * The WebAssembly build of the protocol engine, behind the C ABI.
+ *
+ * The module is the same C++ the phone runs. Nothing in this file implements
+ * any cryptography: it allocates buffers in the wasm heap, calls the ABI, and
+ * copies the result back out. That is the whole design goal — one engine, three
+ * clients, no second implementation to drift.
+ *
+ * Entropy deserves a note. A wasm module has no syscall and no /dev/urandom, so
+ * before any engine is created this module installs crypto.getRandomValues as
+ * the engine's RNG. If the browser refuses it — a non-secure origin disables it —
+ * key generation fails rather than proceeding with predictable bytes.
+ */
+
+interface EmscriptenModule {
+  HEAPU8: Uint8Array;
+  _malloc(size: number): number;
+  _free(ptr: number): void;
+  _veil_engine_new(): number;
+  _veil_engine_restore(secrets: number, size: number): number;
+  _veil_engine_free(handle: number): void;
+  _veil_identity_secrets(handle: number, out: number, size: number): number;
+  _veil_identity_public(handle: number, out: number, size: number): number;
+  _veil_identity_binding(handle: number, out: number, size: number): number;
+  _veil_sign_challenge(
+    handle: number, challenge: number, size: number, out: number, outSize: number,
+  ): number;
+  _veil_rotate_prekeys(handle: number, out: number, size: number): number;
+  _veil_export_prekey_set(handle: number, out: number, size: number): number;
+  _veil_needs_prekey_refill(handle: number, lowWater: number): number;
+  _veil_export_prekey_state(handle: number, out: number, size: number): number;
+  _veil_import_prekey_state(handle: number, data: number, size: number): number;
+  _veil_measure_session(handle: number, peer: number): number;
+  _veil_establish_outbound(handle: number, peer: number, bundle: number, size: number): number;
+  _veil_session_state(handle: number, peer: number): number;
+  _veil_export_session(handle: number, peer: number, out: number, size: number): number;
+  _veil_import_session(handle: number, peer: number, data: number, size: number): number;
+  _veil_drop_session(handle: number, peer: number): void;
+  _veil_export_peer_registry(handle: number, out: number, size: number): number;
+  _veil_import_peer_registry(handle: number, data: number, size: number): number;
+  _veil_encrypt(
+    handle: number, peer: number, plain: number, plainSize: number,
+    out: number, outSize: number,
+  ): number;
+  _veil_decrypt(
+    handle: number, peer: number, frame: number, frameSize: number,
+    out: number, outSize: number, outLen: number,
+  ): number;
+  _veil_safety_number(handle: number, peer: number, out: number, size: number): number;
+  _veil_version(major: number, minor: number, patch: number): void;
+  _veil_install_web_rng(): number;
+  _veil_web_rng_ready(): number;
+}
+
+declare const createVeilModule: (opts?: unknown) => Promise<EmscriptenModule>;
+
+/** Status codes, mirroring `veil_c.h`. */
+export const Status = {
+  OK: 0,
+  BAD_BUNDLE: 1,
+  BAD_SIGNATURE: 2,
+  IDENTITY_CHANGED: 3,
+  NO_SESSION: 4,
+  AUTH_FAILED: 5,
+  DUPLICATE: 6,
+
+  ERR_NULL_HANDLE: -1,
+  ERR_NULL_ARG: -2,
+  ERR_BUFFER_TOO_SMALL: -3,
+  ERR_OUT_OF_MEMORY: -4,
+  ERR_NO_RANDOM: -5,
+  ERR_BAD_PARAM: -6,
+  ERR_INTERNAL: -7,
+} as const;
+
+export type StatusCode = (typeof Status)[keyof typeof Status];
+
+export enum SessionState {
+  NoPeer = 0,
+  PinnedOnly = 1,
+  Ready = 2,
+}
+
+const utf8 = new TextEncoder();
+
+/**
+ * A handle plus the scratch space a call needs.
+ *
+ * wasm has no garbage collector and this module deliberately does not hand out
+ * memory to JavaScript, so every call allocates inside the wasm heap, copies in,
+ * calls, copies out, and frees. The buffers are reused across calls to keep a
+ * chat from churning the heap.
+ */
+export class VeilEngine {
+  private static module: EmscriptenModule | null = null;
+
+  /**
+   * Loads the module.
+   *
+   * `wasmUrl` is a URL the page can fetch — in the browser it is a relative
+   * path that resolves against the document. `jsUrl` is where the Emscripten
+   * glue lives, and is separate because the two play different games: the glue
+   * is an ES module import (so it must be a real specifier), while the .wasm is
+   * fetched as bytes. A test runner needs to point both at file:// URLs; a page
+   * leaves both as defaults.
+   */
+  static async load(
+    wasmUrl: string,
+    options: { jsUrl?: string; wasmBinary?: ArrayBuffer } = {},
+  ): Promise<void> {
+    if (VeilEngine.module) return;
+
+    const jsUrl = options.jsUrl ?? wasmUrl.replace(/\.wasm$/, ".js");
+    const factory = (await import(/* @vite-ignore */ jsUrl))
+      .default as typeof createVeilModule;
+
+    const mod = await factory({
+      // Node cannot fetch a file:// URL, so a runner may hand the bytes in
+      // directly. In a browser this is undefined and the module fetches.
+      ...(options.wasmBinary ? { wasmBinary: options.wasmBinary } : {}),
+      locateFile: (path: string) => (path.endsWith(".wasm") ? wasmUrl : path),
+      print: () => {},
+      printErr: () => {},
+    });
+
+    // Refuse to start without entropy. The check is not paranoia: an insecure
+    // origin silently disables crypto.getRandomValues, and generating keys from
+    // whatever is left would be worse than showing an error.
+    if (!mod._veil_web_rng_ready()) {
+      throw new Error(
+        "no secure randomness available: serve this page over https or from localhost",
+      );
+    }
+    mod._veil_install_web_rng();
+
+    VeilEngine.module = mod;
+  }
+
+  /** The ABI version, so a stale .wasm is loud rather than subtle. */
+  static version(): string {
+    const mod = VeilEngine.require();
+    const ptr = mod._malloc(12);
+    try {
+      mod._veil_version(ptr, ptr + 4, ptr + 8);
+      const view = new DataView(mod.HEAPU8.buffer, ptr, 12);
+      return `${view.getInt32(0, true)}.${view.getInt32(4, true)}.${view.getInt32(8, true)}`;
+    } finally {
+      mod._free(ptr);
+    }
+  }
+
+  static create(): VeilEngine {
+    const handle = VeilEngine.require()._veil_engine_new();
+    if (handle === 0) {
+      throw new Error("could not create the engine (no entropy source?)");
+    }
+    return new VeilEngine(handle);
+  }
+
+  static restore(secrets: Uint8Array): VeilEngine {
+    const mod = VeilEngine.require();
+    const ptr = mod._malloc(secrets.length);
+    try {
+      mod.HEAPU8.set(secrets, ptr);
+      const handle = mod._veil_engine_restore(ptr, secrets.length);
+      if (handle === 0) throw new Error("could not restore the identity");
+      return new VeilEngine(handle);
+    } finally {
+      mod._free(ptr);
+    }
+  }
+
+  private static require(): EmscriptenModule {
+    if (!VeilEngine.module) throw new Error("call VeilEngine.load() first");
+    return VeilEngine.module;
+  }
+
+  private constructor(private readonly handle: number) {}
+
+  // ---- Identity ---------------------------------------------------------
+
+  identitySecrets(): Uint8Array {
+    return this.produceFixed(96, (mod, out) =>
+      mod._veil_identity_secrets(this.handle, out, 96));
+  }
+
+  publicIdentity(): Uint8Array {
+    return this.produceFixed(64, (mod, out) =>
+      mod._veil_identity_public(this.handle, out, 64));
+  }
+
+  signChallenge(challenge: Uint8Array): Uint8Array {
+    const mod = VeilEngine.require();
+    const c = mod._malloc(challenge.length);
+    const out = mod._malloc(64);
+    try {
+      mod.HEAPU8.set(challenge, c);
+      const n = mod._veil_sign_challenge(this.handle, c, challenge.length, out, 64);
+      if (n < 0) throw new Error(`sign challenge failed (${n})`);
+      return mod.HEAPU8.slice(out, out + n);
+    } finally {
+      mod._free(c);
+      mod._free(out);
+    }
+  }
+
+  // ---- Prekeys ----------------------------------------------------------
+
+  rotatePreKeys(): Uint8Array {
+    return this.produceVariable(4096, (mod, out, size) =>
+      mod._veil_rotate_prekeys(this.handle, out, size));
+  }
+
+  exportPreKeySet(): Uint8Array {
+    return this.produceVariable(4096, (mod, out, size) =>
+      mod._veil_export_prekey_set(this.handle, out, size));
+  }
+
+  needsPreKeyRefill(lowWater: number): boolean {
+    return VeilEngine.require()._veil_needs_prekey_refill(this.handle, lowWater) === 1;
+  }
+
+  exportPreKeyState(): Uint8Array {
+    return this.produceVariable(8192, (mod, out, size) =>
+      mod._veil_export_prekey_state(this.handle, out, size));
+  }
+
+  importPreKeyState(state: Uint8Array): boolean {
+    return this.callWithBlob(state, (mod, ptr, size) =>
+      mod._veil_import_prekey_state(this.handle, ptr, size)) === Status.OK;
+  }
+
+  // ---- Sessions ---------------------------------------------------------
+
+  establishOutbound(peer: string, bundle: Uint8Array): StatusCode {
+    const mod = VeilEngine.require();
+    const p = this.withPeer(peer, (ptr) => {
+      const b = mod._malloc(bundle.length);
+      try {
+        mod.HEAPU8.set(bundle, b);
+        return mod._veil_establish_outbound(this.handle, ptr, b, bundle.length);
+      } finally {
+        mod._free(b);
+      }
+    });
+    return p as StatusCode;
+  }
+
+  sessionState(peer: string): SessionState {
+    const mod = VeilEngine.require();
+    const code = this.withPeer(peer, (ptr) => mod._veil_session_state(this.handle, ptr));
+    return code === 2 ? SessionState.Ready : code === 1 ? SessionState.PinnedOnly
+      : SessionState.NoPeer;
+  }
+
+  exportSession(peer: string): Uint8Array | null {
+    const mod = VeilEngine.require();
+    return this.withPeer(peer, (ptr) => {
+      const need = mod._veil_measure_session(this.handle, ptr);
+      if (need <= 0) return null;
+      const out = mod._malloc(need);
+      try {
+        const n = mod._veil_export_session(this.handle, ptr, out, need);
+        if (n < 0) return null;
+        return mod.HEAPU8.slice(out, out + n);
+      } finally {
+        mod._free(out);
+      }
+    });
+  }
+
+  importSession(peer: string, blob: Uint8Array): boolean {
+    const mod = VeilEngine.require();
+    return this.withPeer(peer, (ptr) => {
+      const b = mod._malloc(blob.length);
+      try {
+        mod.HEAPU8.set(blob, b);
+        return mod._veil_import_session(this.handle, ptr, b, blob.length) === Status.OK;
+      } finally {
+        mod._free(b);
+      }
+    });
+  }
+
+  dropSession(peer: string): void {
+    const mod = VeilEngine.require();
+    this.withPeer(peer, (ptr) => {
+      mod._veil_drop_session(this.handle, ptr);
+      return 0;
+    });
+  }
+
+  exportPeerRegistry(): Uint8Array {
+    return this.produceVariable(65536, (mod, out, size) =>
+      mod._veil_export_peer_registry(this.handle, out, size));
+  }
+
+  importPeerRegistry(blob: Uint8Array): boolean {
+    return this.callWithBlob(blob, (mod, ptr, size) =>
+      mod._veil_import_peer_registry(this.handle, ptr, size)) === Status.OK;
+  }
+
+  // ---- Messaging --------------------------------------------------------
+
+  encrypt(peer: string, plain: Uint8Array): Uint8Array | null {
+    const mod = VeilEngine.require();
+    return this.withPeer(peer, (ptr) => {
+      // Plaintext plus the largest frame overhead (prekey header + ratchet
+      // header + MAC), so a first frame fits without a second attempt.
+      const capacity = plain.length + 512;
+      const p = mod._malloc(plain.length || 1);
+      const out = mod._malloc(capacity);
+      try {
+        if (plain.length) mod.HEAPU8.set(plain, p);
+        const n = mod._veil_encrypt(this.handle, ptr, p, plain.length, out, capacity);
+        if (n < 0) return null;
+        return mod.HEAPU8.slice(out, out + n);
+      } finally {
+        mod._free(p);
+        mod._free(out);
+      }
+    });
+  }
+
+  /**
+   * Decrypts a frame.
+   *
+   * Returns the plaintext with the status. `DUPLICATE` is a normal event on an
+   * at-least-once relay and is surfaced as a status rather than as an error,
+   * because the caller has to tell it apart from a failed authentication.
+   *
+   * The buffer is sized from the frame and never probed first: a probe would
+   * have to decrypt to know the length, and that consumes the message key.
+   */
+  decrypt(peer: string, frame: Uint8Array): { plain: Uint8Array | null; status: StatusCode } {
+    const mod = VeilEngine.require();
+    return this.withPeer(peer, (ptr) => {
+      const capacity = frame.length + 64;
+      const f = mod._malloc(frame.length);
+      const out = mod._malloc(capacity);
+      const len = mod._malloc(4);
+      try {
+        mod.HEAPU8.set(frame, f);
+        const status = mod._veil_decrypt(
+          this.handle, ptr, f, frame.length, out, capacity, len,
+        );
+        if (status !== Status.OK) return { plain: null, status: status as StatusCode };
+
+        const n = new DataView(mod.HEAPU8.buffer, len, 4).getUint32(0, true);
+        return { plain: mod.HEAPU8.slice(out, out + n), status: Status.OK };
+      } finally {
+        mod._free(f);
+        mod._free(out);
+        mod._free(len);
+      }
+    });
+  }
+
+  safetyNumber(peer: string): string | null {
+    const mod = VeilEngine.require();
+    return this.withPeer(peer, (ptr) => {
+      const out = mod._malloc(64);
+      try {
+        if (mod._veil_safety_number(this.handle, ptr, out, 64) !== Status.OK) return null;
+        // The ABI writes a NUL-terminated ASCII string.
+        let end = out;
+        while (end < out + 64 && mod.HEAPU8[end] !== 0) end++;
+        return new TextDecoder().decode(mod.HEAPU8.slice(out, end));
+      } finally {
+        mod._free(out);
+      }
+    });
+  }
+
+  close(): void {
+    VeilEngine.require()._veil_engine_free(this.handle);
+  }
+
+  // ---- Plumbing ---------------------------------------------------------
+
+  private produceFixed(size: number, call: (mod: EmscriptenModule, out: number) => number):
+    Uint8Array {
+    const mod = VeilEngine.require();
+    const out = mod._malloc(size);
+    try {
+      const n = call(mod, out);
+      if (n < 0) throw new Error(`native call failed (${n})`);
+      return mod.HEAPU8.slice(out, out + n);
+    } finally {
+      mod._free(out);
+    }
+  }
+
+  /**
+   * Runs a producing call, growing once if the documented bound was wrong.
+   *
+   * The bound is generous, but a caller should not crash because an
+   * implementation detail changed; a retry with twice the room is cheaper than
+   * a page of arithmetic that has to be kept in sync with the C side.
+   */
+  private produceVariable(
+    initial: number,
+    call: (mod: EmscriptenModule, out: number, size: number) => number,
+  ): Uint8Array {
+    const mod = VeilEngine.require();
+    let size = initial;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const out = mod._malloc(size);
+      try {
+        const n = call(mod, out, size);
+        if (n >= 0) return mod.HEAPU8.slice(out, out + n);
+        if (n !== Status.ERR_BUFFER_TOO_SMALL) throw new Error(`native call failed (${n})`);
+      } finally {
+        mod._free(out);
+      }
+      size *= 2;
+    }
+    throw new Error("native call kept refusing the buffer size");
+  }
+
+  private callWithBlob(
+    blob: Uint8Array,
+    call: (mod: EmscriptenModule, ptr: number, size: number) => number,
+  ): number {
+    const mod = VeilEngine.require();
+    const p = mod._malloc(blob.length || 1);
+    try {
+      if (blob.length) mod.HEAPU8.set(blob, p);
+      return call(mod, p, blob.length);
+    } finally {
+      mod._free(p);
+    }
+  }
+
+  /** Copies a peer id into the heap, runs `body`, and always frees it. */
+  private withPeer<T>(peer: string, body: (ptr: number) => T): T {
+    const mod = VeilEngine.require();
+    const bytes = utf8.encode(peer);
+    const p = mod._malloc(bytes.length + 1);
+    try {
+      mod.HEAPU8.set(bytes, p);
+      mod.HEAPU8[p + bytes.length] = 0;
+      return body(p);
+    } finally {
+      mod._free(p);
+    }
+  }
+}
