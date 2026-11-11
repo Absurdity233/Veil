@@ -37,6 +37,11 @@ std::string toString(const veil::Bytes& b) {
     return std::string(b.begin(), b.end());
 }
 
+// A frame carries a prekey header when bit 0 of the flags byte is set.
+bool hasPreKeyHeader(const veil::Bytes& frame) {
+    return !frame.empty() && (frame[0] & veil::WireMessage::kFlagPreKey) != 0;
+}
+
 }  // namespace
 
 int main() {
@@ -507,6 +512,264 @@ int main() {
               "relay-shaped bundle establishes");
     }
 
+    section("identity binding ties the two key halves together");
+    {
+        // Without this, a relay could pair a victim's DH key with its own
+        // signing key: the prekey signature would verify, X3DH would run
+        // against the victim's DH key, and the safety number would not move.
+        Identity id;
+        check(id.generate(), "binding identity");
+
+        uint8_t binding[kBindingSize];
+        id.bindingSignature(binding);
+        check(Identity::verifyBinding(id.dh_pub, id.sign_pub, binding),
+              "binding verifies");
+
+        // The DH half swapped for somebody else's: the signature is over the
+        // original bytes, so it must fail.
+        Identity other;
+        other.generate();
+        check(!Identity::verifyBinding(other.dh_pub, id.sign_pub, binding),
+              "binding rejects a swapped DH key");
+
+        // The signing half swapped: same story from the other side.
+        check(!Identity::verifyBinding(id.dh_pub, other.sign_pub, binding),
+              "binding rejects a swapped signing key");
+
+        // A flipped signature byte is not accepted.
+        uint8_t broken[kBindingSize];
+        std::memcpy(broken, binding, kBindingSize);
+        broken[7] ^= 0xFF;
+        check(!Identity::verifyBinding(id.dh_pub, id.sign_pub, broken),
+              "binding rejects a corrupt signature");
+
+        // And the engine wrapper agrees.
+        Engine e;
+        e.createIdentity();
+        Bytes pub = e.exportIdentityPublic();
+        Bytes sig = e.exportIdentityBinding();
+        check(pub.size() == kIdentitySize && sig.size() == kBindingSize,
+              "identity blob and binding sizes");
+        check(Engine::verifyIdentityBinding(pub.data(), sig.data()),
+              "engine binding verifies");
+    }
+
+    section("prekey signature covers the identity DH key");
+    {
+        Identity bob;
+        bob.generate();
+        PreKeys bp;
+        bp.generate(bob, 11, 2);
+
+        check(verifySignedPreKey(bob.dh_pub, bob.sign_pub,
+                                 bp.signed_pub, bp.signed_signature),
+              "signed prekey verifies");
+
+        // The exact attack the binding closes: keep the victim's DH key, swap
+        // in another signing key. A signature that only covered signed_pub
+        // would still verify here, because the same signer produced it.
+        Identity evil;
+        evil.generate();
+        check(!verifySignedPreKey(bob.dh_pub, evil.sign_pub,
+                                  bp.signed_pub, bp.signed_signature),
+              "spliced signing key rejected by the prekey signature");
+
+        // A bundle built that way must not establish a session either.
+        PreKeyBundle spliced = publishBundle(bob, bp, &bp.one_time[0]);
+        std::memcpy(spliced.identity_sign_pub, evil.sign_pub, 32);
+        Bytes wire = spliced.serialize();
+        PreKeyBundle parsed;
+        check(PreKeyBundle::deserialize(parsed, wire.data(), wire.size()),
+              "spliced bundle retrieves");
+
+        Engine alice;
+        alice.createIdentity();
+        check(alice.establishOutboundStatus("bob", wire.data(), wire.size()) ==
+                  Engine::Result::BadSignature,
+              "spliced bundle refused");
+    }
+
+    section("prekey header names the signed prekey it used");
+    {
+        // A peer may download a bundle just before a rotation and send its
+        // first message afterwards. The previous private half has to stay
+        // usable, and a header naming a key we never held must be refused
+        // rather than silently re-keyed.
+        Identity bob;
+        bob.generate();
+        PreKeys bp;
+        bp.generate(bob, 21, 2);
+
+        const uint32_t first_id = bp.signed_prekey_id;
+        const PreKeyBundle stale_bundle = publishBundle(bob, bp, &bp.one_time[0]);
+
+        // Rotate: the old prekey is now retired, not gone.
+        PreKeys rotated;
+        rotated.generate(bob, 22, 2);
+        rotated.retired_signed_id = first_id;
+        rotated.has_retired_signed = true;
+        rotated.retired_signed_pub[0] = 0;  // only the private half matters here
+
+        Identity alice;
+        alice.generate();
+        Session as;
+        check(as.establishOutbound(alice, stale_bundle), "stale bundle establishes");
+
+        // The header carries the retired id, and the receiver must still be
+        // able to complete the handshake with it.
+        Session bs;
+        check(bs.establishInbound(bob, bp, as.pendingPreKeyHeader()),
+              "handshake against the retired prekey");
+
+        // A header naming an id we never issued is refused.
+        PreKeyHeader unknown = as.pendingPreKeyHeader();
+        unknown.signed_prekey_id = 9999;
+        Session nope;
+        check(!nope.establishInbound(bob, bp, unknown),
+              "unknown signed prekey id refused");
+
+        // zero is not a valid signed prekey id either; it would otherwise
+        // look like "no prekey" and re-key the session silently.
+        unknown.signed_prekey_id = 0;
+        Session zero;
+        check(!zero.establishInbound(bob, bp, unknown),
+              "missing signed prekey id refused");
+    }
+
+    section("prekey header travels until the peer answers");
+    {
+        // The first frame can be lost - the socket drops, the outbox entry is
+        // discarded, the peer restarts. Dropping the header after the first
+        // send would orphan the session with no way to retry.
+        Engine a, b;
+        a.createIdentity();
+        b.createIdentity();
+        a.generatePreKeys(1, 2);
+        b.generatePreKeys(1, 2);
+
+        Bytes bundle = b.publishBundle(0);
+        check(a.establishOutboundStatus("bob", bundle.data(), bundle.size()) == Engine::Result::Ok,
+              "outbound establishes");
+
+        Bytes f1 = a.encrypt("bob", reinterpret_cast<const uint8_t*>("lost"), 4);
+        Bytes f2 = a.encrypt("bob", reinterpret_cast<const uint8_t*>("also lost"), 9);
+        check(hasPreKeyHeader(f2), "second frame still carries the header");
+
+        // Only the third frame reaches Bob. The session must still come up,
+        // because the header travelled with it.
+        Bytes f3 = a.encrypt("bob", reinterpret_cast<const uint8_t*>("arrived"), 7);
+        Bytes p;
+        check(b.decrypt("alice", f3.data(), f3.size(), p), "late first frame decrypts");
+        check(toString(p) == "arrived", "late first frame content");
+
+        // Now that Bob has answered, the header is gone and frames shrink.
+        Bytes r = b.encrypt("alice", reinterpret_cast<const uint8_t*>("ack"), 3);
+        Bytes rp;
+        check(a.decrypt("bob", r.data(), r.size(), rp), "reply decrypts");
+        Bytes f4 = a.encrypt("bob", reinterpret_cast<const uint8_t*>("after"), 5);
+        check(!hasPreKeyHeader(f4), "header dropped once the peer answered");
+    }
+
+    section("a pinned identity cannot be replaced outbound");
+    {
+        // The inbound path always refused a re-handshake under a known label.
+        // The outbound path used to overwrite the pin silently, so a hostile
+        // relay could hand back a bundle for a different identity and the user
+        // would keep talking to a stranger with an unchanged safety number.
+        Engine alice, bob, mallory;
+        alice.createIdentity();
+        bob.createIdentity();
+        mallory.createIdentity();
+        bob.generatePreKeys(1, 2);
+        mallory.generatePreKeys(1, 2);
+
+        Bytes bob_bundle = bob.publishBundle(0);
+        check(alice.establishOutboundStatus("bob", bob_bundle.data(), bob_bundle.size()) ==
+                  Engine::Result::Ok,
+              "first bind succeeds");
+        std::string good = alice.safetyNumber("bob");
+
+        Bytes evil_bundle = mallory.publishBundle(0);
+        check(alice.establishOutboundStatus("bob", evil_bundle.data(), evil_bundle.size()) ==
+                  Engine::Result::IdentityChanged,
+              "re-binding to another identity refused");
+        check(alice.safetyNumber("bob") == good, "safety number unchanged");
+
+        // The session still works after the refused swap.
+        Bytes f = alice.encrypt("bob", reinterpret_cast<const uint8_t*>("ok"), 2);
+        Bytes p;
+        check(bob.decrypt("alice", f.data(), f.size(), p), "session survives");
+    }
+
+    section("safety number covers the signing key too");
+    {
+        // The safety number used to hash only the two DH keys. That left the
+        // key which authenticates prekeys outside what the user verifies.
+        Engine a, b;
+        a.createIdentity();
+        b.createIdentity();
+        a.generatePreKeys(1, 2);
+        b.generatePreKeys(1, 2);
+
+        Bytes bundle = b.publishBundle(0);
+        a.establishOutbound("bob", bundle.data(), bundle.size());
+        Bytes f = a.encrypt("bob", reinterpret_cast<const uint8_t*>("x"), 1);
+        Bytes p;
+        b.decrypt("alice", f.data(), f.size(), p);
+
+        std::string an = a.safetyNumber("bob");
+        std::string bn = b.safetyNumber("alice");
+        check(!an.empty() && an == bn, "both sides agree with both halves");
+
+        // 25 digits in five groups of five.
+        check(an.size() == 29, "safety number length");
+        check(an[5] == ' ' && an[11] == ' ' && an[17] == ' ' && an[23] == ' ',
+              "safety number grouping");
+    }
+
+    section("pinned identities survive a restart");
+    {
+        Engine a;
+        a.createIdentity();
+        a.generatePreKeys(1, 2);
+        Bytes self_bundle = a.publishBundle(0);
+
+        Engine b;
+        b.createIdentity();
+        b.generatePreKeys(1, 2);
+        b.establishOutbound("alice", self_bundle.data(), self_bundle.size());
+        std::string before = b.safetyNumber("alice");
+
+        Bytes registry = b.exportPeerRegistry();
+        check(!registry.empty(), "registry exports");
+
+        // A fresh process restores the same identity plus the pins, but not
+        // the sessions.
+        Bytes secrets = b.exportIdentitySecrets();
+        Engine b2;
+        check(b2.restoreIdentity(secrets.data(), secrets.data() + kKeySize),
+              "identity restores");
+        check(b2.importPeerRegistry(registry.data(), registry.size()),
+              "registry imports");
+        check(b2.safetyNumber("alice") == before, "safety number survives a restart");
+
+        // And the pin still blocks a different identity for that label.
+        Identity other;
+        other.generate();
+        PreKeys op;
+        op.generate(other, 1, 1);
+        Bytes evil = publishBundle(other, op, &op.one_time[0]).serialize();
+        check(b2.establishOutboundStatus("alice", evil.data(), evil.size()) ==
+                  Engine::Result::IdentityChanged,
+              "restored pin still refuses a different identity");
+
+        // Dropping the session must not clear the pin: otherwise anyone could
+        // re-bind the label right after a session reset.
+        b2.dropSession("alice");
+        check(b2.establishOutboundStatus("alice", evil.data(), evil.size()) ==
+                  Engine::Result::IdentityChanged,
+              "dropping a session keeps the pin");
+    }
     section("ratchet does not move backwards");
     {
         // Alice sends two messages; Bob reads only the first, then replies.

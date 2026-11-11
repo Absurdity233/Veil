@@ -7,6 +7,19 @@
 
 namespace veil {
 
+namespace {
+
+// A pinned identity always has a DH half. The signing half is zero-filled
+// until a bundle or prekey header has supplied it, which lets the engine tell
+// "pinned DH only" from "pinned both" without a second flag.
+bool hasSignHalf(const std::array<uint8_t, kIdentitySize>& known) {
+    uint8_t acc = 0;
+    for (size_t i = kKeySize; i < kIdentitySize; ++i) acc |= known[i];
+    return acc != 0;
+}
+
+}  // namespace
+
 // ---- Wire framing ------------------------------------------------------
 
 Bytes WireMessage::encode(const Session& session, const RatchetMessage& msg) {
@@ -78,9 +91,32 @@ Bytes Engine::exportIdentitySecrets() const {
 
 Bytes Engine::exportIdentityPublic() const {
     Bytes out;
-    out.reserve(kKeySize + 32);
+    out.reserve(kIdentitySize);
     out.insert(out.end(), identity_.dh_pub, identity_.dh_pub + kKeySize);
     out.insert(out.end(), identity_.sign_pub, identity_.sign_pub + 32);
+    return out;
+}
+
+Bytes Engine::exportIdentityBinding() const {
+    uint8_t sig[kBindingSize];
+    identity_.bindingSignature(sig);
+    Bytes out(sig, sig + sizeof(sig));
+    veil::wipe(sig, sizeof(sig));
+    return out;
+}
+
+bool Engine::verifyIdentityBinding(const uint8_t identity[kIdentitySize],
+                                   const uint8_t binding[kBindingSize]) {
+    if (identity == nullptr || binding == nullptr) return false;
+    return Identity::verifyBinding(identity, identity + kKeySize, binding);
+}
+
+Bytes Engine::signChallenge(const uint8_t* data, size_t size) const {
+    if (data == nullptr && size != 0) return {};
+    uint8_t sig[kSigSize];
+    crypto::ed25519_sign(sig, identity_.sign_priv, data, size);
+    Bytes out(sig, sig + sizeof(sig));
+    veil::wipe(sig, sizeof(sig));
     return out;
 }
 
@@ -134,24 +170,62 @@ bool Engine::hasSession(const std::string& peer) const {
 }
 
 bool Engine::establishOutbound(const std::string& peer, const uint8_t* bundle, size_t size) {
-    PreKeyBundle parsed;
-    if (!PreKeyBundle::deserialize(parsed, bundle, size)) return false;
-
-    Session session;
-    if (!session.establishOutbound(identity_, parsed)) return false;
-
-    std::memcpy(peer_identity_[peer].data(), parsed.identity_dh_pub, kKeySize);
-    sessions_[peer] = std::move(session);
-    return true;
+    return establishOutboundStatus(peer, bundle, size) == Result::Ok;
 }
 
-bool Engine::establishInbound(const std::string& peer, const PreKeyHeader& header) {
-    Session session;
-    if (!session.establishInbound(identity_, prekeys_, header)) return false;
+Engine::Result Engine::establishOutboundStatus(const std::string& peer,
+                                               const uint8_t* bundle, size_t size) {
+    PreKeyBundle parsed;
+    if (!PreKeyBundle::deserialize(parsed, bundle, size)) return Result::BadBundle;
 
-    std::memcpy(peer_identity_[peer].data(), header.sender_identity_dh, kKeySize);
+    // A peer label is bound to one identity for the lifetime of the pinning.
+    // Learning a different identity for a label we already know is not an
+    // ordinary error: it is either a hostile relay or a genuinely reinstalled
+    // peer, and either way the user has to be told rather than silently
+    // downgraded onto a new session with a new safety number.
+    auto known = peer_identity_.find(peer);
+    if (known != peer_identity_.end()) {
+        if (!constant_time_equal(known->second.data(), parsed.identity_dh_pub, kKeySize) ||
+            !constant_time_equal(known->second.data() + kKeySize,
+                                 parsed.identity_sign_pub, 32)) {
+            return Result::IdentityChanged;
+        }
+    }
+
+    Session session;
+    if (!session.establishOutbound(identity_, parsed)) {
+        // The only failure establishOutbound() reports at this point is the
+        // prekey signature.
+        return Result::BadSignature;
+    }
+
+    std::memcpy(peer_identity_[peer].data(), parsed.identity_dh_pub, kKeySize);
+    std::memcpy(peer_identity_[peer].data() + kKeySize, parsed.identity_sign_pub, 32);
     sessions_[peer] = std::move(session);
-    return true;
+    return Result::Ok;
+}
+
+Engine::Result Engine::establishInbound(const std::string& peer, const PreKeyHeader& header) {
+    Session session;
+    if (!session.establishInbound(identity_, prekeys_, header)) {
+        return Result::BadSignature;
+    }
+
+    // Inbound learns the sender's whole identity from the header, including
+    // the signing half, so both sides can compute the same safety number.
+    auto known = peer_identity_.find(peer);
+    if (known != peer_identity_.end()) {
+        if (!constant_time_equal(known->second.data(), header.sender_identity_dh, kKeySize) ||
+            (hasSignHalf(known->second) &&
+             !constant_time_equal(known->second.data() + kKeySize,
+                                  header.sender_identity_sign, 32))) {
+            return Result::IdentityChanged;
+        }
+    }
+    std::memcpy(peer_identity_[peer].data(), header.sender_identity_dh, kKeySize);
+    std::memcpy(peer_identity_[peer].data() + kKeySize, header.sender_identity_sign, 32);
+    sessions_[peer] = std::move(session);
+    return Result::Ok;
 }
 
 bool Engine::importSession(const std::string& peer, const uint8_t* data, size_t size) {
@@ -172,7 +246,9 @@ void Engine::dropSession(const std::string& peer) {
     if (it == sessions_.end()) return;
     it->second.wipe();
     sessions_.erase(it);
-    peer_identity_.erase(peer);
+    // The pinned identity is deliberately left in place: dropping a session
+    // is not the same event as forgetting who the peer is, and clearing the
+    // pin would let anyone re-bind the label afterwards.
 }
 
 // ---- Messaging ---------------------------------------------------------
@@ -191,9 +267,12 @@ Bytes Engine::encrypt(const std::string& peer, const uint8_t* plain, size_t size
     RatchetMessage msg;
     if (!s->encrypt(plain, size, prekey_aad.data(), prekey_aad.size(), msg)) return {};
 
-    Bytes frame = WireMessage::encode(*s, msg);
-    if (s->hasPendingPreKeyHeader()) s->clearPendingPreKeyHeader();
-    return frame;
+    // The prekey header is deliberately *not* cleared here. The first frame
+    // can be lost - the socket drops, the relay's outbox entry is acknowledged
+    // away, or the peer process was restarted - and if the header went with it
+    // the handshake could never be retried. It travels with every frame until
+    // the peer answers, which is the signal that X3DH completed on both sides.
+    return WireMessage::encode(*s, msg);
 }
 
 bool Engine::decrypt(const std::string& peer, const uint8_t* frame, size_t size, Bytes& out) {
@@ -217,22 +296,81 @@ bool Engine::decrypt(const std::string& peer, const uint8_t* frame, size_t size,
     if (s == nullptr) {
         if (!has_prekey) return false;
 
-        // Once a peer label has been bound to an identity it must stay bound.
-        // Otherwise an attacker could start a fresh handshake under a label
-        // we already trust.
-        auto known = peer_identity_.find(peer);
-        if (known != peer_identity_.end() &&
-            !constant_time_equal(known->second.data(),
-                                 prekey.sender_identity_dh, kKeySize)) {
-            return false;
-        }
-
-        if (!establishInbound(peer, prekey)) return false;
+        if (establishInbound(peer, prekey) != Result::Ok) return false;
         s = findSession(peer);
         if (s == nullptr) return false;
     }
 
-    return s->decrypt(msg, prekey_aad.data(), prekey_aad.size(), out);
+    if (!s->decrypt(msg, prekey_aad.data(), prekey_aad.size(), out)) return false;
+
+    // A frame that authenticated proves the peer holds this session. Once it
+    // arrives *without* a prekey header, the peer has already completed X3DH
+    // from its side, so those parameters no longer need to travel and sending
+    // can drop to plain ratchet frames.
+    //
+    // Keeping them until that moment - rather than dropping them after the
+    // first send - means a first frame lost to a dropped socket or a discarded
+    // outbox entry is retried instead of orphaning the session forever.
+    if (!has_prekey && s->hasPendingPreKeyHeader()) s->clearPendingPreKeyHeader();
+
+    return true;
+}
+
+Bytes Engine::peerIdentity(const std::string& peer) const {
+    auto it = peer_identity_.find(peer);
+    if (it == peer_identity_.end()) return {};
+    return Bytes(it->second.begin(), it->second.end());
+}
+
+// ---- Pinned identity registry -----------------------------------------
+
+Bytes Engine::exportPeerRegistry() const {
+    Bytes out;
+    out.reserve(4 + peer_identity_.size() * (4 + 32 + kIdentitySize));
+
+    uint8_t buf[4];
+    put_u32(buf, static_cast<uint32_t>(peer_identity_.size()));
+    out.insert(out.end(), buf, buf + 4);
+
+    for (const auto& [peer, identity] : peer_identity_) {
+        put_u32(buf, static_cast<uint32_t>(peer.size()));
+        out.insert(out.end(), buf, buf + 4);
+        out.insert(out.end(), peer.begin(), peer.end());
+        out.insert(out.end(), identity.begin(), identity.end());
+    }
+    return out;
+}
+
+bool Engine::importPeerRegistry(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 4) return false;
+
+    size_t off = 0;
+    const uint32_t count = get_u32(data + off);
+    off += 4;
+
+    // Every entry is at least 4 + 1 + 64 bytes, so a count that could not fit
+    // in the remaining bytes is malformed rather than merely large.
+    if (static_cast<size_t>(count) > (size - off) / (4 + kIdentitySize)) return false;
+
+    std::map<std::string, std::array<uint8_t, kIdentitySize>> loaded;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (size < off + 4) return false;
+        const uint32_t id_len = get_u32(data + off);
+        off += 4;
+        if (id_len == 0 || id_len > 128) return false;
+        if (size < off + id_len + kIdentitySize) return false;
+
+        std::string peer(reinterpret_cast<const char*>(data + off), id_len);
+        off += id_len;
+
+        std::array<uint8_t, kIdentitySize> identity{};
+        std::memcpy(identity.data(), data + off, kIdentitySize);
+        off += kIdentitySize;
+        loaded[peer] = identity;
+    }
+
+    peer_identity_ = std::move(loaded);
+    return true;
 }
 
 // ---- Safety number -----------------------------------------------------
@@ -241,22 +379,30 @@ std::string Engine::safetyNumber(const std::string& peer) const {
     auto it = peer_identity_.find(peer);
     if (it == peer_identity_.end()) return {};
 
+    // Both halves of each identity go in: the DH key that X3DH runs against
+    // and the signing key that authenticates prekeys. Hashing only the DH half
+    // would let a relay swap the signing key - and therefore sign prekeys of
+    // its choosing - while the 25 digits the user compares stayed identical.
+    //
+    // Canonical ordering is on the DH half, which is unique per identity.
     const uint8_t* mine = identity_.dh_pub;
     const uint8_t* theirs = it->second.data();
 
-    // Canonical ordering so both sides hash the same bytes.
     const bool mine_first = std::memcmp(mine, theirs, kKeySize) <= 0;
-    uint8_t buf[kKeySize * 2];
+    uint8_t buf[kIdentitySize * 2];
     if (mine_first) {
         std::memcpy(buf, mine, kKeySize);
-        std::memcpy(buf + kKeySize, theirs, kKeySize);
+        std::memcpy(buf + kKeySize, identity_.sign_pub, 32);
+        std::memcpy(buf + kIdentitySize, theirs, kIdentitySize);
     } else {
-        std::memcpy(buf, theirs, kKeySize);
-        std::memcpy(buf + kKeySize, mine, kKeySize);
+        std::memcpy(buf, theirs, kIdentitySize);
+        std::memcpy(buf + kIdentitySize, mine, kKeySize);
+        std::memcpy(buf + kIdentitySize + kKeySize, identity_.sign_pub, 32);
     }
 
     uint8_t digest[32];
     crypto::blake2b(digest, sizeof(digest), buf, sizeof(buf));
+    veil::wipe(buf, sizeof(buf));
 
     std::string out;
     out.reserve(29);

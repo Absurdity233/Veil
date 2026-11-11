@@ -34,19 +34,23 @@ constexpr uint32_t kStateVersion = 1;
 
 void PreKeyHeader::write(uint8_t* out) const {
     std::memcpy(out, sender_identity_dh, 32);
-    std::memcpy(out + 32, sender_ephemeral, 32);
-    std::memcpy(out + 64, recipient_identity_dh, 32);
-    put_u32(out + 96, signed_prekey_id);
-    put_u32(out + 100, one_time_prekey_id);
+    std::memcpy(out + 32, sender_identity_sign, 32);
+    std::memcpy(out + 64, sender_binding, 64);
+    std::memcpy(out + 128, sender_ephemeral, 32);
+    std::memcpy(out + 160, recipient_identity_dh, 32);
+    put_u32(out + 192, signed_prekey_id);
+    put_u32(out + 196, one_time_prekey_id);
 }
 
 bool PreKeyHeader::read(PreKeyHeader& out, const uint8_t* in, size_t size) {
     if (in == nullptr || size < kSize) return false;
     std::memcpy(out.sender_identity_dh, in, 32);
-    std::memcpy(out.sender_ephemeral, in + 32, 32);
-    std::memcpy(out.recipient_identity_dh, in + 64, 32);
-    out.signed_prekey_id = get_u32(in + 96);
-    out.one_time_prekey_id = get_u32(in + 100);
+    std::memcpy(out.sender_identity_sign, in + 32, 32);
+    std::memcpy(out.sender_binding, in + 64, 64);
+    std::memcpy(out.sender_ephemeral, in + 128, 32);
+    std::memcpy(out.recipient_identity_dh, in + 160, 32);
+    out.signed_prekey_id = get_u32(in + 192);
+    out.one_time_prekey_id = get_u32(in + 196);
     return true;
 }
 
@@ -108,10 +112,13 @@ void Session::deriveMessageKeyMaterial(const uint8_t message_key[32],
 
 bool Session::establishOutbound(const Identity& identity, const PreKeyBundle& bundle) {
     // 1. Verify that the signed prekey really was signed by the peer's
-    //    identity key. Without this the server could substitute its own
-    //    prekey and sit in the middle.
-    if (!crypto::ed25519_verify(bundle.signed_signature, bundle.identity_sign_pub,
-                                bundle.signed_pub, kKeySize)) {
+    //    identity key. The signed message covers the identity's DH public key
+    //    as well, so these bytes also prove that the signing key and the key
+    //    X3DH runs against belong to the same holder. Without that a server
+    //    could pair a victim's DH key with its own signing key and sit in the
+    //    middle while the safety number stayed put.
+    if (!verifySignedPreKey(bundle.identity_dh_pub, bundle.identity_sign_pub,
+                            bundle.signed_pub, bundle.signed_signature)) {
         return false;
     }
 
@@ -162,6 +169,8 @@ bool Session::establishOutbound(const Identity& identity, const PreKeyBundle& bu
     pending_prekey_.signed_prekey_id = bundle.signed_prekey_id;
     pending_prekey_.one_time_prekey_id = bundle.has_one_time ? bundle.one_time_id : 0;
     std::memcpy(pending_prekey_.sender_identity_dh, identity.dh_pub, 32);
+    std::memcpy(pending_prekey_.sender_identity_sign, identity.sign_pub, 32);
+    identity.bindingSignature(pending_prekey_.sender_binding);
     std::memcpy(pending_prekey_.sender_ephemeral, ek_pub, 32);
     std::memcpy(pending_prekey_.recipient_identity_dh, bundle.identity_dh_pub, 32);
     has_pending_prekey_ = true;
@@ -209,6 +218,26 @@ bool Session::establishInbound(const Identity& identity,
         return false;
     }
 
+    // The sender's two identity halves have to belong together before either
+    // one is used. Without this check a relay could take a victim's DH key,
+    // bolt on its own signing key, and present a bundle whose prekey signature
+    // verifies - the safety number would not move because the DH half is the
+    // victim's.
+    if (!Identity::verifyBinding(header.sender_identity_dh,
+                                 header.sender_identity_sign,
+                                 header.sender_binding)) {
+        return false;
+    }
+
+    // The header names the signed prekey the sender used. A frame that names
+    // a key we do not hold cannot complete X3DH, and silently falling back to
+    // the current key would derive a different secret than the sender did,
+    // producing a session that fails on the first message with no explanation.
+    // The retired prekey is checked too, so a bundle fetched just before a
+    // rotation still works.
+    const uint8_t* signed_priv = prekeys.signedPrivFor(header.signed_prekey_id);
+    if (signed_priv == nullptr) return false;
+
     // Locate the one-time prekey the sender used, if any.
     const PreKeys::OneTime* ot = nullptr;
     if (header.one_time_prekey_id != 0) {
@@ -222,9 +251,9 @@ bool Session::establishInbound(const Identity& identity,
     }
 
     uint8_t dh1[kKeySize], dh2[kKeySize], dh3[kKeySize], dh4[kKeySize];
-    bool ok = crypto::x25519(dh1, prekeys.signed_priv, header.sender_identity_dh) &&
+    bool ok = crypto::x25519(dh1, signed_priv, header.sender_identity_dh) &&
               crypto::x25519(dh2, identity.dh_priv, header.sender_ephemeral) &&
-              crypto::x25519(dh3, prekeys.signed_priv, header.sender_ephemeral);
+              crypto::x25519(dh3, signed_priv, header.sender_ephemeral);
     if (ok && ot != nullptr) {
         ok = crypto::x25519(dh4, ot->priv, header.sender_ephemeral);
     }
@@ -261,7 +290,7 @@ bool Session::establishInbound(const Identity& identity,
     std::memcpy(root_key_.data(), sk, 32);
     std::memset(chain_send_.data(), 0, 32);
     std::memset(chain_recv_.data(), 0, 32);
-    std::memcpy(dh_self_priv_, prekeys.signed_priv, kKeySize);
+    std::memcpy(dh_self_priv_, signed_priv, kKeySize);
     crypto::x25519_keypair(dh_self_pub_, dh_self_priv_);
     std::memset(dh_remote_pub_, 0, kKeySize);
     n_send_ = 0;

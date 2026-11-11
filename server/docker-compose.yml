@@ -19,10 +19,15 @@ services:
       VEIL_ADDR: ":8080"
       VEIL_DB: "/data/veil.db"
     healthcheck:
-      # The distroless image has no shell, so the check must be a binary call.
-      # wget/curl are absent; the relay's own /health is probed by the host
-      # (see scripts/healthcheck.sh) or by an orchestrator instead.
-      disable: true
+      # The image is distroless: no shell, no curl, no wget. The relay binary
+      # is the only thing guaranteed to exist in there, so it probes itself.
+      # This checks /health, not just the port, because a bound port says
+      # nothing about whether the SQLite store is usable.
+      test: ["CMD", "/usr/local/bin/veil-relay", "-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
     read_only: true
     security_opt:
       - no-new-privileges:true

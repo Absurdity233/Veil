@@ -42,6 +42,21 @@ public:
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
+    // Why a call into the engine was refused. Callers need to tell "the bundle
+    // was malformed" from "the peer's identity key changed", because only the
+    // second one is a security event the user has to see.
+    //
+    // Unscoped on purpose: it is compared against and cast to an int at the
+    // JNI boundary, and a plain enum keeps both spellings working.
+    enum Result : int32_t {
+        Ok               = 0,
+        BadBundle        = 1,  // framing or length was wrong
+        BadSignature     = 2,  // the prekey signature did not verify
+        IdentityChanged  = 3,  // peer label is pinned to a different identity
+        NoSession        = 4,  // no session for that peer
+        AuthFailed       = 5,  // frame did not authenticate
+    };
+
     // ---- Identity -------------------------------------------------------
 
     bool createIdentity();
@@ -52,6 +67,22 @@ public:
 
     // 64 bytes: DH public || signing public. Safe to publish.
     Bytes exportIdentityPublic() const;
+
+    // Ed25519 signature over the DH public key, made with the signing key.
+    // Published alongside the identity so a peer can prove the two halves
+    // belong together; see Identity::bindingSignature.
+    Bytes exportIdentityBinding() const;
+
+    // Verifies that a 64-byte identity blob really carries two halves by the
+    // same holder.
+    static bool verifyIdentityBinding(const uint8_t identity[kIdentitySize],
+                                      const uint8_t binding[kBindingSize]);
+
+    // Signs an arbitrary challenge with the identity signing key. Used to
+    // prove possession of the identity to the relay: registering a user id is
+    // otherwise first-come-first-served, so anybody could claim somebody
+    // else's id and publish prekeys of their own under it.
+    Bytes signChallenge(const uint8_t* data, size_t size) const;
 
     // ---- Prekeys --------------------------------------------------------
 
@@ -69,11 +100,29 @@ public:
     // ---- Sessions -------------------------------------------------------
 
     bool hasSession(const std::string& peer) const;
+    // Same as establishOutbound() but reports why it failed, so the caller can
+    // tell a bad signature from a changed identity.
+    Result establishOutboundStatus(const std::string& peer,
+                                   const uint8_t* bundle, size_t size);
     bool establishOutbound(const std::string& peer, const uint8_t* bundle, size_t size);
-    bool establishInbound(const std::string& peer, const PreKeyHeader& header);
+    Result establishInbound(const std::string& peer, const PreKeyHeader& header);
     bool importSession(const std::string& peer, const uint8_t* data, size_t size);
     Bytes exportSession(const std::string& peer) const;
     void dropSession(const std::string& peer);
+
+    // The peer's pinned identity (DH || signing), or empty when unmapped.
+    Bytes peerIdentity(const std::string& peer) const;
+
+    // ---- Pinned identity registry ---------------------------------------
+    //
+    // The pin lives beside the session but outlives it: a session can be
+    // dropped and rebuilt, while "this label belongs to this identity" must
+    // survive a restart or the whole TOFU guarantee is gone. The app stores
+    // this blob next to the session blob and restores both at launch.
+    //
+    // Layout: [4] count, then per entry [4] id length | id | [64] identity.
+    Bytes exportPeerRegistry() const;
+    bool importPeerRegistry(const uint8_t* data, size_t size);
 
     // ---- Messaging ------------------------------------------------------
 
@@ -85,9 +134,13 @@ public:
 
     // ---- Verification ---------------------------------------------------
 
-    // BLAKE2b-256 over both identity DH public keys in sorted order, rendered
+    // BLAKE2b-256 over both identity public keys in sorted order, rendered
     // as five groups of five decimal digits. Both sides compute the same
     // string; comparing it out of band proves there is no middlebox.
+    //
+    // Both halves of each identity go in. Hashing only the DH keys would leave
+    // the signing key - the one that actually authenticates prekeys - outside
+    // what the user verifies.
     std::string safetyNumber(const std::string& peer) const;
 
 private:
@@ -100,7 +153,7 @@ private:
 
     // The peer's identity key, learned during the handshake. Needed for the
     // safety number, and to keep a peer label bound to one identity.
-    std::map<std::string, std::array<uint8_t, kKeySize>> peer_identity_;
+    std::map<std::string, std::array<uint8_t, kIdentitySize>> peer_identity_;
 };
 
 }  // namespace veil

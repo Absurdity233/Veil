@@ -68,16 +68,35 @@ class IdentityVault(context: Context) {
             cipher.init(Cipher.DECRYPT_MODE, orCreateKey(), GCMParameterSpec(128, iv))
             cipher.doFinal(blob)
         } catch (e: Exception) {
-            // A keystore reset (factory reset, lock screen change) makes the
-            // old blob undecryptable. Treat that as "no identity" rather than
-            // crashing on every launch.
-            clear()
+            // A keystore reset (factory reset, lock screen change, vendor ROM
+            // keystore bug) makes the old blob undecryptable. The identity is
+            // gone and no amount of retrying brings it back, so the blob is
+            // moved aside rather than deleted: the caller can tell "first run"
+            // from "your identity is lost", which are very different things to
+            // put in front of a user who has no account recovery.
+            quarantine()
             null
         }
     }
 
+    /** True when a previous identity existed but can no longer be decrypted. */
+    fun isIdentityLost(): Boolean = prefs.contains(PREF_LOST)
+
     fun clear() {
-        prefs.edit().remove(PREF_IV).remove(PREF_BLOB).apply()
+        prefs.edit().remove(PREF_IV).remove(PREF_BLOB).remove(PREF_LOST).apply()
+    }
+
+    /**
+     * Keeps the unreadable blob under a "lost" key so the app can say what
+     * happened, instead of presenting a silent new identity as a first run.
+     */
+    private fun quarantine() {
+        val lostBlob = prefs.getString(PREF_BLOB, null)
+        prefs.edit()
+            .putString(PREF_LOST, lostBlob)
+            .remove(PREF_IV)
+            .remove(PREF_BLOB)
+            .apply()
     }
 
     private fun ByteArray.toHex(): String =
@@ -93,5 +112,6 @@ class IdentityVault(context: Context) {
         const val PREFS = "veil.vault"
         const val PREF_IV = "iv"
         const val PREF_BLOB = "blob"
+        const val PREF_LOST = "lost.blob"
     }
 }

@@ -26,10 +26,16 @@ class RelayClient(private val url: String) {
 
     sealed interface Event {
         data class Connected(val userId: String) : Event
+
+        /** The relay wants a proof of identity before it binds the user id. */
+        data class Challenge(val nonce: ByteArray) : Event
         data class Delivered(val outboxId: Long, val sender: String, val frame: ByteArray) : Event
         data class Bundle(val userId: String, val identity: ByteArray, val signedId: Int,
                           val signedPub: ByteArray, val signature: ByteArray,
                           val oneTimeId: Int, val oneTimePub: ByteArray) : Event
+
+        /** A full page of replayed entries went out; the next ACK pulls more. */
+        data object MorePending : Event
         data class Failed(val message: String) : Event
         data object Disconnected : Event
     }
@@ -44,10 +50,26 @@ class RelayClient(private val url: String) {
     val stream: Flow<Event> = events.receiveAsFlow()
 
     private var socket: WebSocket? = null
+
+    @Volatile
+    private var closed = false
+
+    @Volatile
     private var connected = false
 
-    /** Opens the connection and sends HELLO. */
+    /** True while the socket can accept a frame without it being dropped. */
+    val isConnected: Boolean get() = connected && socket != null
+
+    /**
+     * Opens the connection and sends HELLO.
+     *
+     * HELLO no longer completes the registration by itself: the relay answers
+     * with a nonce, and the caller has to sign it. [respondToChallenge] is
+     * that second half, kept separate so the signing key never has to enter
+     * this class.
+     */
     suspend fun connect(userId: String, publicIdentity: ByteArray) {
+        closed = false
         val request = Request.Builder().url(url).build()
         val opened = suspendCancellableCoroutine { cont ->
             val listener = object : WebSocketListener() {
@@ -79,6 +101,14 @@ class RelayClient(private val url: String) {
         if (opened != true) error("could not reach the relay")
     }
 
+    /** Answers a [Event.Challenge]; the relay binds the user id on success. */
+    fun respondToChallenge(signature: ByteArray) {
+        // Deliberately not gated on `connected`: the handshake is *how* the
+        // connection becomes usable, so requiring it here would drop the very
+        // frame that completes it.
+        write(Wire.TYPE_AUTH_RESPONSE, Writer().blob(signature).build())
+    }
+
     private fun handleFrame(bytes: ByteArray) {
         val frame = try {
             Wire.parse(bytes)
@@ -93,6 +123,8 @@ class RelayClient(private val url: String) {
                     connected = true
                     events.trySend(Event.Connected(r.string()))
                 }
+                Wire.TYPE_AUTH_CHALLENGE -> events.trySend(Event.Challenge(r.blob()))
+                Wire.TYPE_MORE_PENDING -> events.trySend(Event.MorePending)
                 Wire.TYPE_DELIVER -> {
                     val outboxId = r.u32().toLong() and 0xFFFFFFFFL
                     val sender = r.string()
@@ -120,34 +152,46 @@ class RelayClient(private val url: String) {
     }
 
     fun publishPreKeys(signedId: Int, signedPub: ByteArray, signature: ByteArray,
-                       oneTimeSet: ByteArray) {
+                       oneTimeSet: ByteArray): Boolean {
         val payload = Writer()
             .u32(signedId)
             .blob(signedPub)
             .blob(signature)
             .blob(oneTimeSet)
             .build()
-        send(Wire.TYPE_PUBLISH_PREKEYS, payload)
+        return send(Wire.TYPE_PUBLISH_PREKEYS, payload)
     }
 
-    fun requestBundle(userId: String) {
+    fun requestBundle(userId: String): Boolean =
         send(Wire.TYPE_GET_BUNDLE, Writer().string(userId).build())
-    }
 
-    fun sendMessage(recipient: String, frame: ByteArray) {
+    /**
+     * Queues one ciphertext frame.
+     *
+     * Returns false when the socket cannot take it. That is not a detail the
+     * caller may ignore: the frame already advanced the ratchet, so silently
+     * dropping it leaves a hole in the sending chain that the peer can never
+     * decrypt.
+     */
+    fun sendMessage(recipient: String, frame: ByteArray): Boolean =
         send(Wire.TYPE_SEND, Writer().string(recipient).blob(frame).build())
-    }
 
-    fun acknowledge(outboxId: Long) {
+    fun acknowledge(outboxId: Long): Boolean =
         send(Wire.TYPE_ACK, Writer().u32(outboxId.toInt()).build())
+
+    private fun send(type: Int, payload: ByteArray): Boolean {
+        if (!connected || closed) return false
+        return write(type, payload)
     }
 
-    private fun send(type: Int, payload: ByteArray) {
-        val ws = socket ?: return
-        ws.send(Wire.frame(type, payload).toByteString())
+    /** Writes a frame if a socket exists at all, without the readiness check. */
+    private fun write(type: Int, payload: ByteArray): Boolean {
+        val ws = socket ?: return false
+        return ws.send(Wire.frame(type, payload).toByteString())
     }
 
     fun close() {
+        closed = true
         socket?.close(1000, "bye")
         socket = null
         connected = false

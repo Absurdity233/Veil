@@ -1,8 +1,13 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,30 +19,94 @@ const (
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = maxPayload + envelopeHeaderSize
+
+	// One page of replayable outbox entries. The client is told to ask for
+	// more whenever a page came back full, so a large backlog drains over
+	// several round trips instead of stalling at the first page.
+	flushPageSize = 200
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	// The relay is meant to sit behind a TLS terminator; the origin check
-	// below keeps browser pages from opening a socket with a stolen cookie.
-	CheckOrigin: func(r *http.Request) bool { return true },
+// allowedOrigins is an explicit allow-list. Browsers send an Origin header on
+// every websocket handshake they initiate; a page served from anywhere else
+// must not be able to open a socket, because the handshake would otherwise
+// inherit whatever ambient credentials that page enjoys against this host.
+//
+// An empty list means "native clients only": those send no Origin at all. A
+// deployment that serves a browser build sets VEIL_ALLOWED_ORIGINS.
+type originPolicy struct {
+	exact []string
+}
+
+func newOriginPolicy(raw string) originPolicy {
+	var out originPolicy
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// Normalise so "https://example.com/" and "https://example.com"
+		// compare equal.
+		if u, err := url.Parse(entry); err == nil {
+			if u.Scheme != "" && u.Host != "" {
+				entry = u.Scheme + "://" + u.Host
+			}
+		}
+		out.exact = append(out.exact, entry)
+	}
+	return out
+}
+
+// check reports whether a handshake may proceed.
+//
+// No Origin header at all is accepted: that is what the Android client and
+// every other non-browser client sends, and a browser cannot forge its
+// absence. A browser request must name an origin on the list.
+func (p originPolicy) check(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if u, err := url.Parse(origin); err == nil && u.Scheme != "" && u.Host != "" {
+		origin = u.Scheme + "://" + u.Host
+	}
+	for _, allowed := range p.exact {
+		if subtle.ConstantTimeCompare([]byte(origin), []byte(allowed)) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // Hub tracks live connections and owns the fan-out.
 type Hub struct {
 	store  *Store
 	log    *slog.Logger
+	origin originPolicy
+
 	mu     sync.RWMutex
 	byUser map[string]map[*client]struct{}
 }
 
 func NewHub(store *Store, log *slog.Logger) *Hub {
+	return NewHubWithOrigins(store, log, "")
+}
+
+// NewHubWithOrigins is what main() uses; NewHub keeps the tests terse.
+func NewHubWithOrigins(store *Store, log *slog.Logger, allowedOrigins string) *Hub {
 	return &Hub{
 		store:  store,
 		log:    log,
+		origin: newOriginPolicy(allowedOrigins),
 		byUser: make(map[string]map[*client]struct{}),
 	}
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	// The real decision is made by originPolicy.check() before the upgrade,
+	// so this callback only has to confirm it.
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func (h *Hub) attach(c *client) {
@@ -112,12 +181,19 @@ func (h *Hub) deliver(recipient, sender string, body []byte) (bool, error) {
 	return true, nil
 }
 
-// flush replays the outbox for a freshly connected client.
+// flush replays the outbox for a freshly connected client, one page at a time.
+//
+// The client acknowledges each page as it is consumed; the relay keeps a
+// cursor per connection and offers the next page whenever the client asks.
+// The old behaviour - a single 200-entry page at HELLO - left everything past
+// the first page stranded until the next reconnect, with the UI showing an
+// empty conversation and no indication that more was waiting.
 func (h *Hub) flush(c *client, afterID int64) (int64, error) {
-	pending, err := h.store.Drain(c.userID, afterID, 200)
+	pending, err := h.store.Drain(c.userID, afterID, flushPageSize)
 	if err != nil {
 		return afterID, err
 	}
+
 	last := afterID
 	for _, m := range pending {
 		// m.Payload already carries sender|body; prepend the outbox id so
@@ -133,6 +209,17 @@ func (h *Hub) flush(c *client, afterID int64) (int64, error) {
 			return last, nil
 		}
 		last = m.ID
+	}
+
+	// A full page means there is probably more behind it. Say so, and let the
+	// client's next ACK pull the following page.
+	if len(pending) == flushPageSize {
+		c.morePending = true
+		if env, err := frame(typeMorePending, nil); err == nil {
+			c.enqueue(env)
+		}
+	} else {
+		c.morePending = false
 	}
 	return last, nil
 }
@@ -150,6 +237,14 @@ func newMux(h *Hub) *http.ServeMux {
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.origin.check(r) {
+		// Deliberately terse: an attacker probing the policy learns nothing
+		// beyond "no".
+		h.log.Warn("rejected cross-origin handshake", "origin", r.Header.Get("Origin"))
+		http.Error(w, "forbidden origin", http.StatusForbidden)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		h.log.Warn("upgrade failed", "err", err)
@@ -175,6 +270,20 @@ type client struct {
 	send    chan []byte
 	closed  chan struct{}
 	closeMu sync.Once
+
+	// ---- HELLO challenge ----
+	//
+	// The nonce is issued once per connection and dies with it. A client that
+	// never answers is disconnected rather than left holding it.
+	challenge         []byte
+	challengeSeen     bool
+	authed            bool
+	pendingUserID     string
+	pendingIdentity   []byte
+
+	// ---- outbox replay cursor ----
+	flushCursor int64
+	morePending bool
 }
 
 // enqueue never blocks: a slow peer is disconnected rather than allowed to
@@ -242,7 +351,16 @@ func (c *client) readLoop() {
 		if err != nil {
 			return
 		}
-		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		// Before the handshake completes the deadline is the auth budget, not
+		// the liveness budget: an unauthenticated socket must not be able to
+		// hold a challenge open for an hour by trickling frames.
+		if c.authed {
+			_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		} else if len(c.challenge) != 0 {
+			_ = c.conn.SetReadDeadline(time.Now().Add(authTimeout))
+		} else {
+			_ = c.conn.SetReadDeadline(time.Now().Add(authTimeout))
+		}
 
 		if err := c.handle(data); err != nil {
 			c.fail(err.Error())
@@ -267,6 +385,8 @@ func (c *client) handle(data []byte) error {
 	switch msgType {
 	case typeHello:
 		return c.handleHello(payload)
+	case typeAuthResponse:
+		return c.handleAuthResponse(payload)
 	case typePublishPreKeys:
 		return c.handlePublishPreKeys(payload)
 	case typeGetBundle:
@@ -280,7 +400,19 @@ func (c *client) handle(data []byte) error {
 	}
 }
 
+// handleHello issues a challenge instead of binding the user id outright.
+//
+// Registering an id used to be first-come-first-served: whoever sent HELLO
+// first owned that id, and could publish prekeys of their own choosing under
+// it. Requiring a signature over a relay-chosen nonce means an id can only be
+// claimed by the holder of the matching identity signing key.
 func (c *client) handleHello(payload []byte) error {
+	if len(c.challenge) != 0 {
+		// One challenge per connection. Issuing a second would let a client
+		// grind solutions without paying for a new socket.
+		return errAlreadyChallenged
+	}
+
 	r := reader{buf: payload}
 	userID, err := r.str()
 	if err != nil {
@@ -300,20 +432,76 @@ func (c *client) handleHello(payload []byte) error {
 		return errBadIdentity
 	}
 
-	ok, err := c.hub.store.EnsureAccount(userID, identity)
+	nonce := make([]byte, challengeSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+	c.challenge = nonce
+	c.challengeSeen = true
+	c.pendingUserID = userID
+	c.pendingIdentity = append([]byte(nil), identity...)
+
+	// Deadline is per-read; the client only has to beat authTimeout overall,
+	// not per frame, because every frame of the handshake resets it.
+	_ = c.conn.SetReadDeadline(time.Now().Add(authTimeout))
+
+	var w writer
+	w.blob(nonce)
+	env, err := frame(typeAuthChallenge, w.bytes())
+	if err != nil {
+		return err
+	}
+	c.enqueue(env)
+	return nil
+}
+
+// handleAuthResponse verifies the signature and only then binds the id.
+func (c *client) handleAuthResponse(payload []byte) error {
+	if len(c.challenge) == 0 {
+		return errNoChallenge
+	}
+
+	r := reader{buf: payload}
+	signature, err := r.blob()
+	if err != nil {
+		return err
+	}
+	if !r.done() {
+		return errTruncated
+	}
+	if len(signature) != ed25519.SignatureSize {
+		return errBadSignature
+	}
+
+	// The identity blob is DH public || signing public, so the verifying key
+	// is the second half.
+	verifyKey := ed25519.PublicKey(c.pendingIdentity[kKeyOffset:])
+	if !ed25519.Verify(verifyKey, c.challenge, signature) {
+		c.hub.log.Warn("identity proof failed", "user", c.pendingUserID)
+		return errBadSignature
+	}
+
+	ok, err := c.hub.store.EnsureAccount(c.pendingUserID, c.pendingIdentity)
 	if err != nil {
 		return err
 	}
 	if !ok {
+		c.hub.log.Warn("identity mismatch on hello", "user", c.pendingUserID)
 		return errIdentityMismatch
 	}
 
-	c.userID = userID
+	// The nonce is single-use.
+	c.challenge = nil
+	c.authed = true
+	c.userID = c.pendingUserID
+	c.pendingUserID = ""
+	c.pendingIdentity = nil
+
 	c.hub.attach(c)
-	c.hub.log.Info("connected", "user", userID)
+	c.hub.log.Info("connected", "user", c.userID)
 
 	var w writer
-	w.str(userID)
+	w.str(c.userID)
 	env, err := frame(typeHelloOK, w.bytes())
 	if err != nil {
 		return err
@@ -321,7 +509,7 @@ func (c *client) handleHello(payload []byte) error {
 	c.enqueue(env)
 
 	// Anything queued while the peer was away goes out right away.
-	_, _ = c.hub.flush(c, 0)
+	c.flushCursor, _ = c.hub.flush(c, 0)
 	return nil
 }
 
@@ -464,5 +652,19 @@ func (c *client) handleAck(payload []byte) error {
 	if !r.done() {
 		return errTruncated
 	}
-	return c.hub.store.Acknowledge(c.userID, int64(upTo))
+	if err := c.hub.store.Acknowledge(c.userID, int64(upTo)); err != nil {
+		return err
+	}
+
+	// An ACK is also the client saying "I have this page, send the next one".
+	// Without this the replay stalled at a single page and everything behind
+	// it waited for another reconnect.
+	if c.morePending {
+		cursor, err := c.hub.flush(c, int64(upTo))
+		if err != nil {
+			return err
+		}
+		c.flushCursor = cursor
+	}
+	return nil
 }

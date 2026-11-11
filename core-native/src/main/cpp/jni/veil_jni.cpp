@@ -106,6 +106,68 @@ Java_com_veil_core_VeilNative_nativeExportIdentity(JNIEnv* env, jobject /*thiz*/
     return toArray(env, engine->exportIdentitySecrets());
 }
 
+JNIEXPORT jint JNICALL
+Java_com_veil_core_VeilNative_nativeEstablishOutbound(JNIEnv* env, jobject /*thiz*/,
+                                                      jlong handle, jstring peerId,
+                                                      jbyteArray bundle) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return static_cast<jint>(veil::Engine::Result::NoSession);
+
+    veil::Bytes bytes = fromArray(env, bundle);
+    const std::string peer = toStd(env, peerId);
+    return static_cast<jint>(engine->establishOutboundStatus(peer, bytes.data(), bytes.size()));
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativePeerIdentity(JNIEnv* env, jobject /*thiz*/,
+                                                 jlong handle, jstring peerId) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    return toArray(env, engine->peerIdentity(toStd(env, peerId)));
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeIdentityBinding(JNIEnv* env, jobject /*thiz*/, jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    return toArray(env, engine->exportIdentityBinding());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_veil_core_VeilNative_nativeVerifyIdentityBinding(JNIEnv* env, jobject /*thiz*/,
+                                                          jbyteArray identity,
+                                                          jbyteArray binding) {
+    veil::Bytes id = fromArray(env, identity);
+    veil::Bytes sig = fromArray(env, binding);
+    if (id.size() != veil::kIdentitySize || sig.size() != veil::kBindingSize) return JNI_FALSE;
+    return veil::Engine::verifyIdentityBinding(id.data(), sig.data()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeSignChallenge(JNIEnv* env, jobject /*thiz*/,
+                                                  jlong handle, jbyteArray challenge) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    veil::Bytes data = fromArray(env, challenge);
+    return toArray(env, engine->signChallenge(data.data(), data.size()));
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeExportPeerRegistry(JNIEnv* env, jobject /*thiz*/, jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    return toArray(env, engine->exportPeerRegistry());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_veil_core_VeilNative_nativeImportPeerRegistry(JNIEnv* env, jobject /*thiz*/,
+                                                       jlong handle, jbyteArray registry) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return JNI_FALSE;
+    veil::Bytes bytes = fromArray(env, registry);
+    return engine->importPeerRegistry(bytes.data(), bytes.size()) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jbyteArray JNICALL
 Java_com_veil_core_VeilNative_nativePublicIdentity(JNIEnv* env, jobject /*thiz*/, jlong handle) {
     auto* engine = toEngine(handle);
@@ -137,18 +199,6 @@ Java_com_veil_core_VeilNative_nativePublishBundle(JNIEnv* env, jobject /*thiz*/,
     auto* engine = toEngine(handle);
     if (engine == nullptr) return nullptr;
     return toArray(env, engine->publishBundle(oneTimeIndex));
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_veil_core_VeilNative_nativeEstablishOutbound(JNIEnv* env, jobject /*thiz*/,
-                                                      jlong handle, jstring peerId,
-                                                      jbyteArray bundle) {
-    auto* engine = toEngine(handle);
-    if (engine == nullptr) return JNI_FALSE;
-    veil::Bytes data = fromArray(env, bundle);
-    if (data.empty()) return JNI_FALSE;
-    return engine->establishOutbound(toStd(env, peerId), data.data(), data.size())
-               ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL

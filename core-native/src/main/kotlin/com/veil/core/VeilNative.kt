@@ -28,8 +28,15 @@ internal object VeilNative {
     external fun nativeGeneratePreKeys(handle: Long, signedId: Int, oneTimeCount: Int): ByteArray?
     external fun nativePublishBundle(handle: Long, oneTimeIndex: Int): ByteArray?
 
-    external fun nativeEstablishOutbound(handle: Long, peerId: String, bundle: ByteArray): Boolean
+    external fun nativeEstablishOutbound(handle: Long, peerId: String, bundle: ByteArray): Int
     external fun nativeHasSession(handle: Long, peerId: String): Boolean
+
+    external fun nativeIdentityBinding(handle: Long): ByteArray?
+    external fun nativeVerifyIdentityBinding(identity: ByteArray, binding: ByteArray): Boolean
+    external fun nativeSignChallenge(handle: Long, challenge: ByteArray): ByteArray?
+    external fun nativePeerIdentity(handle: Long, peerId: String): ByteArray?
+    external fun nativeExportPeerRegistry(handle: Long): ByteArray?
+    external fun nativeImportPeerRegistry(handle: Long, registry: ByteArray): Boolean
 
     external fun nativeEncrypt(handle: Long, peerId: String, plain: ByteArray): ByteArray?
     external fun nativeDecrypt(handle: Long, peerId: String, frame: ByteArray): ByteArray?

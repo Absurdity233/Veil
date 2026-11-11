@@ -1,0 +1,10 @@
+# The Dockerfile does `COPY . .`, and Docker does not read .gitignore. Without
+# this, local build artefacts and the live database end up in the build context
+# and therefore in the image layer cache.
+veil.db
+veil.db-*
+veil-relay
+veil-relay.exe
+*.o
+*.so
+*.exe

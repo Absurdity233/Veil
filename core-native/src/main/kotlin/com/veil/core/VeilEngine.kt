@@ -12,6 +12,36 @@ import java.lang.ref.Cleaner
 class VeilException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 /**
+ * Why establishing a session succeeded or failed.
+ *
+ * Mirrors `veil::Engine::Result`. The distinction matters at the UI layer:
+ * [BAD_BUNDLE] and [BAD_SIGNATURE] mean the peer or the relay sent something
+ * broken, while [IDENTITY_CHANGED] means the peer we were talking to is no
+ * longer the peer we pinned - which the user has to confirm before anything
+ * else is sent.
+ */
+enum class Handshake {
+    OK,
+    BAD_BUNDLE,
+    BAD_SIGNATURE,
+    IDENTITY_CHANGED,
+    NO_SESSION,
+    AUTH_FAILED;
+
+    companion object {
+        fun fromCode(code: Int): Handshake = when (code) {
+            0 -> OK
+            1 -> BAD_BUNDLE
+            2 -> BAD_SIGNATURE
+            3 -> IDENTITY_CHANGED
+            4 -> NO_SESSION
+            5 -> AUTH_FAILED
+            else -> BAD_BUNDLE
+        }
+    }
+}
+
+/**
  * A live protocol engine.
  *
  * [close] wipes all key material. The instance is unusable afterwards.
@@ -58,9 +88,39 @@ class VeilEngine private constructor(handle: Long) : AutoCloseable {
     fun hasSession(peerId: String): Boolean =
         VeilNative.nativeHasSession(state.handle, peerId)
 
-    /** Starts a session from a peer's published bundle. */
-    fun establishOutbound(peerId: String, bundle: ByteArray): Boolean =
-        VeilNative.nativeEstablishOutbound(state.handle, peerId, bundle)
+    /**
+     * Starts a session from a peer's published bundle.
+     *
+     * Returns a [Handshake] rather than a bare boolean because the caller has
+     * to react differently to each failure: a bad signature is a broken peer,
+     * while a changed identity is a security event the user must be shown.
+     */
+    fun establishOutbound(peerId: String, bundle: ByteArray): Handshake =
+        Handshake.fromCode(VeilNative.nativeEstablishOutbound(state.handle, peerId, bundle))
+
+    /** Ed25519 signature over this identity's DH public key. */
+    fun identityBinding(): ByteArray? = VeilNative.nativeIdentityBinding(state.handle)
+
+    /** Signs a relay challenge, proving possession of the identity. */
+    fun signChallenge(challenge: ByteArray): ByteArray? =
+        VeilNative.nativeSignChallenge(state.handle, challenge)
+
+    /** The peer's pinned identity as last learned, or null when unmapped. */
+    fun peerIdentity(peerId: String): ByteArray? =
+        VeilNative.nativePeerIdentity(state.handle, peerId)
+
+    // ---- Pinned identity registry ---------------------------------------
+
+    /**
+     * Every peer label pinned to an identity. The pin has to outlive both the
+     * process and the session: if it is forgotten, a re-handshake can silently
+     * swap the peer's identity and the safety number would move without
+     * anyone noticing.
+     */
+    fun exportPeerRegistry(): ByteArray? = VeilNative.nativeExportPeerRegistry(state.handle)
+
+    fun importPeerRegistry(registry: ByteArray): Boolean =
+        VeilNative.nativeImportPeerRegistry(state.handle, registry)
 
     fun exportSession(peerId: String): ByteArray? =
         VeilNative.nativeExportSession(state.handle, peerId)

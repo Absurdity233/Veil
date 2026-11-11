@@ -1,6 +1,7 @@
 package com.veil.app
 
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -20,6 +21,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Ciphertext on the wire is worthless to an attacker if the plaintext
+        // is visible in the recents thumbnail. FLAG_SECURE keeps the window out
+        // of screenshots, screen recordings and the task switcher, which is the
+        // difference between "the relay cannot read this" and "nobody can
+        // casually photograph this".
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE,
+        )
+
         enableEdgeToEdge()
         setContent {
             VeilTheme {

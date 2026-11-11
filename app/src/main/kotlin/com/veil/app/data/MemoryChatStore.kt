@@ -32,6 +32,19 @@ class MemoryChatStore : ChatStore {
 
     override fun peers(): List<Peer> = peers.values.sortedBy { it.displayName }
 
+    override fun markLastOutgoing(peerId: String, state: SendState): Boolean {
+        synchronized(this) {
+            val list = messages[peerId] ?: return false
+            for (i in list.indices.reversed()) {
+                val message = list[i]
+                if (!message.outgoing) continue
+                list[i] = message.copy(state = state)
+                return true
+            }
+            return false
+        }
+    }
+
     override fun upsertPeer(peer: Peer) {
         peers[peer.userId] = peer
     }

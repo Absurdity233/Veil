@@ -7,6 +7,8 @@ import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
 import java.net.ServerSocket
+import java.security.KeyPairGenerator
+import java.security.Signature
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.launch
 
@@ -15,9 +17,13 @@ import kotlinx.coroutines.launch
  *
  * The relay is started as a child process from the built binary, so this test
  * exercises the actual framing both sides agree on rather than a mock of it.
- * Crypto is stubbed out: the relay never verifies signatures, it only stores
- * and forwards public keys and opaque bodies, which is exactly the contract
- * being tested here.
+ * Message crypto is stubbed out: the relay never verifies message signatures,
+ * it only stores and forwards public keys and opaque bodies, which is exactly
+ * the contract being tested here.
+ *
+ * The HELLO handshake is *not* stubbed: the relay verifies a real Ed25519
+ * signature over its challenge, so the identity keys here are real key pairs
+ * with a stand-in DH half.
  *
  * Skipped automatically when the relay binary has not been built.
  */
@@ -175,7 +181,31 @@ class RelayInteropTest {
 
     // ---- Fake key material ----------------------------------------------
 
-    private fun fakeIdentity(seed: Int) = ByteArray(64) { (seed * 13 + it).toByte() }
+    /**
+     * A real Ed25519 key pair with a stand-in DH half.
+     *
+     * The relay only ever looks at the signing half (offset 32..64), and only
+     * to check the HELLO challenge signature, so the first 32 bytes just have
+     * to be distinct per peer.
+     */
+    private class FakeIdentity(val blob: ByteArray, val signer: java.security.PrivateKey) {
+        fun sign(nonce: ByteArray): ByteArray {
+            val s = Signature.getInstance("Ed25519")
+            s.initSign(signer)
+            s.update(nonce)
+            return s.sign()
+        }
+    }
+
+    private fun fakeIdentity(seed: Int): FakeIdentity {
+        val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        val blob = ByteArray(64) { (seed * 13 + it).toByte() }
+        // Overwrite the signing half so the relay sees the real public key.
+        val pub = pair.public.encoded
+        // X.509 SubjectPublicKeyInfo for Ed25519 is a 12-byte prefix + 32 bytes.
+        System.arraycopy(pub, pub.size - 32, blob, 32, 32)
+        return FakeIdentity(blob, pair.private)
+    }
 
     /** [4] count, then per entry [4] id | [32] public key. */
     private fun oneTimeSet(ids: IntArray): ByteArray {
@@ -208,14 +238,19 @@ class RelayInteropTest {
             kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob(),
         )
 
-        fun connect(userId: String, identity: ByteArray) {
-            kotlinx.coroutines.runBlocking { client.connect(userId, identity) }
+        fun connect(userId: String, identity: FakeIdentity) {
+            kotlinx.coroutines.runBlocking { client.connect(userId, identity.blob) }
             scope.launch {
                 client.stream.collect { event ->
                     when (event) {
                         is RelayClient.Event.Connected -> inbox.add(
                             Wire.Frame(Wire.TYPE_HELLO_OK, ByteArray(0)),
                         )
+                        is RelayClient.Event.Challenge -> {
+                            // The relay verifies this for real, so it cannot be
+                            // faked: sign the nonce with the identity key.
+                            client.respondToChallenge(identity.sign(event.nonce))
+                        }
                         is RelayClient.Event.Delivered -> inbox.add(
                             Wire.Frame(
                                 Wire.TYPE_DELIVER,
@@ -240,6 +275,9 @@ class RelayInteropTest {
                                     .build(),
                             ),
                         )
+                        is RelayClient.Event.MorePending -> inbox.add(
+                            Wire.Frame(Wire.TYPE_MORE_PENDING, ByteArray(0)),
+                        )
                         is RelayClient.Event.Failed -> inbox.add(
                             Wire.Frame(Wire.TYPE_ERROR, Writer().string(event.message).build()),
                         )
@@ -249,11 +287,11 @@ class RelayInteropTest {
             }
             // The connect call returns once the socket opens; the HELLO_OK
             // frame is what proves the relay accepted the identity.
-            val ok = awaitType(Wire.TYPE_HELLO_OK, 5_000)
+            val ok = awaitType(Wire.TYPE_HELLO_OK, 10_000)
             checkNotNull(ok) { "relay did not accept HELLO" }
         }
 
-        fun tryConnect(userId: String, identity: ByteArray): Result<Unit> = runCatching {
+        fun tryConnect(userId: String, identity: FakeIdentity): Result<Unit> = runCatching {
             connect(userId, identity)
         }
 

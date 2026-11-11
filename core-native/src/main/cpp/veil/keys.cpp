@@ -56,19 +56,74 @@ bool Identity::fromSecrets(Identity& out,
     return true;
 }
 
+void Identity::bindingSignature(uint8_t sig[kBindingSize]) const {
+    crypto::ed25519_sign(sig, sign_priv, dh_pub, kKeySize);
+}
+
+bool Identity::verifyBinding(const uint8_t dh_pub[kKeySize],
+                             const uint8_t sign_pub[32],
+                             const uint8_t sig[kBindingSize]) {
+    return crypto::ed25519_verify(sig, sign_pub, dh_pub, kKeySize);
+}
+
 void Identity::wipeSecrets() {
     veil::wipe(dh_priv, sizeof(dh_priv));
     veil::wipe(sign_priv, sizeof(sign_priv));
 }
 
+// ---- Signed prekey message ---------------------------------------------
+
+size_t signedPreKeyMessage(uint8_t* out, size_t capacity,
+                           const uint8_t identity_dh_pub[kKeySize],
+                           const uint8_t signed_pub[kKeySize]) {
+    const size_t domain_len = sizeof(kSignedPreKeyDomain) - 1;
+    const size_t total = domain_len + kKeySize * 2;
+    if (out == nullptr || capacity < total) return 0;
+
+    std::memcpy(out, kSignedPreKeyDomain, domain_len);
+    std::memcpy(out + domain_len, identity_dh_pub, kKeySize);
+    std::memcpy(out + domain_len + kKeySize, signed_pub, kKeySize);
+    return total;
+}
+
+bool verifySignedPreKey(const uint8_t identity_dh_pub[kKeySize],
+                        const uint8_t identity_sign_pub[32],
+                        const uint8_t signed_pub[kKeySize],
+                        const uint8_t signature[kSigSize]) {
+    uint8_t message[sizeof(kSignedPreKeyDomain) - 1 + kKeySize * 2];
+    const size_t len = signedPreKeyMessage(message, sizeof(message),
+                                          identity_dh_pub, signed_pub);
+    if (len == 0) return false;
+    return crypto::ed25519_verify(signature, identity_sign_pub, message, len);
+}
+
 bool PreKeys::generate(const Identity& identity, uint32_t signed_id,
                        uint32_t one_time_count) {
+    // Retire the current signed prekey before generating a new one. A peer
+    // that fetched the old bundle and only now sends its first message still
+    // has to be able to run X3DH against the key it was handed, so the
+    // previous private half stays decryptable until the next rotation.
+    if (signed_prekey_id != 0) {
+        retired_signed_id = signed_prekey_id;
+        std::memcpy(retired_signed_pub, signed_pub, kKeySize);
+        std::memcpy(retired_signed_priv, signed_priv, kKeySize);
+        std::memcpy(retired_signed_signature, signed_signature, kSigSize);
+        has_retired_signed = true;
+    }
+
     signed_prekey_id = signed_id;
 
     if (!crypto::x25519_generate(signed_pub, signed_priv)) return false;
 
-    crypto::ed25519_sign(signed_signature, identity.sign_priv,
-                         signed_pub, kKeySize);
+    // The signature covers the identity's DH public key as well as the prekey
+    // itself, so a relay cannot pair a victim's DH key with its own signing
+    // key and then vouch for a prekey of its choosing.
+    uint8_t message[sizeof(kSignedPreKeyDomain) - 1 + kKeySize * 2];
+    const size_t len = signedPreKeyMessage(message, sizeof(message),
+                                          identity.dh_pub, signed_pub);
+    if (len == 0) return false;
+    crypto::ed25519_sign(signed_signature, identity.sign_priv, message, len);
+    veil::wipe(message, sizeof(message));
 
     one_time.clear();
     one_time.reserve(one_time_count);
@@ -81,8 +136,16 @@ bool PreKeys::generate(const Identity& identity, uint32_t signed_id,
     return true;
 }
 
+const uint8_t* PreKeys::signedPrivFor(uint32_t signed_id) const {
+    if (signed_id == signed_prekey_id) return signed_priv;
+    if (has_retired_signed && signed_id == retired_signed_id) return retired_signed_priv;
+    return nullptr;
+}
+
 void PreKeys::wipeSecrets() {
     veil::wipe(signed_priv, sizeof(signed_priv));
+    veil::wipe(retired_signed_priv, sizeof(retired_signed_priv));
+    has_retired_signed = false;
     for (auto& ot : one_time) veil::wipe(ot.priv, sizeof(ot.priv));
     one_time.clear();
 }

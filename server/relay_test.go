@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,6 +25,11 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessWithOrigins(t, "")
+}
+
+func newHarnessWithOrigins(t *testing.T, allowed string) *harness {
+	t.Helper()
 
 	store, err := OpenStore(t.TempDir() + "/test.db")
 	if err != nil {
@@ -31,7 +38,7 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() { _ = store.Close() })
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(newMux(NewHub(store, logger)))
+	srv := httptest.NewServer(newMux(NewHubWithOrigins(store, logger, allowed)))
 	t.Cleanup(srv.Close)
 
 	return &harness{
@@ -41,22 +48,34 @@ func newHarness(t *testing.T) *harness {
 	}
 }
 
-// dial opens a connection and completes HELLO.
-func (h *harness) dial(t *testing.T, userID string, identity []byte) *testClient {
+// testIdentity is a real Ed25519 key pair plus a stand-in for the DH half, so
+// the challenge signature can actually be produced and checked. The relay
+// never looks at the DH half beyond storing it.
+type testIdentity struct {
+	blob   []byte // [32] dh stand-in | [32] ed25519 public
+	signer ed25519.PrivateKey
+}
+
+func newTestIdentity(t *testing.T, seed byte) *testIdentity {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519: %v", err)
+	}
+	blob := make([]byte, 64)
+	for i := 0; i < 32; i++ {
+		blob[i] = seed + byte(i)
+	}
+	copy(blob[32:], pub)
+	return &testIdentity{blob: blob, signer: priv}
+}
+
+// dial opens a connection and completes the challenge handshake.
+func (h *harness) dial(t *testing.T, userID string, id *testIdentity) *testClient {
 	t.Helper()
 
-	conn, _, err := websocket.DefaultDialer.Dial(h.wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
-
-	c := &testClient{t: t, conn: conn}
-	var w writer
-	w.str(userID)
-	w.blob(identity)
-	c.send(typeHello, w.bytes())
-
+	c := h.dialRaw(t)
+	c.hello(t, userID, id)
 	if msgType, _ := c.recv(); msgType != typeHelloOK {
 		t.Fatalf("expected hello ok, got %#x", msgType)
 	}
@@ -73,6 +92,27 @@ func (h *harness) dialRaw(t *testing.T) *testClient {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return &testClient{t: t, conn: conn}
+}
+
+// hello runs HELLO plus the challenge response.
+func (c *testClient) hello(t *testing.T, userID string, id *testIdentity) {
+	t.Helper()
+
+	var w writer
+	w.str(userID)
+	w.blob(id.blob)
+	c.send(typeHello, w.bytes())
+
+	payload := c.recvType(typeAuthChallenge)
+	r := reader{buf: payload}
+	nonce, err := r.blob()
+	if err != nil || len(nonce) != challengeSize {
+		t.Fatalf("challenge: %v", err)
+	}
+
+	var a writer
+	a.blob(ed25519.Sign(id.signer, nonce))
+	c.send(typeAuthResponse, a.bytes())
 }
 
 type testClient struct {
@@ -127,6 +167,7 @@ func (c *testClient) expectType(want byte) []byte {
 	return payload
 }
 
+// identity is used by the store-level tests, which never sign anything.
 func identity(seed byte) []byte {
 	b := make([]byte, 64)
 	for i := range b {
@@ -211,19 +252,96 @@ func TestFieldCodecRejectsTruncation(t *testing.T) {
 
 func TestHelloBindsIdentity(t *testing.T) {
 	h := newHarness(t)
-	h.dial(t, "alice", identity(1))
+	h.dial(t, "alice", newTestIdentity(t, 1))
 
-	// Same user id, different identity: must be refused.
+	// Same user id, different identity: the challenge is answered correctly
+	// for the *new* key, so the refusal has to come from the binding check.
 	c := h.dialRaw(t)
+	impostor := newTestIdentity(t, 99)
 	var w writer
 	w.str("alice")
-	w.blob(identity(99))
+	w.blob(impostor.blob)
 	c.send(typeHello, w.bytes())
+
+	r := reader{buf: c.recvType(typeAuthChallenge)}
+	nonce, _ := r.blob()
+	var a writer
+	a.blob(ed25519.Sign(impostor.signer, nonce))
+	c.send(typeAuthResponse, a.bytes())
 
 	payload := c.expectType(typeError)
 	if !strings.Contains(string(payload), "identity") {
 		t.Fatalf("unexpected error payload: %q", payload)
 	}
+}
+
+func TestHelloRejectsForgedProof(t *testing.T) {
+	// A user id must only be claimable by the holder of the matching signing
+	// key. Otherwise registration is first-come-first-served and anyone can
+	// take over an id that has not been used yet, then publish prekeys of
+	// their own under it.
+	h := newHarness(t)
+
+	victim := newTestIdentity(t, 5)
+	attacker := newTestIdentity(t, 6)
+
+	// The attacker sends the victim's *public* identity with its own key as
+	// the signer: a signature that verifies against nothing the victim holds.
+	c := h.dialRaw(t)
+	var w writer
+	w.str("carol")
+	w.blob(victim.blob)
+	c.send(typeHello, w.bytes())
+
+	r := reader{buf: c.recvType(typeAuthChallenge)}
+	nonce, _ := r.blob()
+	var a writer
+	// Sign with the attacker's key, but present it as carol's identity.
+	a.blob(ed25519.Sign(attacker.signer, nonce))
+	c.send(typeAuthResponse, a.bytes())
+
+	payload := c.expectType(typeError)
+	if !strings.Contains(string(payload), "proof") {
+		t.Fatalf("unexpected error payload: %q", payload)
+	}
+
+	// And nothing was registered under the id.
+	got, err := h.store.Identity("carol")
+	if err != nil {
+		t.Fatalf("identity lookup: %v", err)
+	}
+	if got != nil {
+		t.Fatal("a failed proof must not bind the user id")
+	}
+}
+
+func TestAuthResponseRequiresChallenge(t *testing.T) {
+	h := newHarness(t)
+	c := h.dialRaw(t)
+
+	var a writer
+	a.blob(make([]byte, ed25519.SignatureSize))
+	c.send(typeAuthResponse, a.bytes())
+
+	payload := c.expectType(typeError)
+	if !strings.Contains(string(payload), "challenge") {
+		t.Fatalf("unexpected payload: %q", payload)
+	}
+}
+
+func TestSecondChallengeRefused(t *testing.T) {
+	h := newHarness(t)
+	c := h.dialRaw(t)
+
+	var w writer
+	w.str("dave")
+	w.blob(newTestIdentity(t, 7).blob)
+	c.send(typeHello, w.bytes())
+	c.recvType(typeAuthChallenge)
+
+	// Asking twice would let a client grind nonces on one connection.
+	c.send(typeHello, w.bytes())
+	c.expectType(typeError)
 }
 
 func TestHelloRejectsShortIdentity(t *testing.T) {
@@ -248,17 +366,82 @@ func TestHelloRequiredBeforeSend(t *testing.T) {
 	c.send(typeSend, w.bytes())
 
 	payload := c.expectType(typeError)
-	if !strings.Contains(string(payload), "HELLO") {
+	if !strings.Contains(string(payload), "challenge") {
 		t.Fatalf("unexpected payload: %q", payload)
 	}
+}
+
+// ---- Origin policy -----------------------------------------------------
+
+func TestOriginPolicy(t *testing.T) {
+	// No Origin header: a native client. Accepted.
+	if !newOriginPolicy("").check(requestWithOrigin(nil)) {
+		t.Fatal("native client rejected")
+	}
+
+	// A browser at an unlisted origin must not open a socket, even with no
+	// cookies involved: the handshake would otherwise inherit whatever
+	// ambient authority the page has against this host.
+	if newOriginPolicy("").check(requestWithOrigin(strPtr("https://evil.example"))) {
+		t.Fatal("unlisted origin accepted by an empty allow-list")
+	}
+
+	p := newOriginPolicy("https://app.example.com, https://web.example.com/")
+	if !p.check(requestWithOrigin(strPtr("https://app.example.com"))) {
+		t.Fatal("listed origin rejected")
+	}
+	// Normalisation: trailing slash and explicit default port must not matter.
+	if !p.check(requestWithOrigin(strPtr("https://web.example.com/"))) {
+		t.Fatal("listed origin with trailing slash rejected")
+	}
+	if p.check(requestWithOrigin(strPtr("https://app.example.com.evil.example"))) {
+		t.Fatal("look-alike origin accepted")
+	}
+	if p.check(requestWithOrigin(strPtr("http://app.example.com"))) {
+		t.Fatal("scheme downgrade accepted")
+	}
+}
+
+func TestHandshakeRejectedForForeignOrigin(t *testing.T) {
+	h := newHarnessWithOrigins(t, "https://app.example.com")
+
+	header := http.Header{}
+	header.Set("Origin", "https://evil.example")
+	_, resp, err := websocket.DefaultDialer.Dial(h.wsURL, header)
+	if err == nil {
+		t.Fatal("foreign origin completed a handshake")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %v, want 403", resp)
+	}
+
+	// The listed origin still works.
+	ok := http.Header{}
+	ok.Set("Origin", "https://app.example.com")
+	conn, _, err := websocket.DefaultDialer.Dial(h.wsURL, ok)
+	if err != nil {
+		t.Fatalf("listed origin refused: %v", err)
+	}
+	_ = conn.Close()
+}
+
+func strPtr(s string) *string { return &s }
+
+func requestWithOrigin(origin *string) *http.Request {
+	r, _ := http.NewRequest(http.MethodGet, "http://relay.local/ws", nil)
+	if origin != nil {
+		r.Header.Set("Origin", *origin)
+	}
+	return r
 }
 
 // ---- Prekeys -----------------------------------------------------------
 
 func TestPreKeyPublishAndFetch(t *testing.T) {
 	h := newHarness(t)
-	bob := h.dial(t, "bob", identity(2))
-	alice := h.dial(t, "alice", identity(3))
+	bobID := newTestIdentity(t, 2)
+	bob := h.dial(t, "bob", bobID)
+	alice := h.dial(t, "alice", newTestIdentity(t, 3))
 
 	// Two one-time entries, in the client's own encoding:
 	//   [4] count, then per entry [4] id | [32] public
@@ -294,7 +477,7 @@ func TestPreKeyPublishAndFetch(t *testing.T) {
 		t.Fatalf("user = %q, %v", gotUser, err)
 	}
 	id, _ := r.blob()
-	if !bytes.Equal(id, identity(2)) {
+	if !bytes.Equal(id, bobID.blob) {
 		t.Fatal("identity mismatch in bundle")
 	}
 	signedID, _ := r.u32()
@@ -348,7 +531,7 @@ func TestPreKeyPublishAndFetch(t *testing.T) {
 
 func TestBundleMissing(t *testing.T) {
 	h := newHarness(t)
-	alice := h.dial(t, "alice", identity(4))
+	alice := h.dial(t, "alice", newTestIdentity(t, 4))
 
 	var w writer
 	w.str("nobody")
@@ -361,8 +544,8 @@ func TestBundleMissing(t *testing.T) {
 
 func TestDeliverOnline(t *testing.T) {
 	h := newHarness(t)
-	alice := h.dial(t, "alice", identity(10))
-	bob := h.dial(t, "bob", identity(11))
+	alice := h.dial(t, "alice", newTestIdentity(t, 10))
+	bob := h.dial(t, "bob", newTestIdentity(t, 11))
 
 	var w writer
 	w.str("bob")
@@ -387,7 +570,7 @@ func TestDeliverOnline(t *testing.T) {
 
 func TestDeliverOfflineThenFlush(t *testing.T) {
 	h := newHarness(t)
-	alice := h.dial(t, "alice", identity(20))
+	alice := h.dial(t, "alice", newTestIdentity(t, 20))
 
 	// Bob is not connected, so the message is queued.
 	var w writer
@@ -401,7 +584,7 @@ func TestDeliverOfflineThenFlush(t *testing.T) {
 	})
 
 	// Bob connects and must receive the backlog without asking.
-	bob := h.dial(t, "bob", identity(21))
+	bob := h.dial(t, "bob", newTestIdentity(t, 21))
 
 	payload := bob.recvType(typeDeliver)
 	r := reader{buf: payload}
@@ -420,7 +603,7 @@ func TestDeliverOfflineThenFlush(t *testing.T) {
 
 func TestAckDrainsOutbox(t *testing.T) {
 	h := newHarness(t)
-	alice := h.dial(t, "alice", identity(30))
+	alice := h.dial(t, "alice", newTestIdentity(t, 30))
 
 	var w writer
 	w.str("bob")
@@ -432,7 +615,7 @@ func TestAckDrainsOutbox(t *testing.T) {
 		return err == nil && n == 1
 	})
 
-	bob := h.dial(t, "bob", identity(31))
+	bob := h.dial(t, "bob", newTestIdentity(t, 31))
 	bob.recvType(typeDeliver)
 
 	var a writer
@@ -447,7 +630,7 @@ func TestAckDrainsOutbox(t *testing.T) {
 
 func TestSelfSendRejected(t *testing.T) {
 	h := newHarness(t)
-	alice := h.dial(t, "alice", identity(40))
+	alice := h.dial(t, "alice", newTestIdentity(t, 40))
 
 	var w writer
 	w.str("alice")
@@ -459,7 +642,7 @@ func TestSelfSendRejected(t *testing.T) {
 
 func TestUnknownTypeRejected(t *testing.T) {
 	h := newHarness(t)
-	alice := h.dial(t, "alice", identity(50))
+	alice := h.dial(t, "alice", newTestIdentity(t, 50))
 
 	alice.send(0x7F, []byte("nope"))
 	alice.expectType(typeError)
@@ -535,6 +718,86 @@ func TestHealthEndpoint(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
+}
+
+// ---- Outbox paging -----------------------------------------------------
+
+func TestOutboxDrainsAcrossPages(t *testing.T) {
+	// A backlog larger than one page used to strand everything past the first
+	// page until the next reconnect, with the client showing an empty
+	// conversation and no hint that more was waiting.
+	h := newHarness(t)
+	alice := h.dial(t, "alice", newTestIdentity(t, 60))
+
+	const total = flushPageSize + 25
+	for i := 0; i < total; i++ {
+		var w writer
+		w.str("bob")
+		w.blob([]byte{byte(i)})
+		alice.send(typeSend, w.bytes())
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		n, err := h.store.PendingCount()
+		return err == nil && n == total
+	})
+
+	bob := h.dial(t, "bob", newTestIdentity(t, 61))
+
+	// Page one, then the "more pending" marker, then an ACK pulls page two.
+	received := readPage(t, bob, flushPageSize)
+	more := bob.recvType(typeMorePending)
+	if len(more) != 0 {
+		t.Fatalf("more-pending frame carried %d bytes", len(more))
+	}
+	if len(received) != flushPageSize {
+		t.Fatalf("first page = %d, want %d", len(received), flushPageSize)
+	}
+
+	var a writer
+	a.u32(uint32(received[len(received)-1]))
+	bob.send(typeAck, a.bytes())
+
+	rest := readPage(t, bob, total-flushPageSize)
+	if len(rest) != total-flushPageSize {
+		t.Fatalf("second page = %d, want %d", len(rest), total-flushPageSize)
+	}
+
+	// Payloads must arrive in order, with nothing dropped or duplicated across
+	// the page boundary.
+	all := append(append([]uint32{}, received...), rest...)
+	for i := 1; i < len(all); i++ {
+		if all[i] <= all[i-1] {
+			t.Fatalf("outbox ids out of order across pages: %d then %d", all[i-1], all[i])
+		}
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		n, err := h.store.PendingCount()
+		return err == nil && n == total-int64(flushPageSize)
+	})
+}
+
+// readPage collects up to n DELIVER frames, stopping early on more-pending.
+func readPage(t *testing.T, c *testClient, n int) []uint32 {
+	t.Helper()
+	var ids []uint32
+	for len(ids) < n {
+		msgType, payload := c.recv()
+		switch msgType {
+		case typeDeliver:
+			r := reader{buf: payload}
+			id, err := r.u32()
+			if err != nil {
+				t.Fatalf("deliver id: %v", err)
+			}
+			ids = append(ids, id)
+		case typeMorePending:
+			return ids
+		default:
+			t.Fatalf("unexpected frame %#x while reading a page", msgType)
+		}
+	}
+	return ids
 }
 
 // ---- Helpers -----------------------------------------------------------

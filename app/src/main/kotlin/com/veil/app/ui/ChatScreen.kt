@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.sp
 import com.veil.app.LinkState
 import com.veil.app.data.ChatMessage
 import com.veil.app.data.Peer
+import com.veil.app.data.SendState
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -207,15 +208,34 @@ private fun MessageBubble(message: ChatMessage) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
                 Text(message.text)
                 Spacer(Modifier.height(2.dp))
-                Text(
-                    timeFormat.format(Date(message.timestamp)),
-                    fontSize = 10.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.align(Alignment.End),
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // A bubble only ever looked "sent". The state is spelled
+                    // out now, because a frame that never left the device is a
+                    // hole in the ratchet, not a cosmetic detail.
+                    message.stateLabel()?.let { label ->
+                        Text(
+                            label,
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    Text(
+                        timeFormat.format(Date(message.timestamp)),
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
+}
+
+/** The label shown next to an outgoing bubble, or null when there is nothing to say. */
+private fun ChatMessage.stateLabel(): String? = when (state) {
+    SendState.SENT -> null
+    SendState.QUEUED -> "sending"
+    SendState.FAILED -> "not sent"
 }
 
 @Composable

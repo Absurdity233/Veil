@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Wire protocol shared by the client and the relay.
@@ -28,11 +29,35 @@ const (
 	typeDeliver        = 0x07
 	typeAck            = 0x08
 	typeError          = 0x09
+
+	// Challenge-response for HELLO. The relay hands out a nonce, the client
+	// signs it with its identity signing key, and only then is the user id
+	// bound. Without this a user id is first-come-first-served: anybody could
+	// register somebody else's id and publish prekeys of their own under it.
+	typeAuthChallenge = 0x0A
+	typeAuthResponse  = 0x0B
+
+	// Tells the client another page of the outbox is waiting. The relay sends
+	// it after every flush that filled a page, so a client with a large
+	// backlog keeps pulling until the queue is empty instead of stopping at
+	// whatever the first page happened to hold.
+	typeMorePending = 0x0C
 )
 
 const (
 	envelopeHeaderSize = 6
 	maxPayload         = 1 << 20 // 1 MiB
+
+	// How long a client has to answer a challenge before the relay drops the
+	// connection. Long enough for a slow mobile radio, short enough that a
+	// stalled socket does not hold a nonce open.
+	authTimeout = 30 * time.Second
+
+	challengeSize = 32
+
+	// An identity blob is Curve25519 public || Ed25519 public. The relay only
+	// needs the signing half, and only to verify the challenge signature.
+	kKeyOffset = 32
 )
 
 var errShortFrame = errors.New("short frame")

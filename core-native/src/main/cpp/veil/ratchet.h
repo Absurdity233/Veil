@@ -19,14 +19,23 @@ namespace veil {
 // The handshake parameters that must travel with the first message(s) so the
 // recipient can run its side of X3DH. Once the peer has replied, the session
 // drops this and sends plain ratchet messages.
+//
+// It carries the sender's *whole* identity, not just the DH half, for two
+// reasons. The binding signature lets the recipient check that the DH key it
+// will run X3DH against and the signing key it will trust for future prekeys
+// belong to the same holder. And without the signing half the recipient could
+// never compute a safety number the sender would agree with, because the
+// sender's own safety number covers both halves of its identity.
 struct PreKeyHeader {
     uint8_t  sender_identity_dh[kKeySize]{};
+    uint8_t  sender_identity_sign[32]{};
+    uint8_t  sender_binding[kBindingSize]{};   // sign key over sender_identity_dh
     uint8_t  sender_ephemeral[kKeySize]{};
     uint8_t  recipient_identity_dh[kKeySize]{};
     uint32_t signed_prekey_id = 0;
     uint32_t one_time_prekey_id = 0;  // 0 == no one-time prekey was used
 
-    static constexpr size_t kSize = 32 + 32 + 32 + 4 + 4;
+    static constexpr size_t kSize = 32 + 32 + 64 + 32 + 32 + 4 + 4;
 
     void write(uint8_t* out) const;
     static bool read(PreKeyHeader& out, const uint8_t* in, size_t size);

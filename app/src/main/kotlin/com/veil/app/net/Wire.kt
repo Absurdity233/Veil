@@ -26,6 +26,16 @@ object Wire {
     const val TYPE_ACK = 0x08
     const val TYPE_ERROR = 0x09
 
+    // HELLO is a challenge-response: the relay hands out a nonce and only
+    // binds the user id once the client has signed it with its identity
+    // signing key. Without it a user id would be first-come-first-served.
+    const val TYPE_AUTH_CHALLENGE = 0x0A
+    const val TYPE_AUTH_RESPONSE = 0x0B
+
+    // Sent after a full page of replayed outbox entries: more is waiting, and
+    // the next ACK pulls the following page.
+    const val TYPE_MORE_PENDING = 0x0C
+
     const val MAX_PAYLOAD = 1 shl 20
 
     fun frame(type: Int, payload: ByteArray): ByteArray {

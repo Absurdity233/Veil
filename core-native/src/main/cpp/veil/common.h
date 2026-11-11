@@ -17,6 +17,20 @@ constexpr size_t kMacSize   = 16;
 constexpr size_t kNonceSize = 24;
 constexpr size_t kSigSize   = 64;
 
+// A full identity is two public keys, not one: the Curve25519 key that X3DH
+// uses, followed by the Ed25519 key that signs prekeys. Treating them as one
+// 64-byte value everywhere is deliberate - a binding signature alone is not
+// enough, because the safety number has to cover the key that actually
+// authenticates the peer, and that is the signing key.
+constexpr size_t kIdentitySize = kKeySize + 32;
+
+static_assert(kIdentitySize == 64, "identity blob layout is documented as 64 bytes");
+
+// Ed25519 signature over the identity's Curve25519 public key. Proves the two
+// halves of an identity belong to the same holder; without it a relay could
+// splice its own signing key onto a victim's DH key.
+constexpr size_t kBindingSize = kSigSize;
+
 // A message header carries everything the receiver needs to advance its
 // ratchet state before it can derive the message key.
 constexpr size_t kHeaderSize = 32 + 4 + 4;  // dh public || pn || n
