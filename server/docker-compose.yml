@@ -1,0 +1,33 @@
+# Veil relay.
+#
+# The relay only routes opaque ciphertext, so the container needs no secrets
+# and no external database: one volume for the SQLite file is the whole state.
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: veil-relay:latest
+    container_name: veil-relay
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - veil-data:/data
+    environment:
+      VEIL_ADDR: ":8080"
+      VEIL_DB: "/data/veil.db"
+    healthcheck:
+      # The distroless image has no shell, so the check must be a binary call.
+      # wget/curl are absent; the relay's own /health is probed by the host
+      # (see scripts/healthcheck.sh) or by an orchestrator instead.
+      disable: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+
+volumes:
+  veil-data:

@@ -1,0 +1,27 @@
+# Gradle
+.gradle/
+build/
+!build/relay/
+local.properties
+
+# Android Studio
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Native build output
+*.o
+*.so
+*.exe
+!build/host/*.exe
+
+# Go
+server/veil.db
+server/veil.db-*
+server/veil-relay
+server/veil-relay.exe
+
+# Vendored archives
+_vendor/

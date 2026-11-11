@@ -1,0 +1,256 @@
+package com.veil.app.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.veil.app.LinkState
+import com.veil.app.data.ChatMessage
+import com.veil.app.data.Peer
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+private val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+
+@Composable
+fun LinkBadge(state: LinkState) {
+    val (label, color) = when (state) {
+        LinkState.Online -> "online" to Color(0xFF4ADE80)
+        LinkState.Connecting -> "connecting" to Color(0xFFFBBF24)
+        LinkState.Error -> "error" to Color(0xFFF87171)
+        LinkState.Offline -> "offline" to Color(0xFF94A3B8)
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(color),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(label, fontSize = 12.sp, color = color)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ChatScreen(
+    peer: Peer,
+    link: LinkState,
+    messages: List<ChatMessage>,
+    safetyNumber: String?,
+    status: String?,
+    onSend: (String) -> Unit,
+    onBack: () -> Unit,
+) {
+    var draft by remember { mutableStateOf("") }
+    var showSafety by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(peer.displayName, fontWeight = FontWeight.SemiBold)
+                        LinkBadge(link)
+                    }
+                },
+                actions = {
+                    TextButton(onClick = { showSafety = !showSafety }) {
+                        Text(if (showSafety) "Hide code" else "Verify")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                ),
+                navigationIcon = {
+                    TextButton(onClick = onBack) { Text("Back") }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .imePadding(),
+        ) {
+            if (showSafety) {
+                SafetyBanner(peer.userId, safetyNumber)
+            }
+            status?.let {
+                Text(
+                    it,
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                    horizontal = 16.dp,
+                    vertical = 8.dp,
+                ),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                items(messages, key = { it.id }) { message ->
+                    MessageBubble(message)
+                }
+            }
+
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Message") },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    maxLines = 4,
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = {
+                        val text = draft
+                        draft = ""
+                        onSend(text)
+                    },
+                    enabled = draft.isNotBlank() && link == LinkState.Online,
+                ) {
+                    Text("Send")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageBubble(message: ChatMessage) {
+    val alignment = if (message.outgoing) Alignment.CenterEnd else Alignment.CenterStart
+    val color = if (message.outgoing) {
+        MaterialTheme.colorScheme.primaryContainer
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant
+    }
+
+    Box(Modifier.fillMaxWidth(), contentAlignment = alignment) {
+        Card(
+            Modifier.widthIn(max = 280.dp),
+            shape = RoundedCornerShape(
+                topStart = 16.dp,
+                topEnd = 16.dp,
+                bottomStart = if (message.outgoing) 16.dp else 4.dp,
+                bottomEnd = if (message.outgoing) 4.dp else 16.dp,
+            ),
+            colors = CardDefaults.cardColors(containerColor = color),
+        ) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Text(message.text)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    timeFormat.format(Date(message.timestamp)),
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.align(Alignment.End),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SafetyBanner(peerId: String, safetyNumber: String?) {
+    Card(
+        Modifier
+            .fillMaxWidth()
+            .padding(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+        ),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Text("Safety number with $peerId", fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(6.dp))
+            if (safetyNumber.isNullOrEmpty()) {
+                Text(
+                    "No session yet - send or receive a message first.",
+                    fontSize = 12.sp,
+                )
+            } else {
+                Text(
+                    safetyNumber,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 15.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Compare this with the same screen on the other device. " +
+                        "If the digits match, no one is sitting in the middle.",
+                    fontSize = 11.sp,
+                )
+            }
+        }
+    }
+}
