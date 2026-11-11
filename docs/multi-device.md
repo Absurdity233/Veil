@@ -233,14 +233,20 @@ yet.
 | C ABI for both of the above | `core-native/.../veil_c.{h,cpp}` | done |
 | Relay: device table, `PUBLISH_DEVICES` / `GET_DEVICES` | `server/store.go`, `server/hub.go` | done |
 | Relay: `HELLO` and `SEND` carry a device id, outbox per device | `server/hub.go`, `server/store.go` | done |
-| Client wiring: linking UI, device list refresh, per-device send | `app/`, `desktop/`, `web/` | **not started** |
+| Clients: device id claimed, persisted, announced; fan-out send | `app/`, `desktop/`, `web/` | done |
+| Client UI: linking flow, device list refresh | `app/`, `desktop/`, `web/` | **not started** |
 
-The relay is now device-aware: a connection announces its device in `HELLO`, a
+The relay is device-aware: a connection announces its device in `HELLO`, a
 `SEND` may name one, and a frame addressed to a device reaches only that device's
-connections. An empty device id still addresses the whole account, which is why
-a single-device account and a not-yet-upgraded client keep working unchanged.
+connections. An empty device id still addresses the whole account, which is why a
+single-device account keeps working unchanged.
 
-So the whole protocol path is closed. What remains is a client that uses it.
+All three clients now claim a device on connect, persist it so a restart does not
+mint a second one, and send through the fan-out path: one plaintext becomes one
+frame per device of the peer, with a device that has no session skipped rather
+than failing the whole send.
+
+What remains is UI — no client draws a linking flow or shows a device list.
 
 What that means in practice: the engine can hold a multi-device account and
 behave correctly, and a relay can store and serve device lists, but no client
@@ -267,10 +273,12 @@ testable without a relay:
 
 ### What is deliberately still missing
 
-- **Linking UI.** The protocol supports it (`adoptDeviceCredential`); no client
-  draws the QR code or the fingerprint comparison yet.
+- **Linking UI.** The protocol supports it (`adoptDeviceCredential`) and all
+  three clients can call it; none of them draws the QR code or the fingerprint
+  comparison yet.
 - **Device list refresh strategy.** When a client re-fetches, and how it behaves
   when a send fails because a device list moved, is a client decision that has
-  not been made.
+  not been made. The web client has `refreshPeerDevices` and
+  `connectPeerDevices`; the other two do not surface them yet.
 - **History transfer to a new device.** Out of scope above, and still out of
   scope.

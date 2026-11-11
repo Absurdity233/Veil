@@ -76,3 +76,26 @@ interface ChatStore {
     fun peer(peerId: String): Peer?
     fun clear()
 }
+
+/**
+ * A group this client is in.
+ *
+ * [canSend] is false right after a membership change: every chain is discarded
+ * and the epoch moves, so nobody can send until each member republishes one.
+ * That is the mechanism, not a bug to work around - see docs/group.md.
+ */
+data class GroupUi(
+    val groupId: String,
+    val epoch: Int,
+    val members: List<String>,
+    val canSend: Boolean,
+)
+
+/** One group message. No peer id: the conversation is the group. */
+data class GroupMessageUi(
+    val groupId: String,
+    val senderId: String,
+    val text: String,
+    val timestamp: Long,
+    val outgoing: Boolean,
+)

@@ -11,6 +11,7 @@ import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 /**
  * The desktop client against a real relay process.
@@ -300,6 +301,102 @@ class DesktopInteropTest {
             alice.close()
             bob.close()
         }
+    }
+
+    @Test
+    fun `a fan-out send produces one frame per device with a session`() {
+        // The wiring, not the engine: ChatController.sendMessage has to go
+        // through encryptToAccount. Asserting the engine alone would not catch a
+        // client that still calls encrypt().
+        val alice = VeilEngine.create()
+        val bob = VeilEngine.create()
+        try {
+            alice.initDevice("alice")
+            bob.initDevice("bob")
+            alice.rotatePreKeys()
+
+            val bobPub = bob.publicIdentity()!!
+
+            // Bob publishes a list of one, so alice knows to fan out rather than
+            // address the bare account label.
+            val bobCred = bob.deviceCredential()!!
+            val blob = ByteArray(4 + bobCred.size)
+            blob[3] = 1
+            bobCred.copyInto(blob, 4)
+            assertEquals(VeilC.OK, alice.adoptDeviceList(
+                "bob", 1, blob, bobPub.copyOfRange(0, 32), bobPub.copyOfRange(32, 64),
+            ))
+
+            val devices = alice.peerDevices("bob")
+            assertEquals("bob has one device", 1, devices.size)
+
+            // No session yet: the device is skipped, and an empty result is not
+            // an error.
+            assertEquals("a device with no session produces no frame", 0,
+                alice.encryptToAccount("bob", "hello".toByteArray()).size)
+
+            val bundle = bundleFrom(bob, bob.rotatePreKeys())
+            val established = alice.establishOutbound("bob#${devices[0]}", bundle)
+            assertEquals("the session to that device is established", VeilEngine.Status.OK, established)
+
+            val frames = alice.encryptToAccount("bob", "hello".toByteArray())
+            assertEquals("one device with a session yields one frame", 1, frames.size)
+            assertEquals("and it is addressed to that device", devices[0], frames[0].first)
+        } finally {
+            alice.close()
+            bob.close()
+        }
+    }
+
+    @Test
+    fun `a group survives a controller restart`() {
+        // The persistence path: group state exported on close and restored on the
+        // next start. A client that never persisted it would lose every group on
+        // relaunch, which looks exactly like being removed from them.
+        val dir = Files.createTempDirectory("veil-group")
+
+        val first = ChatController(dir)
+        try {
+            runBlocking {
+                first.ensureIdentity()
+                assertTrue("the device is claimed", first.claimDevice("alice"))
+            }
+
+            // The controller writes asynchronously, so the wait is explicit
+            // rather than a sleep: a fixed delay would make this test slow on a
+            // fast machine and flaky on a loaded one.
+            first.createGroup("team")
+            waitUntil(3_000) { first.groups.value.isNotEmpty() }
+            first.setGroupMembers("team", listOf("alice", "bob"))
+            waitUntil(3_000) { first.groups.value.firstOrNull()?.epoch == 2 }
+
+            waitUntil(5_000) { Files.exists(dir.resolve("groups.bin")) }
+        } finally {
+            first.close()
+        }
+
+        // A fresh controller on the same directory: this is the restart.
+        val second = ChatController(dir)
+        try {
+            runBlocking { second.ensureIdentity() }
+
+            val groups = second.groups.value
+            assertEquals("the group came back", 1, groups.size)
+            assertEquals("with its epoch", 2, groups[0].epoch)
+            assertEquals("and its members", listOf("alice", "bob"), groups[0].members)
+        } finally {
+            second.close()
+        }
+    }
+
+    /** Polls until [condition] holds, or fails after [timeoutMs]. */
+    private fun waitUntil(timeoutMs: Long, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (condition()) return
+            Thread.sleep(25)
+        }
+        throw AssertionError("condition did not hold within ${timeoutMs}ms")
     }
 
     private fun bundleFrom(engine: VeilEngine, set: ByteArray): ByteArray {

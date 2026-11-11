@@ -164,11 +164,11 @@ sending), and group messaging with Sender Keys (one frame per message regardless
 of group size, epoch-based re-keying when membership changes, persisted across
 restarts). The relay addresses frames per device and stores device lists.
 
-**Surfaced in the clients:** the web client has device identity, fan-out sending,
-group create/send/receive and group state in the sealed vault. Android and
-desktop have the same engine surface (`encryptToAccount`, groups, group
-persistence) and announce their device id on connect; what they still lack is UI
-for it.
+**Surfaced in all three clients:** device identity claimed on connect and
+persisted, fan-out sending (one frame per device of a peer), group
+create/send/receive, and group state in each client's encrypted store. Android
+and desktop reach it through JNI and JNA respectively; the web client through
+wasm.
 
 **Not implemented at all:** push notifications, account recovery, a device
 linking UI, and group invitations over the wire (chains and member lists travel

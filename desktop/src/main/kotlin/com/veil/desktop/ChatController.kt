@@ -36,6 +36,31 @@ data class Peer(
     val displayName: String,
     val safetyNumber: String? = null,
     val state: SessionState = SessionState.NO_PEER,
+    /** The peer's device ids, hex. Empty means a single-device peer. */
+    val devices: List<String> = emptyList(),
+)
+
+/**
+ * A group this client is in.
+ *
+ * [canSend] is false right after a membership change: every chain is discarded
+ * and the epoch moves, so nobody can send until each member republishes one.
+ * That is the mechanism, not a bug to work around - see docs/group.md.
+ */
+data class Group(
+    val groupId: String,
+    val epoch: Int,
+    val members: List<String>,
+    val canSend: Boolean,
+)
+
+/** One group message. No peer id: the conversation is the group. */
+data class GroupMessage(
+    val groupId: String,
+    val senderId: String,
+    val text: String,
+    val timestamp: Long,
+    val outgoing: Boolean,
 )
 
 /**
@@ -76,8 +101,49 @@ class ChatController(private val stateDir: Path) {
     private val _status = MutableStateFlow<String?>(null)
     val status: StateFlow<String?> = _status.asStateFlow()
 
+    private val _groups = MutableStateFlow<List<Group>>(emptyList())
+    val groups: StateFlow<List<Group>> = _groups.asStateFlow()
+
+    private val _groupMessages = MutableStateFlow<Map<String, List<GroupMessage>>>(emptyMap())
+    val groupMessages: StateFlow<Map<String, List<GroupMessage>>> = _groupMessages.asStateFlow()
+
+    /** This client's own device id, hex. Empty until one has been created. */
+    var deviceId: String = ""
+        private set
+
+    /** The user id this client connected as; empty before the first connect. */
+    private var userId: String = ""
+
+    /**
+     * Gives this client a device identity without connecting.
+     *
+     * A device is local state: a group is created, a member list is signed and a
+     * chain is published without a relay being involved. Requiring a connection
+     * for those would make an offline client unable to set anything up, and it
+     * would make the requirement invisible until the first call failed.
+     */
+    suspend fun claimDevice(userId: String): Boolean = withContext(crypto) {
+        this@ChatController.userId = userId
+        ensureDevice(userId)
+        return@withContext deviceId.isNotEmpty()
+    }
+
     /** Frames encrypted but not yet handed to the relay. */
-    private val pending = ArrayDeque<Pair<String, ByteArray>>()
+    private val pending = ArrayDeque<PendingFrame>()
+
+    /**
+     * A frame waiting to be sent.
+     *
+     * The device id travels beside the bytes rather than being recovered at send
+     * time: the frame was encrypted to one device's ratchet, and re-deriving
+     * which one would be a guess that gets it wrong exactly when a peer links a
+     * second device.
+     */
+    private data class PendingFrame(
+        val peerId: String,
+        val deviceId: String,
+        val frame: ByteArray,
+    )
 
     private var messageSeq = 0L
     private var nextMessageId = 1L
@@ -135,6 +201,12 @@ class ChatController(private val stateDir: Path) {
                 }
             }
         }
+
+        // Groups and the device id last, because both depend on the engine
+        // having its identity: a group's chain keys are derived from it, and a
+        // device id is only meaningful alongside one.
+        restoreGroups(engine)
+        vault.loadDeviceId()?.let { deviceId = it }
     }
 
     private fun persistSession(peerId: String) {
@@ -177,17 +249,45 @@ class ChatController(private val stateDir: Path) {
 
         scope.launch {
             try {
+                this@ChatController.userId = userId
                 val identity = ensureIdentity()
+
+                // Claim a device before connecting, so HELLO can announce it.
+                // A restart finds the stored id rather than minting a second
+                // device for the same account.
+                withContext(crypto) { ensureDevice(userId) }
+
                 val client = RelayClient(serverUrl)
                 relay = client
                 pump?.cancel()
                 pump = scope.launch { pumpEvents(client) }
-                client.connect(userId, identity)
+                client.connect(userId, identity, deviceId)
             } catch (e: Exception) {
                 _link.value = LinkState.ERROR
                 _status.value = e.message ?: "connection failed"
             }
         }
+    }
+
+    /**
+     * Gives this client a device identity, reusing the stored one when present.
+     *
+     * Must run on the crypto executor: it touches the engine and the vault.
+     */
+    private fun ensureDevice(userId: String) {
+        val engine = engine ?: return
+
+        val stored = vault.loadDeviceId()
+        if (stored != null) {
+            deviceId = stored
+            return
+        }
+
+        if (!engine.initDevice(userId)) return
+        val raw = engine.deviceId() ?: return
+
+        deviceId = raw.joinToString("") { "%02x".format(it) }
+        vault.storeDeviceId(deviceId)
     }
 
     fun disconnect() {
@@ -341,10 +441,13 @@ class ChatController(private val stateDir: Path) {
         if (text.isBlank()) return
 
         scope.launch {
-            val frame = withContext(crypto) {
-                engine.encrypt(peerId, text.toByteArray(Charsets.UTF_8))
+            // One plaintext, one frame per device of the peer. A single-device
+            // peer yields exactly one frame, so the caller still passes a user
+            // id and does not have to know which case it is.
+            val frames = withContext(crypto) {
+                engine.encryptToAccount(peerId, text.toByteArray(Charsets.UTF_8))
             }
-            if (frame == null) {
+            if (frames.isEmpty()) {
                 _status.value = "could not encrypt for $peerId: no session"
                 return@launch
             }
@@ -352,15 +455,140 @@ class ChatController(private val stateDir: Path) {
             appendMessage(peerId, outgoing = true, text = text, state = SendState.QUEUED)
             withContext(crypto) { persistSession(peerId) }
 
-            if (client != null && client.isConnected && client.sendMessage(peerId, frame)) {
+            var allSent = true
+            if (client != null && client.isConnected) {
+                for ((targetDevice, frame) in frames) {
+                    if (!client.sendMessage(peerId, frame, targetDevice)) allSent = false
+                }
+            } else {
+                allSent = false
+            }
+
+            if (allSent) {
                 markLastAs(peerId, SendState.SENT)
             } else {
                 // Keep the exact bytes: re-encrypting would advance the sending
-                // chain a second time and leave the peer with a hole.
-                pending.addLast(peerId to frame)
+                // chain a second time and leave the peer with a hole it can
+                // never fill.
+                for ((targetDevice, frame) in frames) {
+                    pending.addLast(PendingFrame(peerId, targetDevice, frame))
+                }
                 markLastAs(peerId, SendState.FAILED)
                 _status.value = "offline: the message is queued and will be retried"
             }
+        }
+    }
+
+    // ---- Groups -----------------------------------------------------------
+
+    /** Creates a group with this client as founder and sole member. */
+    fun createGroup(groupId: String) {
+        val engine = engine ?: return
+        if (groupId.isBlank()) return
+
+        scope.launch {
+            // A group needs a founder, and the founder is this device's user, so
+            // the device has to exist. It does *not* need a connection: creating
+            // a group is local until the member list is handed to somebody, and
+            // gating it on the relay would make an offline client unable to set
+            // one up.
+            val ready = withContext(crypto) {
+                if (deviceId.isEmpty()) {
+                    if (userId.isEmpty()) return@withContext false
+                    ensureDevice(userId)
+                }
+                deviceId.isNotEmpty() && engine.createGroup(groupId)
+            }
+            if (!ready) {
+                _status.value = "could not create $groupId: no device identity"
+                return@launch
+            }
+            refreshGroup(groupId)
+        }
+    }
+
+    /**
+     * Replaces the member list and bumps the epoch.
+     *
+     * Every chain is discarded, including this client's: a removed member holds
+     * the old chain key, and re-keying is the only thing that stops them reading
+     * what follows.
+     */
+    fun setGroupMembers(groupId: String, members: List<String>) {
+        val engine = engine ?: return
+
+        scope.launch {
+            val epoch = withContext(crypto) { engine.setGroupMembers(groupId, members) }
+            if (epoch == 0) {
+                _status.value = "only the founder may change $groupId's members"
+                return@launch
+            }
+            refreshGroup(groupId)
+        }
+    }
+
+    /** The signed member list, to hand to the other members. */
+    fun exportMembership(groupId: String): ByteArray? =
+        engine?.let { withContextBlocking { it.exportMembership(groupId) } }
+
+    /** Adopts a member list the founder signed. */
+    fun adoptMembership(groupId: String, record: ByteArray, founderSignPub: ByteArray) {
+        val engine = engine ?: return
+
+        scope.launch {
+            val status = withContext(crypto) { engine.adoptMembership(record, founderSignPub) }
+            if (status != VeilC.OK) {
+                _status.value = "that member list was refused (status $status)"
+                return@launch
+            }
+            refreshGroup(groupId)
+        }
+    }
+
+    /** This device's chain for the group's current epoch. */
+    fun exportSenderKey(groupId: String): ByteArray? =
+        engine?.let { withContextBlocking { it.exportSenderKey(groupId) } }
+
+    /** Installs a member's chain, as received over a pairwise session. */
+    fun adoptSenderKey(groupId: String, record: ByteArray, senderId: String,
+                       senderSignPub: ByteArray) {
+        val engine = engine ?: return
+
+        scope.launch {
+            val status = withContext(crypto) {
+                engine.adoptSenderKey(record, senderId, senderSignPub)
+            }
+            if (status != VeilC.OK) {
+                _status.value = "that chain was refused (status $status)"
+                return@launch
+            }
+            refreshGroup(groupId)
+        }
+    }
+
+    /** One message to the whole group: one frame, regardless of size. */
+    fun sendToGroup(groupId: String, text: String) {
+        val engine = engine ?: return
+        val client = relay
+        if (text.isBlank()) return
+
+        scope.launch {
+            val record = withContext(crypto) {
+                engine.encryptToGroup(groupId, text.toByteArray(Charsets.UTF_8))
+            }
+            if (record == null) {
+                _status.value = "cannot send to $groupId: the group has no live chain"
+                return@launch
+            }
+
+            appendGroupMessage(groupId, senderId = "", text = text, outgoing = true)
+
+            // A group frame is addressed by group id, not by device: every member
+            // needs it, and device addressing is what pairwise frames use.
+            if (client == null || !client.isConnected || !client.sendMessage(groupId, record)) {
+                _status.value = "offline: the group message was not delivered"
+            }
+            persistGroups()
         }
     }
 
@@ -368,13 +596,13 @@ class ChatController(private val stateDir: Path) {
         val client = relay ?: return
         if (!client.isConnected) return
 
-        val still = ArrayDeque<Pair<String, ByteArray>>()
+        val still = ArrayDeque<PendingFrame>()
         while (pending.isNotEmpty()) {
-            val (peer, frame) = pending.removeFirst()
-            if (client.sendMessage(peer, frame)) {
-                markLastAs(peer, SendState.SENT)
+            val item = pending.removeFirst()
+            if (client.sendMessage(item.peerId, item.frame, item.deviceId)) {
+                markLastAs(item.peerId, SendState.SENT)
             } else {
-                still.addLast(peer to frame)
+                still.addLast(item)
                 break
             }
         }
@@ -400,6 +628,14 @@ class ChatController(private val stateDir: Path) {
                 return
             }
             VeilEngine.Status.NO_SESSION -> {
+                // Not necessarily an error: a group message arrives addressed by
+                // its sender, and this client may hold no pairwise session with
+                // them. Try it as a group frame before dropping it - the MAC on
+                // each group decides, not a guess.
+                if (withContext(crypto) { tryDeliverAsGroup(peerId, event.frame) }) {
+                    if (event.outboxId > 0) relay?.acknowledge(event.outboxId)
+                    return
+                }
                 _status.value = "dropped a message from $peerId: no session"
                 return
             }
@@ -458,6 +694,103 @@ class ChatController(private val stateDir: Path) {
 
     private fun updatePeer(peerId: String, change: (Peer) -> Peer) {
         _peers.value = _peers.value.map { if (it.userId == peerId) change(it) else it }
+    }
+
+    // ---- Group plumbing ---------------------------------------------------
+
+    fun messagesForGroup(groupId: String): List<GroupMessage> =
+        _groupMessages.value[groupId] ?: emptyList()
+
+    /** Re-reads a group from the engine and republishes the view. */
+    private suspend fun refreshGroup(groupId: String) {
+        val engine = engine ?: return
+
+        val snapshot = withContext(crypto) {
+            val epoch = engine.groupEpoch(groupId)
+            if (epoch == 0) return@withContext null
+
+            Group(
+                groupId = groupId,
+                epoch = epoch,
+                members = engine.groupMembers(groupId),
+                canSend = engine.isGroupMember(groupId),
+            )
+        } ?: return
+
+        _groups.value = (_groups.value.filterNot { it.groupId == groupId } + snapshot)
+            .sortedBy { it.groupId }
+
+        if (!_groupMessages.value.containsKey(groupId)) {
+            _groupMessages.value = _groupMessages.value + (groupId to emptyList())
+        }
+
+        persistGroups()
+    }
+
+    private fun appendGroupMessage(groupId: String, senderId: String, text: String,
+                                   outgoing: Boolean) {
+        val message = GroupMessage(
+            groupId = groupId,
+            senderId = senderId,
+            text = text,
+            timestamp = System.currentTimeMillis(),
+            outgoing = outgoing,
+        )
+        val existing = _groupMessages.value[groupId] ?: emptyList()
+        _groupMessages.value = _groupMessages.value + (groupId to (existing + message))
+    }
+
+    /**
+     * Tries a delivery as a group frame.
+     *
+     * A group message arrives addressed by its sender, and this client may hold
+     * no pairwise session with them. The MAC on each group decides whether it
+     * was one - trying each group is a search over a small set, and the
+     * alternative would be guessing which conversation a frame belongs to.
+     */
+    private fun tryDeliverAsGroup(senderId: String, frame: ByteArray): Boolean {
+        val engine = engine ?: return false
+
+        for (group in _groups.value) {
+            val plain = withContextBlocking { engine.decryptFromGroup(group.groupId, frame) }
+                ?: continue
+
+            appendGroupMessage(group.groupId, senderId, String(plain, Charsets.UTF_8),
+                outgoing = false)
+            withContextBlocking { persistGroups() }
+            return true
+        }
+        return false
+    }
+
+    /** Persists group state and the id list. Carries chain keys. */
+    private fun persistGroups() {
+        val engine = engine ?: return
+
+        engine.exportGroupState()?.let { vault.storeGroupState(it) }
+        vault.storeGroupIds(_groups.value.map { it.groupId })
+    }
+
+    /** Reloads groups after a restart, so a reload does not drop every one. */
+    private fun restoreGroups(engine: VeilEngine) {
+        vault.loadGroupState()?.let { engine.importGroupState(it) }
+
+        val restored = vault.loadGroupIds().mapNotNull { groupId ->
+            val epoch = engine.groupEpoch(groupId)
+            if (epoch == 0) return@mapNotNull null
+
+            Group(
+                groupId = groupId,
+                epoch = epoch,
+                members = engine.groupMembers(groupId),
+                canSend = engine.isGroupMember(groupId),
+            )
+        }
+
+        if (restored.isNotEmpty()) {
+            _groups.value = restored
+            _groupMessages.value = restored.associate { it.groupId to emptyList() }
+        }
     }
 
     fun refreshStates() {
@@ -522,6 +855,31 @@ class Vault(private val dir: Path) {
     fun loadSession(peerId: String): ByteArray? = read("session-${safe(peerId)}.bin")
 
     fun storeSession(peerId: String, blob: ByteArray) = write("session-${safe(peerId)}.bin", blob)
+
+    // ---- Device and group state -------------------------------------------
+    //
+    // Group state carries chain keys: every incoming chain decrypts that
+    // sender's messages, and the outgoing one can forge them. It goes through
+    // the same owner-only file as ratchet state, for the same reason.
+
+    fun loadDeviceId(): String? =
+        read("device-id.txt")?.toString(Charsets.UTF_8)?.trim()?.ifEmpty { null }
+
+    fun storeDeviceId(id: String) = write("device-id.txt", id.toByteArray(Charsets.UTF_8))
+
+    fun loadGroupState(): ByteArray? = read("groups.bin")
+
+    fun storeGroupState(blob: ByteArray) = write("groups.bin", blob)
+
+    fun loadGroupIds(): List<String> =
+        read("group-ids.txt")
+            ?.toString(Charsets.UTF_8)
+            ?.lines()
+            ?.filter { it.isNotBlank() }
+            ?: emptyList()
+
+    fun storeGroupIds(ids: List<String>) =
+        write("group-ids.txt", ids.joinToString("\n").toByteArray(Charsets.UTF_8))
 
     private fun read(name: String): ByteArray? {
         val path = dir.resolve(name)
