@@ -15,4 +15,6 @@ var (
 	errAlreadyChallenged = errors.New("a challenge was already issued on this connection")
 	errNoChallenge       = errors.New("send HELLO to request a challenge first")
 	errBadSignature      = errors.New("identity proof did not verify")
+	errRateLimited       = errors.New("too many sends on this connection; back off")
+	errShuttingDown      = errors.New("relay is shutting down")
 )

@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/subtle"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,6 +27,10 @@ const (
 	// more whenever a page came back full, so a large backlog drains over
 	// several round trips instead of stalling at the first page.
 	flushPageSize = 200
+
+	// How long a graceful shutdown waits for connections to close politely
+	// before the process exits anyway.
+	drainGraceful = 5 * time.Second
 )
 
 // allowedOrigins is an explicit allow-list. Browsers send an Origin header on
@@ -85,6 +92,16 @@ type Hub struct {
 
 	mu     sync.RWMutex
 	byUser map[string]map[*client]struct{}
+
+	// Set once the process is shutting down. New handshakes are refused and
+	// live sockets are closed with a "going away" code, so a client knows to
+	// reconnect rather than sitting on a socket that will never speak again.
+	draining atomic.Bool
+
+	// Counters the readiness endpoint reports. They are cheap and they are the
+	// only way to notice that something is rejecting frames in bulk.
+	statRejected atomic.Int64
+	statAccepted atomic.Int64
 }
 
 func NewHub(store *Store, log *slog.Logger) *Hub {
@@ -148,22 +165,32 @@ func (h *Hub) sessions(userID string) []*client {
 //
 // Both paths hand the client the same shape:
 //
-//	[4] outbox id (0 for a live delivery) | [sender] | [body]
+//	[8] outbox id (0 for a live delivery) | [sender] | [body]
+//
+// The id is 8 bytes now, not 4. It used to be the SQLite rowid truncated to
+// u32, which overflows at 2^32 across all recipients and made an
+// acknowledgement able to delete the wrong entry once it wrapped.
 func (h *Hub) deliver(recipient, sender string, body []byte) (bool, error) {
-	// The queued form is everything after the id, so the same bytes serve
-	// both the live and the replay path.
 	var stored writer
 	stored.str(sender)
 	stored.blob(body)
+	payload := stored.bytes()
 
 	targets := h.sessions(recipient)
 	if len(targets) == 0 {
-		return false, h.store.Enqueue(recipient, sender, stored.bytes())
+		seq, err := h.store.Seq(recipient)
+		if err != nil {
+			return false, err
+		}
+		if err := h.enforceCeiling(recipient); err != nil {
+			return false, err
+		}
+		return false, h.store.Enqueue(recipient, sender, seq, payload)
 	}
 
 	var live writer
-	live.u32(0)
-	live.buf = append(live.buf, stored.bytes()...)
+	live.u64(0)
+	live.buf = append(live.buf, payload...)
 	env, err := frame(typeDeliver, live.bytes())
 	if err != nil {
 		return false, err
@@ -176,9 +203,25 @@ func (h *Hub) deliver(recipient, sender string, body []byte) (bool, error) {
 		}
 	}
 	if !sent {
-		return false, h.store.Enqueue(recipient, sender, stored.bytes())
+		seq, err := h.store.Seq(recipient)
+		if err != nil {
+			return false, err
+		}
+		return false, h.store.Enqueue(recipient, sender, seq, payload)
 	}
 	return true, nil
+}
+
+// enforceCeiling keeps one recipient's backlog inside the per-user limit by
+// sweeping before the insert rather than after it, so the ceiling is never
+// exceeded even briefly.
+func (h *Hub) enforceCeiling(recipient string) error {
+	n, err := h.store.PendingFor(recipient)
+	if err != nil || n < outboxPerRecipient {
+		return err
+	}
+	_, _, err = h.store.Sweep(time.Now())
+	return err
 }
 
 // flush replays the outbox for a freshly connected client, one page at a time.
@@ -188,7 +231,7 @@ func (h *Hub) deliver(recipient, sender string, body []byte) (bool, error) {
 // The old behaviour - a single 200-entry page at HELLO - left everything past
 // the first page stranded until the next reconnect, with the UI showing an
 // empty conversation and no indication that more was waiting.
-func (h *Hub) flush(c *client, afterID int64) (int64, error) {
+func (h *Hub) flush(c *client, afterID uint64) (uint64, error) {
 	pending, err := h.store.Drain(c.userID, afterID, flushPageSize)
 	if err != nil {
 		return afterID, err
@@ -199,7 +242,7 @@ func (h *Hub) flush(c *client, afterID int64) (int64, error) {
 		// m.Payload already carries sender|body; prepend the outbox id so
 		// the client can acknowledge it.
 		var w writer
-		w.u32(uint32(m.ID))
+		w.u64(m.ID)
 		w.buf = append(w.buf, m.Payload...)
 		env, err := frame(typeDeliver, w.bytes())
 		if err != nil {
@@ -229,17 +272,123 @@ func (h *Hub) flush(c *client, afterID int64) (int64, error) {
 func newMux(h *Hub) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/ws", h)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+
+	// Liveness: "the process is up". Deliberately does not touch the store,
+	// so a slow disk cannot get a healthy process restarted.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	// Readiness: "I can serve". Reports what actually breaks in practice -
+	// queue depth, live connections, and a write that proves the store is
+	// usable - and returns 503 when the store cannot be written.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		h.serveReady(w)
+	})
+
+	// Kept as an alias: the image healthcheck and older deployments probe it.
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		h.serveReady(w)
 	})
 	return mux
 }
 
+func (h *Hub) serveReady(w http.ResponseWriter) {
+	pending, err := h.store.PendingCount()
+	if err != nil {
+		h.log.Warn("readiness: store unavailable", "err", err)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("store unavailable\n"))
+		return
+	}
+
+	// A read can succeed against a file that cannot be written, so the probe
+	// writes something and takes it back. This is what actually catches a full
+	// disk or a read-only mount.
+	if _, _, err := h.store.Sweep(time.Now()); err != nil {
+		h.log.Warn("readiness: sweep failed", "err", err)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("store not writable\n"))
+		return
+	}
+
+	live := 0
+	h.mu.RLock()
+	for _, set := range h.byUser {
+		live += len(set)
+	}
+	h.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = fmt.Fprintf(w, "ok\noutbox=%d\nconnections=%d\naccepted=%d\nrejected=%d\n",
+		pending, live, h.statAccepted.Load(), h.statRejected.Load())
+}
+
+// Shutdown closes every live socket with a "going away" status and waits for
+// the handlers to unwind.
+//
+// http.Server.Shutdown does not touch hijacked connections, so without this the
+// process exited 10 seconds later and clients only found out when their next
+// write failed - which, with ratchet state in play, is a worse failure than a
+// clean close.
+func (h *Hub) Shutdown(ctx context.Context) {
+	h.draining.Store(true)
+
+	h.mu.RLock()
+	var all []*client
+	for _, set := range h.byUser {
+		for c := range set {
+			all = append(all, c)
+		}
+	}
+	h.mu.RUnlock()
+
+	for _, c := range all {
+		c.goodbye()
+	}
+
+	deadline := time.After(drainGraceful)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			h.mu.RLock()
+			live := 0
+			for _, set := range h.byUser {
+				live += len(set)
+			}
+			h.mu.RUnlock()
+			if live == 0 {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(25 * time.Millisecond):
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-deadline:
+	case <-ctx.Done():
+	}
+	h.log.Info("relay drained", "remaining", len(all))
+}
+
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.draining.Load() {
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	if !h.origin.check(r) {
-		// Deliberately terse: an attacker probing the policy learns nothing
-		// beyond "no".
+		// Deliberately terse: a client probing the policy learns nothing
+		// beyond "no", but the operator gets the counter and the reason.
+		h.statRejected.Add(1)
 		h.log.Warn("rejected cross-origin handshake", "origin", r.Header.Get("Origin"))
 		http.Error(w, "forbidden origin", http.StatusForbidden)
 		return
@@ -247,6 +396,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		h.statRejected.Add(1)
 		h.log.Warn("upgrade failed", "err", err)
 		return
 	}
@@ -256,6 +406,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		conn:   conn,
 		send:   make(chan []byte, 256),
 		closed: make(chan struct{}),
+		limit:  newRateLimiter(sendBurst, sendRefill),
 	}
 	go c.writeLoop()
 	c.readLoop()
@@ -282,8 +433,61 @@ type client struct {
 	pendingIdentity   []byte
 
 	// ---- outbox replay cursor ----
-	flushCursor int64
+	flushCursor uint64
 	morePending bool
+
+	// Per-connection send pacing.
+	limit *rateLimiter
+}
+
+// rateLimiter is a token bucket in the simple sense: a burst allowance that
+// refills at a fixed rate.
+//
+// A relay will accept ciphertext from any authenticated sender for any
+// recipient, so without a ceiling one connection can fill the outbox for
+// everybody else. Refusing with an error is better than silently dropping,
+// because the sender can back off.
+type rateLimiter struct {
+	mu      sync.Mutex
+	tokens  float64
+	burst   float64
+	perTick float64
+	period  time.Duration
+	last    time.Time
+}
+
+func newRateLimiter(burst int, period time.Duration) *rateLimiter {
+	return &rateLimiter{
+		tokens:  float64(burst),
+		burst:   float64(burst),
+		perTick: 1,
+		period:  period,
+		last:    time.Now(),
+	}
+}
+
+func (l *rateLimiter) allow() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+	if elapsed := now.Sub(l.last); elapsed >= l.period {
+		refill := float64(elapsed/l.period) * l.perTick
+		l.tokens = min(l.burst, l.tokens+refill)
+		l.last = now
+	}
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens--
+	return true
+}
+
+func min(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // enqueue never blocks: a slow peer is disconnected rather than allowed to
@@ -301,6 +505,19 @@ func (c *client) enqueue(b []byte) bool {
 
 func (c *client) shutdown() {
 	c.closeMu.Do(func() {
+		close(c.closed)
+		_ = c.conn.Close()
+	})
+}
+
+// goodbye closes politely: a real close frame with "going away", which tells
+// the client to reconnect instead of assuming the network died.
+func (c *client) goodbye() {
+	c.closeMu.Do(func() {
+		// Best effort: the peer may already be gone.
+		_ = c.conn.SetWriteDeadline(time.Now().Add(time.Second))
+		_ = c.conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "relay shutting down"))
 		close(c.closed)
 		_ = c.conn.Close()
 	})
@@ -376,6 +593,8 @@ func (c *client) fail(msg string) {
 	}
 }
 
+func (c *client) draining() bool { return c.hub.draining.Load() }
+
 func (c *client) handle(data []byte) error {
 	msgType, payload, err := parseEnvelope(data)
 	if err != nil {
@@ -407,6 +626,9 @@ func (c *client) handle(data []byte) error {
 // it. Requiring a signature over a relay-chosen nonce means an id can only be
 // claimed by the holder of the matching identity signing key.
 func (c *client) handleHello(payload []byte) error {
+	if c.draining() {
+		return errShuttingDown
+	}
 	if len(c.challenge) != 0 {
 		// One challenge per connection. Issuing a second would let a client
 		// grind solutions without paying for a new socket.
@@ -635,8 +857,16 @@ func (c *client) handleSend(payload []byte) error {
 	if recipient == c.userID {
 		return errSelfSend
 	}
+	if !c.limit.allow() {
+		c.hub.statRejected.Add(1)
+		c.hub.log.Warn("send rate limited", "user", c.userID, "recipient", recipient)
+		return errRateLimited
+	}
 
 	_, err = c.hub.deliver(recipient, c.userID, body)
+	if err == nil {
+		c.hub.statAccepted.Add(1)
+	}
 	return err
 }
 
@@ -645,14 +875,14 @@ func (c *client) handleAck(payload []byte) error {
 		return errHelloFirst
 	}
 	r := reader{buf: payload}
-	upTo, err := r.u32()
+	upTo, err := r.u64()
 	if err != nil {
 		return err
 	}
 	if !r.done() {
 		return errTruncated
 	}
-	if err := c.hub.store.Acknowledge(c.userID, int64(upTo)); err != nil {
+	if err := c.hub.store.Acknowledge(c.userID, upTo); err != nil {
 		return err
 	}
 
@@ -660,7 +890,7 @@ func (c *client) handleAck(payload []byte) error {
 	// Without this the replay stalled at a single page and everything behind
 	// it waited for another reconnect.
 	if c.morePending {
-		cursor, err := c.hub.flush(c, int64(upTo))
+		cursor, err := c.hub.flush(c, upTo)
 		if err != nil {
 			return err
 		}

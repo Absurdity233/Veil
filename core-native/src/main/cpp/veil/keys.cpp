@@ -97,55 +97,99 @@ bool verifySignedPreKey(const uint8_t identity_dh_pub[kKeySize],
     return crypto::ed25519_verify(signature, identity_sign_pub, message, len);
 }
 
-bool PreKeys::generate(const Identity& identity, uint32_t signed_id,
-                       uint32_t one_time_count) {
+bool PreKeys::rotate(const Identity& identity, uint32_t one_time_count) {
     // Retire the current signed prekey before generating a new one. A peer
     // that fetched the old bundle and only now sends its first message still
     // has to be able to run X3DH against the key it was handed, so the
     // previous private half stays decryptable until the next rotation.
-    if (signed_prekey_id != 0) {
-        retired_signed_id = signed_prekey_id;
-        std::memcpy(retired_signed_pub, signed_pub, kKeySize);
-        std::memcpy(retired_signed_priv, signed_priv, kKeySize);
-        std::memcpy(retired_signed_signature, signed_signature, kSigSize);
-        has_retired_signed = true;
+    if (current.id != 0) {
+        retired = current;
+        has_retired = true;
     }
 
-    signed_prekey_id = signed_id;
+    // The id only ever moves forward. Reusing "1" with fresh keys made a stale
+    // bundle indistinguishable from a current one, and let the relay overwrite
+    // the prekey row under the same name.
+    current.id = next_signed_id++;
 
-    if (!crypto::x25519_generate(signed_pub, signed_priv)) return false;
+    if (!crypto::x25519_generate(current.pub, current.priv)) return false;
 
     // The signature covers the identity's DH public key as well as the prekey
     // itself, so a relay cannot pair a victim's DH key with its own signing
     // key and then vouch for a prekey of its choosing.
     uint8_t message[sizeof(kSignedPreKeyDomain) - 1 + kKeySize * 2];
     const size_t len = signedPreKeyMessage(message, sizeof(message),
-                                          identity.dh_pub, signed_pub);
+                                          identity.dh_pub, current.pub);
     if (len == 0) return false;
-    crypto::ed25519_sign(signed_signature, identity.sign_priv, message, len);
+    crypto::ed25519_sign(current.signature, identity.sign_priv, message, len);
     veil::wipe(message, sizeof(message));
 
-    one_time.clear();
-    one_time.reserve(one_time_count);
+    // One-time prekeys are keyed on the signed id so an id names exactly one
+    // generation. Spent ones from earlier generations stay as tombstones.
     for (uint32_t i = 0; i < one_time_count; ++i) {
-        OneTime ot;
-        ot.id = signed_id * 1000u + i;
+        OneTimePreKey ot;
+        ot.id = current.id * 1000u + i;
         if (!crypto::x25519_generate(ot.pub, ot.priv)) return false;
         one_time.push_back(ot);
     }
+
+    pruneOneTime();
     return true;
 }
 
+void PreKeys::pruneOneTime() {
+    // Keep every unspent key, plus enough spent tombstones that a handshake
+    // arriving just before a rotation can still name one - and so a duplicate
+    // cannot quietly reuse the private half.
+    std::vector<OneTimePreKey> kept;
+    kept.reserve(one_time.size());
+
+    size_t tombstones = 0;
+    for (const auto& ot : one_time) {
+        if (ot.consumed) {
+            if (tombstones >= kTombstoneKeep) {
+                veil::wipe(const_cast<uint8_t*>(ot.priv), kKeySize);
+                continue;
+            }
+            ++tombstones;
+        }
+        kept.push_back(ot);
+    }
+    one_time = std::move(kept);
+}
+
 const uint8_t* PreKeys::signedPrivFor(uint32_t signed_id) const {
-    if (signed_id == signed_prekey_id) return signed_priv;
-    if (has_retired_signed && signed_id == retired_signed_id) return retired_signed_priv;
+    if (signed_id == 0) return nullptr;
+    if (signed_id == current.id) return current.priv;
+    if (has_retired && signed_id == retired.id) return retired.priv;
     return nullptr;
 }
 
+const OneTimePreKey* PreKeys::consumeOneTime(uint32_t id) {
+    if (id == 0) return nullptr;
+    for (auto& ot : one_time) {
+        if (ot.id != id) continue;
+        // Already spent: answering again would let two sessions share the
+        // same one-time key, which is precisely what "one-time" excludes.
+        if (ot.consumed) return nullptr;
+        ot.consumed = true;
+        return &ot;
+    }
+    return nullptr;
+}
+
+bool PreKeys::needsRefill(size_t low_water) const {
+    size_t unused = 0;
+    for (const auto& ot : one_time) {
+        if (!ot.consumed) ++unused;
+    }
+    return unused < low_water;
+}
+
 void PreKeys::wipeSecrets() {
-    veil::wipe(signed_priv, sizeof(signed_priv));
-    veil::wipe(retired_signed_priv, sizeof(retired_signed_priv));
-    has_retired_signed = false;
+    veil::wipe(current.priv, sizeof(current.priv));
+    veil::wipe(retired.priv, sizeof(retired.priv));
+    has_retired = false;
     for (auto& ot : one_time) veil::wipe(ot.priv, sizeof(ot.priv));
     one_time.clear();
 }
@@ -205,19 +249,118 @@ bool PreKeyBundle::deserialize(PreKeyBundle& out, const uint8_t* data, size_t si
 }
 
 PreKeyBundle publishBundle(const Identity& identity, const PreKeys& prekeys,
-                           const PreKeys::OneTime* one_time) {
+                           const OneTimePreKey* one_time) {
     PreKeyBundle b;
     std::memcpy(b.identity_dh_pub, identity.dh_pub, 32);
     std::memcpy(b.identity_sign_pub, identity.sign_pub, 32);
-    b.signed_prekey_id = prekeys.signed_prekey_id;
-    std::memcpy(b.signed_pub, prekeys.signed_pub, 32);
-    std::memcpy(b.signed_signature, prekeys.signed_signature, 64);
+    b.signed_prekey_id = prekeys.current.id;
+    std::memcpy(b.signed_pub, prekeys.current.pub, 32);
+    std::memcpy(b.signed_signature, prekeys.current.signature, 64);
     if (one_time != nullptr) {
         b.has_one_time = true;
         b.one_time_id = one_time->id;
         std::memcpy(b.one_time_pub, one_time->pub, 32);
     }
     return b;
+}
+
+// ---- Prekey state persistence ------------------------------------------
+//
+// Layout:
+//   [1]  version
+//   [4]  next signed id
+//   [4]  current id | [32] pub | [32] priv | [64] signature
+//   [1]  has retired
+//   [4]  retired id | [32] pub | [32] priv | [64] signature   (when present)
+//   [4]  one-time count
+//   per one-time: [4] id | [32] pub | [32] priv | [1] consumed
+//
+// The result carries private keys: it is meant for the same encrypted store
+// the ratchet state goes into, never for plain disk.
+constexpr uint8_t kPreKeyStateVersion = 1;
+
+namespace {
+
+void putSignedPreKey(Bytes& out, const SignedPreKey& spk) {
+    uint8_t buf[4];
+    put_u32(buf, spk.id);
+    out.insert(out.end(), buf, buf + 4);
+    out.insert(out.end(), spk.pub, spk.pub + kKeySize);
+    out.insert(out.end(), spk.priv, spk.priv + kKeySize);
+    out.insert(out.end(), spk.signature, spk.signature + kSigSize);
+}
+
+bool readSignedPreKey(SignedPreKey& out, const uint8_t* data, size_t size, size_t& off) {
+    if (size < off + 4 + kKeySize + kKeySize + kSigSize) return false;
+    out.id = get_u32(data + off); off += 4;
+    std::memcpy(out.pub, data + off, kKeySize); off += kKeySize;
+    std::memcpy(out.priv, data + off, kKeySize); off += kKeySize;
+    std::memcpy(out.signature, data + off, kSigSize); off += kSigSize;
+    return true;
+}
+
+}  // namespace
+
+Bytes PreKeys::serialize() const {
+    Bytes out;
+    out.reserve(1 + 4 + 4 + kKeySize * 2 + kSigSize + 1 + one_time.size() * (4 + 65));
+
+    out.push_back(kPreKeyStateVersion);
+
+    uint8_t buf[4];
+    put_u32(buf, next_signed_id);
+    out.insert(out.end(), buf, buf + 4);
+
+    putSignedPreKey(out, current);
+
+    out.push_back(has_retired ? 1 : 0);
+    if (has_retired) putSignedPreKey(out, retired);
+
+    put_u32(buf, static_cast<uint32_t>(one_time.size()));
+    out.insert(out.end(), buf, buf + 4);
+    for (const auto& ot : one_time) {
+        put_u32(buf, ot.id);
+        out.insert(out.end(), buf, buf + 4);
+        out.insert(out.end(), ot.pub, ot.pub + kKeySize);
+        out.insert(out.end(), ot.priv, ot.priv + kKeySize);
+        out.push_back(ot.consumed ? 1 : 0);
+    }
+    return out;
+}
+
+bool PreKeys::deserialize(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 1 + 4 + 4 + kKeySize * 2 + kSigSize + 1 + 4) return false;
+
+    size_t off = 0;
+    if (data[off++] != kPreKeyStateVersion) return false;
+
+    next_signed_id = get_u32(data + off); off += 4;
+    if (next_signed_id == 0) return false;
+
+    if (!readSignedPreKey(current, data, size, off)) return false;
+    if (current.id == 0 || current.id >= next_signed_id) return false;
+
+    has_retired = data[off++] != 0;
+    if (has_retired && !readSignedPreKey(retired, data, size, off)) return false;
+
+    uint32_t count = get_u32(data + off); off += 4;
+    // Each entry is a fixed size, so a count that cannot fit is malformed
+    // rather than merely large.
+    if (static_cast<size_t>(count) > (size - off) / (4 + kKeySize * 2 + 1)) return false;
+
+    one_time.clear();
+    one_time.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (size < off + 4) return false;
+        OneTimePreKey ot;
+        ot.id = get_u32(data + off); off += 4;
+        if (size < off + kKeySize * 2 + 1) return false;
+        std::memcpy(ot.pub, data + off, kKeySize); off += kKeySize;
+        std::memcpy(ot.priv, data + off, kKeySize); off += kKeySize;
+        ot.consumed = data[off++] != 0;
+        one_time.push_back(ot);
+    }
+    return true;
 }
 
 }  // namespace veil

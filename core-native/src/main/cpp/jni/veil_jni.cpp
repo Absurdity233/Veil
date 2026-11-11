@@ -169,28 +169,53 @@ Java_com_veil_core_VeilNative_nativeImportPeerRegistry(JNIEnv* env, jobject /*th
 }
 
 JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeRotatePreKeys(JNIEnv* env, jobject /*thiz*/, jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    if (!engine->rotatePreKeys()) {
+        throwIllegal(env, "no secure random source");
+        return nullptr;
+    }
+    return toArray(env, engine->exportPreKeySet());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_veil_core_VeilNative_nativeNeedsPreKeyRefill(JNIEnv*, jobject /*thiz*/,
+                                                      jlong handle, jint lowWater) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr || lowWater < 0) return JNI_FALSE;
+    return engine->needsPreKeyRefill(static_cast<size_t>(lowWater)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeExportPreKeyState(JNIEnv* env, jobject /*thiz*/, jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    return toArray(env, engine->exportPreKeyState());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_veil_core_VeilNative_nativeImportPreKeyState(JNIEnv* env, jobject /*thiz*/,
+                                                      jlong handle, jbyteArray state) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return JNI_FALSE;
+    veil::Bytes bytes = fromArray(env, state);
+    return engine->importPreKeyState(bytes.data(), bytes.size()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_veil_core_VeilNative_nativeSessionState(JNIEnv* env, jobject /*thiz*/,
+                                                 jlong handle, jstring peerId) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return static_cast<jint>(veil::Engine::NoPeer);
+    return static_cast<jint>(engine->sessionState(toStd(env, peerId)));
+}
+
+JNIEXPORT jbyteArray JNICALL
 Java_com_veil_core_VeilNative_nativePublicIdentity(JNIEnv* env, jobject /*thiz*/, jlong handle) {
     auto* engine = toEngine(handle);
     if (engine == nullptr) return nullptr;
     return toArray(env, engine->exportIdentityPublic());
-}
-
-JNIEXPORT jbyteArray JNICALL
-Java_com_veil_core_VeilNative_nativeGeneratePreKeys(JNIEnv* env, jobject /*thiz*/,
-                                                    jlong handle,
-                                                    jint signedId,
-                                                    jint oneTimeCount) {
-    auto* engine = toEngine(handle);
-    if (engine == nullptr) return nullptr;
-    if (oneTimeCount < 0 || oneTimeCount > 1000) {
-        throwIllegal(env, "one-time prekey count out of range");
-        return nullptr;
-    }
-    if (!engine->generatePreKeys(static_cast<uint32_t>(signedId),
-                                 static_cast<uint32_t>(oneTimeCount))) {
-        return nullptr;
-    }
-    return toArray(env, engine->exportPreKeySet());
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -209,6 +234,26 @@ Java_com_veil_core_VeilNative_nativeHasSession(JNIEnv* env, jobject /*thiz*/,
     return engine->hasSession(toStd(env, peerId)) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jint JNICALL
+Java_com_veil_core_VeilNative_nativeDecrypt(JNIEnv* env, jobject /*thiz*/,
+                                            jlong handle, jstring peerId, jbyteArray frame,
+                                            jobjectArray outPlain) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return static_cast<jint>(veil::Engine::NoSession);
+
+    veil::Bytes data = fromArray(env, frame);
+    veil::Bytes plain;
+    veil::Engine::Result r =
+        engine->decryptStatus(toStd(env, peerId), data.data(), data.size(), plain);
+
+    if (r == veil::Engine::Result::Ok) {
+        jbyteArray arr = toArray(env, plain);
+        if (arr != nullptr) env->SetObjectArrayElement(outPlain, 0, arr);
+    }
+    veil::wipe(plain.data(), plain.size());
+    return static_cast<jint>(r);
+}
+
 JNIEXPORT jbyteArray JNICALL
 Java_com_veil_core_VeilNative_nativeEncrypt(JNIEnv* env, jobject /*thiz*/,
                                             jlong handle, jstring peerId, jbyteArray plain) {
@@ -216,19 +261,6 @@ Java_com_veil_core_VeilNative_nativeEncrypt(JNIEnv* env, jobject /*thiz*/,
     if (engine == nullptr) return nullptr;
     veil::Bytes data = fromArray(env, plain);
     return toArray(env, engine->encrypt(toStd(env, peerId), data.data(), data.size()));
-}
-
-JNIEXPORT jbyteArray JNICALL
-Java_com_veil_core_VeilNative_nativeDecrypt(JNIEnv* env, jobject /*thiz*/,
-                                            jlong handle, jstring peerId, jbyteArray frame) {
-    auto* engine = toEngine(handle);
-    if (engine == nullptr) return nullptr;
-    veil::Bytes data = fromArray(env, frame);
-    veil::Bytes out;
-    if (!engine->decrypt(toStd(env, peerId), data.data(), data.size(), out)) {
-        return nullptr;  // authentication failure; caller treats null as reject
-    }
-    return toArray(env, out);
 }
 
 JNIEXPORT jbyteArray JNICALL

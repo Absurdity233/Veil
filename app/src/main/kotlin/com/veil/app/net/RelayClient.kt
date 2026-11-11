@@ -126,7 +126,7 @@ class RelayClient(private val url: String) {
                 Wire.TYPE_AUTH_CHALLENGE -> events.trySend(Event.Challenge(r.blob()))
                 Wire.TYPE_MORE_PENDING -> events.trySend(Event.MorePending)
                 Wire.TYPE_DELIVER -> {
-                    val outboxId = r.u32().toLong() and 0xFFFFFFFFL
+                    val outboxId = r.u64()
                     val sender = r.string()
                     val body = r.blob()
                     events.trySend(Event.Delivered(outboxId, sender, body))
@@ -177,7 +177,7 @@ class RelayClient(private val url: String) {
         send(Wire.TYPE_SEND, Writer().string(recipient).blob(frame).build())
 
     fun acknowledge(outboxId: Long): Boolean =
-        send(Wire.TYPE_ACK, Writer().u32(outboxId.toInt()).build())
+        send(Wire.TYPE_ACK, Writer().u64(outboxId).build())
 
     private fun send(type: Int, payload: ByteArray): Boolean {
         if (!connected || closed) return false

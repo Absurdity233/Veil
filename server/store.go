@@ -3,9 +3,38 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// Outbox retention and pacing.
+//
+// None of these existed: the outbox grew forever, and one connection could
+// push frames into it as fast as the socket allowed. A relay that accepts
+// ciphertext from anyone for anyone will be used as cheap storage unless it
+// says no somewhere.
+const (
+	// Entries older than this are dropped on the next sweep. A week is long
+	// enough for a phone that was off, short enough that the disk stays
+	// bounded without operator attention.
+	outboxTTL = 7 * 24 * time.Hour
+
+	// Per-recipient ceiling. When it is reached the oldest entries go first:
+	// the peer is clearly not reading, and keeping the newest is what makes
+	// the queue useful when it does come back.
+	outboxPerRecipient = 2000
+
+	// Send pacing per connection.
+	//
+	// A var rather than a const so a test can raise the allowance for the
+	// duration of one case instead of the production ceiling carrying a
+	// test-only escape hatch.
+	sendBurstDefault = 30
+	sendRefill       = 10 * time.Second
+)
+
+var sendBurst = sendBurstDefault
 
 // Store keeps exactly the three things the relay can act on: who published
 // which public prekeys, which ciphertext is waiting for whom, and the
@@ -58,13 +87,80 @@ CREATE TABLE IF NOT EXISTS outbox (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     recipient   TEXT NOT NULL,
     sender      TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
     payload     BLOB NOT NULL,
     created_at  INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS outbox_recipient ON outbox(recipient, id);
+-- The id the client sees and acknowledges is (recipient, seq), a dense
+-- per-recipient counter. It used to be the global rowid truncated to u32:
+-- AUTOINCREMENT counts across *all* recipients, so the wire value was sparse,
+-- overflowed at 2^32, and an acknowledgement after the wrap could delete a
+-- different recipient's entry.
+CREATE UNIQUE INDEX IF NOT EXISTS outbox_recipient_seq ON outbox(recipient, seq);
+CREATE INDEX IF NOT EXISTS outbox_age ON outbox(created_at);
+
+-- Per-recipient sequence. A separate row per recipient keeps the counter dense
+-- even after entries are deleted, so a client can say "I have everything up to
+-- N" without gaps.
+CREATE TABLE IF NOT EXISTS outbox_seq (
+    recipient   TEXT PRIMARY KEY,
+    last_seq    INTEGER NOT NULL
+);
 `
-	_, err := s.db.Exec(schema)
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Databases created before the seq column existed get it added and seeded
+	// from the rowid. The old ids were globally increasing, so per recipient
+	// they are still strictly increasing - not dense, but a valid ordering,
+	// which is all an acknowledgement needs.
+	return s.ensureSeqColumn()
+}
+
+func (s *Store) ensureSeqColumn() error {
+	rows, err := s.db.Query(`PRAGMA table_info(outbox)`)
+	if err != nil {
+		return err
+	}
+	hasSeq := false
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "seq" {
+			hasSeq = true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasSeq {
+		return nil
+	}
+
+	if _, err := s.db.Exec(`ALTER TABLE outbox ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`UPDATE outbox SET seq = id WHERE seq = 0`); err != nil {
+		return err
+	}
+	// Seed the counters so new inserts continue after the highest seeded value.
+	_, err = s.db.Exec(`
+INSERT INTO outbox_seq(recipient, last_seq)
+SELECT recipient, MAX(seq) FROM outbox GROUP BY recipient
+ON CONFLICT(recipient) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)`)
 	return err
 }
 
@@ -142,26 +238,63 @@ func (s *Store) ReplaceOneTime(userID string, remaining []byte) error {
 	return err
 }
 
-func (s *Store) Enqueue(recipient, sender string, payload []byte) error {
-	_, err := s.db.Exec(
-		`INSERT INTO outbox(recipient, sender, payload, created_at)
-		 VALUES(?,?,?,strftime('%s','now'))`,
-		recipient, sender, payload)
-	return err
-}
-
 type storedMessage struct {
-	ID      int64
+	// The per-recipient sequence number, not the SQLite rowid.
+	//
+	// The wire carried the rowid as a u32. AUTOINCREMENT is global, so it
+	// overflows at 2^32 across *all* recipients - and the client echoed the
+	// same u32 back in an acknowledgement, so the day it wrapped, an ACK could
+	// delete somebody else's entry. A per-recipient counter is scoped to the
+	// recipient it belongs to, and 2^64 is not reachable by accident.
+	ID      uint64
 	Sender  string
 	Payload []byte
 }
 
-// Drain returns everything queued for recipient with id greater than afterID.
-func (s *Store) Drain(recipient string, afterID int64, limit int) ([]storedMessage, error) {
+// Seq returns the next dense sequence number for one recipient.
+func (s *Store) Seq(recipient string) (uint64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var last int64
+	err = tx.QueryRow(`SELECT last_seq FROM outbox_seq WHERE recipient = ?`, recipient).Scan(&last)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
+	}
+
+	next := last + 1
+	if _, err := tx.Exec(`
+INSERT INTO outbox_seq(recipient, last_seq) VALUES(?,?)
+ON CONFLICT(recipient) DO UPDATE SET last_seq = excluded.last_seq`,
+		recipient, next); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return uint64(next), nil
+}
+
+// Enqueue stores a frame for a recipient that is not connected, under an
+// explicit per-recipient sequence number so the id the client sees is the one
+// it will acknowledge.
+func (s *Store) Enqueue(recipient, sender string, seq uint64, payload []byte) error {
+	_, err := s.db.Exec(
+		`INSERT INTO outbox(recipient, sender, seq, payload, created_at)
+		 VALUES(?,?,?,?,strftime('%s','now'))`,
+		recipient, sender, int64(seq), payload)
+	return err
+}
+
+// Drain returns everything queued for recipient with seq greater than afterSeq.
+func (s *Store) Drain(recipient string, afterSeq uint64, limit int) ([]storedMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT id, sender, payload FROM outbox
-		 WHERE recipient = ? AND id > ? ORDER BY id LIMIT ?`,
-		recipient, afterID, limit)
+		`SELECT seq, sender, payload FROM outbox
+		 WHERE recipient = ? AND seq > ? ORDER BY seq LIMIT ?`,
+		recipient, int64(afterSeq), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -170,22 +303,88 @@ func (s *Store) Drain(recipient string, afterID int64, limit int) ([]storedMessa
 	var out []storedMessage
 	for rows.Next() {
 		var m storedMessage
-		if err := rows.Scan(&m.ID, &m.Sender, &m.Payload); err != nil {
+		var seq int64
+		if err := rows.Scan(&seq, &m.Sender, &m.Payload); err != nil {
 			return nil, err
 		}
+		m.ID = uint64(seq)
 		out = append(out, m)
 	}
 	return out, rows.Err()
 }
 
-func (s *Store) Acknowledge(recipient string, upTo int64) error {
-	_, err := s.db.Exec(`DELETE FROM outbox WHERE recipient = ? AND id <= ?`, recipient, upTo)
+// Acknowledge drops everything this recipient has up to and including upTo.
+//
+// Scoped to the recipient on purpose: the wire id used to be a global rowid, so
+// an acknowledgement could match a row belonging to somebody else.
+func (s *Store) Acknowledge(recipient string, upTo uint64) error {
+	_, err := s.db.Exec(`DELETE FROM outbox WHERE recipient = ? AND seq <= ?`,
+		recipient, int64(upTo))
 	return err
 }
 
-// PendingCount is used by the health endpoint to report queue depth.
+// PendingCount is used by the readiness endpoint to report queue depth.
 func (s *Store) PendingCount() (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM outbox`).Scan(&n)
 	return n, err
+}
+
+// PendingFor reports how many entries are waiting for one recipient.
+func (s *Store) PendingFor(recipient string) (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM outbox WHERE recipient = ?`, recipient).Scan(&n)
+	return n, err
+}
+
+// Sweep drops expired entries and trims each recipient back to the ceiling.
+//
+// Without this the outbox was unbounded storage anyone could fill: the relay
+// accepts ciphertext from any authenticated sender for any recipient, and
+// nothing ever removed what the recipient declined to read.
+func (s *Store) Sweep(now time.Time) (expired int64, trimmed int64, err error) {
+	cutoff := now.Add(-outboxTTL).Unix()
+
+	res, err := s.db.Exec(`DELETE FROM outbox WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, 0, err
+	}
+	expired, _ = res.RowsAffected()
+
+	rows, err := s.db.Query(
+		`SELECT recipient FROM outbox GROUP BY recipient HAVING COUNT(*) > ?`,
+		outboxPerRecipient)
+	if err != nil {
+		return expired, 0, err
+	}
+	var over []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			rows.Close()
+			return expired, 0, err
+		}
+		over = append(over, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return expired, 0, err
+	}
+
+	for _, recipient := range over {
+		// Keep the newest N: the peer is clearly not reading, and the recent
+		// entries are the ones worth having when it comes back.
+		r, err := s.db.Exec(
+			`DELETE FROM outbox
+			 WHERE recipient = ?
+			   AND seq < (SELECT seq FROM outbox WHERE recipient = ?
+			              ORDER BY seq DESC LIMIT 1 OFFSET ?)`,
+			recipient, recipient, outboxPerRecipient-1)
+		if err != nil {
+			return expired, trimmed, err
+		}
+		n, _ := r.RowsAffected()
+		trimmed += n
+	}
+	return expired, trimmed, nil
 }

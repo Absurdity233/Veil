@@ -39,11 +39,32 @@ internal object VeilNative {
     external fun nativeImportPeerRegistry(handle: Long, registry: ByteArray): Boolean
 
     external fun nativeEncrypt(handle: Long, peerId: String, plain: ByteArray): ByteArray?
-    external fun nativeDecrypt(handle: Long, peerId: String, frame: ByteArray): ByteArray?
+
+    /**
+     * Decrypts [frame] into `outPlain[0]` and returns a [DecryptOutcome] code.
+     *
+     * The reason is returned rather than collapsed into a null because a
+     * duplicated delivery is a normal event on an at-least-once relay, while a
+     * frame that fails on an unseen counter is not.
+     */
+    external fun nativeDecrypt(
+        handle: Long,
+        peerId: String,
+        frame: ByteArray,
+        outPlain: Array<ByteArray?>,
+    ): Int
 
     external fun nativeExportSession(handle: Long, peerId: String): ByteArray?
     external fun nativeImportSession(handle: Long, peerId: String, blob: ByteArray): Boolean
     external fun nativeDropSession(handle: Long, peerId: String)
+
+    /** 0 = no peer, 1 = pinned without a session, 2 = a live session. */
+    external fun nativeSessionState(handle: Long, peerId: String): Int
+
+    external fun nativeExportPreKeyState(handle: Long): ByteArray?
+    external fun nativeImportPreKeyState(handle: Long, state: ByteArray): Boolean
+    external fun nativeRotatePreKeys(handle: Long): ByteArray?
+    external fun nativeNeedsPreKeyRefill(handle: Long, lowWater: Int): Boolean
 
     external fun nativeSafetyNumber(handle: Long, peerId: String): String?
 }

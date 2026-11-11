@@ -211,7 +211,7 @@ bool Session::establishOutbound(const Identity& identity, const PreKeyBundle& bu
 }
 
 bool Session::establishInbound(const Identity& identity,
-                               const PreKeys& prekeys,
+                               PreKeys& prekeys,
                                const PreKeyHeader& header) {
     // The header must be addressed to this identity.
     if (!constant_time_equal(header.recipient_identity_dh, identity.dh_pub, 32)) {
@@ -238,15 +238,14 @@ bool Session::establishInbound(const Identity& identity,
     const uint8_t* signed_priv = prekeys.signedPrivFor(header.signed_prekey_id);
     if (signed_priv == nullptr) return false;
 
-    // Locate the one-time prekey the sender used, if any.
-    const PreKeys::OneTime* ot = nullptr;
+    // Locate and spend the one-time prekey the sender used, if any.
+    //
+    // `consumeOneTime` refuses an id that has already been spent. Without that
+    // a replayed first frame would re-run X3DH against the same one-time key,
+    // which is the one thing a one-time key must never allow.
+    const OneTimePreKey* ot = nullptr;
     if (header.one_time_prekey_id != 0) {
-        for (const auto& candidate : prekeys.one_time) {
-            if (candidate.id == header.one_time_prekey_id) {
-                ot = &candidate;
-                break;
-            }
-        }
+        ot = prekeys.consumeOneTime(header.one_time_prekey_id);
         if (ot == nullptr) return false;
     }
 
@@ -297,6 +296,7 @@ bool Session::establishInbound(const Identity& identity,
     n_recv_ = 0;
     pn_ = 0;
     skipped_.clear();
+    skipped_total_ = 0;
     has_pending_prekey_ = false;
     has_prev_remote_ = false;
     std::memset(dh_prev_remote_pub_, 0, kKeySize);
@@ -361,9 +361,30 @@ bool Session::dhRatchet(const uint8_t remote_pub[kKeySize],
     return true;
 }
 
+size_t Session::evictSkippedOverBudget() {
+    size_t dropped = 0;
+    while (skipped_total_ > kMaxSkippedKeysTotal && !skipped_.empty()) {
+        auto oldest = skipped_.begin();
+        for (auto& [idx, mk] : oldest->second) {
+            veil::wipe(mk.data(), mk.size());
+            ++dropped;
+        }
+        skipped_total_ -= oldest->second.size();
+        skipped_.erase(oldest);
+    }
+    return dropped;
+}
+
 bool Session::skipMessageKeys(uint32_t until) {
     if (until < n_recv_) return true;  // already past it
     if (until - n_recv_ > kMaxSkippedKeys) return false;
+
+    // Refuse before doing any work if this run could not fit even after
+    // evicting every other chain: the sender is asking for something no
+    // session could honour, so the frame is not a legitimate late arrival.
+    if (skipped_total_ + (until - n_recv_) > kMaxSkippedKeysTotal + kMaxSkippedKeys) {
+        return false;
+    }
 
     std::array<uint8_t, 32> peer_key;
     std::memcpy(peer_key.data(), dh_remote_pub_, 32);
@@ -376,13 +397,26 @@ bool Session::skipMessageKeys(uint32_t until) {
 
         std::array<uint8_t, 32> mk;
         std::memcpy(mk.data(), message_key, 32);
-        bucket[n_recv_] = mk;
+
+        // Idempotent: a replayed header must not be able to inflate the count.
+        if (bucket.emplace(n_recv_, mk).second) ++skipped_total_;
 
         std::memcpy(chain_recv_.data(), next_chain, 32);
         ++n_recv_;
         veil::wipe(next_chain, sizeof(next_chain));
         veil::wipe(message_key, sizeof(message_key));
     }
+
+    // The per-chain cap still applies, but the global one now decides what has
+    // to go when several chains are open at once.
+    while (bucket.size() > kMaxSkippedKeys) {
+        auto victim = bucket.begin();
+        veil::wipe(victim->second.data(), victim->second.size());
+        bucket.erase(victim);
+        --skipped_total_;
+    }
+
+    evictSkippedOverBudget();
     return true;
 }
 
@@ -447,7 +481,15 @@ bool Session::encrypt(const uint8_t* plain, size_t plain_size,
 bool Session::decrypt(const RatchetMessage& message,
                       const uint8_t* extra_aad, size_t extra_aad_size,
                       Bytes& out) {
-    if (message.ciphertext.size() < kMacSize) return false;
+    return decryptDetailed(message, extra_aad, extra_aad_size, out) == DecryptOk;
+}
+
+Session::DecryptResult Session::decryptDetailed(const RatchetMessage& message,
+                                                const uint8_t* extra_aad, size_t extra_aad_size,
+                                                Bytes& out) {
+    // A frame too short to even carry a MAC is malformed, not a duplicate:
+    // saying otherwise would let a truncated delivery be swallowed silently.
+    if (message.ciphertext.size() < kMacSize) return DecryptAuthFailed;
 
     const size_t text_size = message.ciphertext.size() - kMacSize;
 
@@ -470,7 +512,9 @@ bool Session::decrypt(const RatchetMessage& message,
         auto mk_it = bucket_it->second.find(message.header.message_number);
         if (mk_it != bucket_it->second.end()) {
             message_key = mk_it->second;
+            veil::wipe(mk_it->second.data(), mk_it->second.size());
             bucket_it->second.erase(mk_it);
+            --skipped_total_;
             if (bucket_it->second.empty()) skipped_.erase(bucket_it);
             have_key = true;
         }
@@ -480,26 +524,29 @@ bool Session::decrypt(const RatchetMessage& message,
     if (!have_key) {
         // A frame from a chain we have already left cannot be decrypted any
         // more, and treating it as a new ratchet key would drag the session
-        // backwards. Reject it outright.
+        // backwards. That is a duplicate, not an attack.
         if (has_prev_remote_ &&
             constant_time_equal(message.header.dh_pub, dh_prev_remote_pub_, kKeySize)) {
-            return false;
+            return DecryptDuplicate;
         }
 
         if (!constant_time_equal(message.header.dh_pub, dh_remote_pub_, kKeySize)) {
             if (!dhRatchet(message.header.dh_pub,
                            message.header.previous_chain_length)) {
-                return false;
+                return DecryptTooFarAhead;
             }
         }
 
         if (message.header.message_number < n_recv_) {
-            // Older than what we have already consumed and not in the skipped
-            // table: a replay or a message we have lost the key for.
-            return false;
+            // The counter has already been consumed and the key is gone, so
+            // this frame cannot be authenticated either way. It is a
+            // duplicate: the only way to produce it is to resend something
+            // that was accepted once, because a fresh forgery would have had
+            // to guess a counter we already advanced past.
+            return DecryptDuplicate;
         }
 
-        if (!skipMessageKeys(message.header.message_number)) return false;
+        if (!skipMessageKeys(message.header.message_number)) return DecryptTooFarAhead;
 
         uint8_t next_chain[32];
         kdfChainKey(chain_recv_.data(), next_chain, message_key.data());
@@ -523,16 +570,16 @@ bool Session::decrypt(const RatchetMessage& message,
     veil::wipe(enc_key, sizeof(enc_key));
     veil::wipe(nonce, sizeof(nonce));
 
-    if (!ok) return false;
+    if (!ok) return DecryptAuthFailed;
     out = std::move(plain);
-    return true;
+    return DecryptOk;
 }
 
 // ---- Persistence -------------------------------------------------------
 
 Bytes Session::serialize() const {
     Bytes out;
-    out.reserve(1 + 4 + 32 * 3 + 32 * 3 + 12 + 4 + skipped_.size() * 44);
+    out.reserve(1 + 4 + 32 * 3 + 32 * 3 + 12 + 4 + skipped_total_ * 36);
 
     out.push_back(static_cast<uint8_t>(kStateVersion));
     out.insert(out.end(), dh_self_pub_, dh_self_pub_ + 32);
@@ -587,15 +634,17 @@ bool Session::deserialize(const uint8_t* data, size_t size) {
     pn_ = get_u32(data + off); off += 4;
 
     uint32_t peer_count = get_u32(data + off); off += 4;
-    if (peer_count > kMaxSkippedKeys) return false;
+    if (peer_count > kMaxSkippedKeysTotal) return false;
 
     skipped_.clear();
+    skipped_total_ = 0;
     for (uint32_t i = 0; i < peer_count; ++i) {
         if (size < off + 32 + 4) return false;
         std::array<uint8_t, 32> peer_key;
         std::memcpy(peer_key.data(), data + off, 32); off += 32;
         uint32_t count = get_u32(data + off); off += 4;
         if (count > kMaxSkippedKeys) return false;
+        if (skipped_total_ + count > kMaxSkippedKeysTotal) return false;
 
         std::map<uint32_t, std::array<uint8_t, 32>> bucket;
         for (uint32_t j = 0; j < count; ++j) {
@@ -605,6 +654,7 @@ bool Session::deserialize(const uint8_t* data, size_t size) {
             std::memcpy(mk.data(), data + off, 32); off += 32;
             bucket[idx] = mk;
         }
+        skipped_total_ += bucket.size();
         skipped_[peer_key] = std::move(bucket);
     }
 
@@ -624,6 +674,7 @@ void Session::wipe() {
         for (auto& [idx, mk] : keys) veil::wipe(mk.data(), mk.size());
     }
     skipped_.clear();
+    skipped_total_ = 0;
     n_send_ = n_recv_ = pn_ = 0;
 }
 

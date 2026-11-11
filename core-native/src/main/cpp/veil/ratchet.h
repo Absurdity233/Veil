@@ -68,8 +68,13 @@ public:
     bool establishOutbound(const Identity& identity, const PreKeyBundle& bundle);
 
     // Runs the receiver half of X3DH from an inbound prekey header.
+    //
+    // Takes `prekeys` by reference because a successful handshake *spends* the
+    // one-time prekey it named. A const reference would either hide that
+    // mutation or force it to happen somewhere the caller cannot see, and a
+    // spent key that is not recorded anywhere is a key that can be used twice.
     bool establishInbound(const Identity& identity,
-                          const PreKeys& prekeys,
+                          PreKeys& prekeys,
                           const PreKeyHeader& header);
 
     // ---- Messaging ------------------------------------------------------
@@ -86,11 +91,42 @@ public:
                  const uint8_t* extra_aad, size_t extra_aad_size,
                  Bytes& out);
 
+    // As above, but says whether the frame was refused because it had already
+    // been accepted.
+    //
+    // That distinction is not cosmetic. The relay delivers at-least-once - one
+    // live push plus a replay of the same outbox entry - so a duplicated frame
+    // is a normal event, while a frame that fails to authenticate on a counter
+    // we have *not* consumed is a tamper attempt. Collapsing both into one
+    // error meant every duplicate looked like an attack.
+    enum DecryptResult : int32_t {
+        DecryptOk = 0,
+        // Already consumed: either the counter is behind the chain, or the
+        // frame belongs to a chain we have ratcheted away from.
+        DecryptDuplicate = 1,
+        // Would not authenticate on a counter we have not seen.
+        DecryptAuthFailed = 2,
+        // The counter is so far ahead that honouring it would blow the
+        // skipped-key budget.
+        DecryptTooFarAhead = 3,
+    };
+    DecryptResult decryptDetailed(const RatchetMessage& message,
+                                  const uint8_t* extra_aad, size_t extra_aad_size,
+                                  Bytes& out);
+
     // ---- Handshake state ------------------------------------------------
 
     bool hasPendingPreKeyHeader() const { return has_pending_prekey_; }
     const PreKeyHeader& pendingPreKeyHeader() const { return pending_prekey_; }
     void clearPendingPreKeyHeader() { has_pending_prekey_ = false; }
+
+    // ---- Introspection -------------------------------------------------
+    //
+    // The skipped-key budget is a memory bound, so it has to be observable to
+    // be tested: without a count there is no way to assert that repeated
+    // ratchet steps cannot grow the table past the cap.
+    size_t skippedKeyCount() const { return skipped_total_; }
+    size_t skippedChainCount() const { return skipped_.size(); }
 
     // ---- Persistence ----------------------------------------------------
 
@@ -149,9 +185,18 @@ private:
     uint32_t pn_ = 0;
 
     // Skipped message keys, indexed by the peer's ratchet public key and then
-    // by message number.
+// by message number.
+    //
+    // Ordered by peer key so the oldest chain can be evicted first when the
+    // global budget is exceeded: a chain the peer ratcheted away from long ago
+    // is the least likely to still be needed.
     std::map<std::array<uint8_t, 32>, std::map<uint32_t, std::array<uint8_t, 32>>>
         skipped_;
+    size_t skipped_total_ = 0;
+
+    // Drops the oldest chain buckets until the total is back inside the
+    // budget. Returns how many keys were discarded.
+    size_t evictSkippedOverBudget();
 
     bool has_pending_prekey_ = false;
     PreKeyHeader pending_prekey_;

@@ -42,6 +42,59 @@ enum class Handshake {
 }
 
 /**
+ * Why a delivery was accepted or refused.
+ *
+ * [DUPLICATE] is the interesting one: the relay is at-least-once, so one frame
+ * can arrive live and again from the outbox. Treating that as a failure put a
+ * security warning in front of the user on an ordinary event.
+ */
+enum class DecryptOutcome {
+    OK,
+
+    /** Already accepted once. Normal, and silent. */
+    DUPLICATE,
+
+    /** Failed to authenticate on a counter never seen before. Worth reporting. */
+    AUTH_FAILED,
+
+    /** The counter is far enough ahead that honouring it would break the budget. */
+    TOO_FAR_AHEAD,
+
+    /** No session, or a frame that could not be parsed. */
+    NO_SESSION;
+
+    companion object {
+        fun fromCode(code: Int): DecryptOutcome = when (code) {
+            0 -> OK
+            4 -> NO_SESSION
+            5 -> AUTH_FAILED
+            6 -> DUPLICATE
+            else -> AUTH_FAILED
+        }
+    }
+}
+
+/** What the engine actually knows about a peer label. */
+enum class SessionState {
+    /** Nothing known about this label. */
+    NO_PEER,
+
+    /** The identity is pinned but there is no live ratchet. */
+    PINNED_ONLY,
+
+    /** A session is usable and the safety number is comparable. */
+    READY;
+
+    companion object {
+        fun fromCode(code: Int): SessionState = when (code) {
+            2 -> READY
+            1 -> PINNED_ONLY
+            else -> NO_PEER
+        }
+    }
+}
+
+/**
  * A live protocol engine.
  *
  * [close] wipes all key material. The instance is unusable afterwards.
@@ -71,8 +124,18 @@ class VeilEngine private constructor(handle: Long) : AutoCloseable {
     // ---- Prekeys --------------------------------------------------------
 
     /** Generates a signed prekey and [oneTimeCount] one-time prekeys. */
-    fun generatePreKeys(signedId: Int, oneTimeCount: Int): ByteArray =
-        VeilNative.nativeGeneratePreKeys(state.handle, signedId, oneTimeCount)
+    // ---- Prekeys --------------------------------------------------------
+
+    /**
+     * Rotates the signed prekey and generates a fresh batch of one-time keys.
+     *
+     * There is no signed-id parameter any more: the id comes from a counter
+     * carried in the persisted prekey state. Passing one in made every launch
+     * reuse the same id with different keys, which is indistinguishable from a
+     * stale bundle on the wire.
+     */
+    fun generatePreKeys(): ByteArray =
+        VeilNative.nativeRotatePreKeys(state.handle)
             ?: throw VeilException("prekey generation failed")
 
     /**
@@ -138,12 +201,44 @@ class VeilEngine private constructor(handle: Long) : AutoCloseable {
             ?: throw VeilException("cannot encrypt for $peerId")
 
     /**
-     * Decrypts a wire frame. Returns null when authentication fails - a
-     * tampered, replayed or undecryptable frame is not an error condition the
-     * caller needs to distinguish.
+     * Decrypts a wire frame.
+     *
+     * Returns the plaintext with the outcome, so the caller can tell a
+     * duplicated delivery from a tampered one. Collapsing both into "null"
+     * meant every duplicate showed up as an authentication failure.
      */
-    fun decrypt(peerId: String, frame: ByteArray): ByteArray? =
-        VeilNative.nativeDecrypt(state.handle, peerId, frame)
+    fun decrypt(peerId: String, frame: ByteArray): Pair<ByteArray?, DecryptOutcome> {
+        val out = arrayOfNulls<ByteArray>(1)
+        val code = VeilNative.nativeDecrypt(state.handle, peerId, frame, out)
+        return out[0] to DecryptOutcome.fromCode(code)
+    }
+
+    /** What the engine knows about a label: no peer, pinned only, or ready. */
+    fun sessionState(peerId: String): SessionState =
+        SessionState.fromCode(VeilNative.nativeSessionState(state.handle, peerId))
+
+    // ---- Prekey state ---------------------------------------------------
+
+    /**
+     * The signed prekey generation and every one-time secret, including which
+     * ones have been spent.
+     *
+     * Carries private keys: it belongs in the same encrypted store as the
+     * ratchet state, never in plain preferences.
+     */
+    fun exportPreKeyState(): ByteArray? = VeilNative.nativeExportPreKeyState(state.handle)
+
+    fun importPreKeyState(blob: ByteArray): Boolean =
+        VeilNative.nativeImportPreKeyState(state.handle, blob)
+
+    /**
+     * Rotates the signed prekey and generates a fresh batch of one-time keys.
+     * The signed id comes from the persisted counter, so it never repeats.
+     */
+    fun rotatePreKeys(): ByteArray? = VeilNative.nativeRotatePreKeys(state.handle)
+
+    fun needsPreKeyRefill(lowWater: Int): Boolean =
+        VeilNative.nativeNeedsPreKeyRefill(state.handle, lowWater)
 
     // ---- Verification ---------------------------------------------------
 

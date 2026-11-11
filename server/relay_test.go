@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 
 type harness struct {
 	store *Store
+	hub   *Hub
 	srv   *httptest.Server
 	wsURL string
 }
@@ -38,11 +41,13 @@ func newHarnessWithOrigins(t *testing.T, allowed string) *harness {
 	t.Cleanup(func() { _ = store.Close() })
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(newMux(NewHubWithOrigins(store, logger, allowed)))
+	hub := NewHubWithOrigins(store, logger, allowed)
+	srv := httptest.NewServer(newMux(hub))
 	t.Cleanup(srv.Close)
 
 	return &harness{
 		store: store,
+		hub:   hub,
 		srv:   srv,
 		wsURL: "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws",
 	}
@@ -145,7 +150,6 @@ func (c *testClient) recv() (byte, []byte) {
 	return msgType, payload
 }
 
-// recvType reads until a message of the wanted type arrives.
 func (c *testClient) recvType(want byte) []byte {
 	c.t.Helper()
 	for i := 0; i < 8; i++ {
@@ -554,7 +558,7 @@ func TestDeliverOnline(t *testing.T) {
 
 	payload := bob.recvType(typeDeliver)
 	r := reader{buf: payload}
-	id, err := r.u32()
+	id, err := r.u64()
 	if err != nil || id != 0 {
 		t.Fatalf("outbox id = %d, %v (want 0 for a live delivery)", id, err)
 	}
@@ -588,7 +592,7 @@ func TestDeliverOfflineThenFlush(t *testing.T) {
 
 	payload := bob.recvType(typeDeliver)
 	r := reader{buf: payload}
-	if _, err := r.u32(); err != nil { // outbox id
+	if _, err := r.u64(); err != nil { // outbox id
 		t.Fatalf("id: %v", err)
 	}
 	sender, _ := r.str()
@@ -619,7 +623,7 @@ func TestAckDrainsOutbox(t *testing.T) {
 	bob.recvType(typeDeliver)
 
 	var a writer
-	a.u32(1) // acknowledge everything up to id 1
+	a.u64(1) // acknowledge everything up to id 1
 	bob.send(typeAck, a.bytes())
 
 	waitFor(t, 2*time.Second, func() bool {
@@ -658,7 +662,7 @@ func TestOutboxOrdering(t *testing.T) {
 	defer store.Close()
 
 	for i := 0; i < 5; i++ {
-		if err := store.Enqueue("bob", "alice", []byte{byte(i)}); err != nil {
+		if err := enqueueAt(store, "bob", "alice", uint64(i+1), []byte{byte(i)}); err != nil {
 			t.Fatalf("enqueue: %v", err)
 		}
 	}
@@ -693,8 +697,11 @@ func TestAcknowledgeIsScopedToRecipient(t *testing.T) {
 	}
 	defer store.Close()
 
-	_ = store.Enqueue("bob", "alice", []byte("b1"))
-	_ = store.Enqueue("carol", "alice", []byte("c1"))
+	// Both recipients use the same sequence numbers, which is the point: the
+	// id is per-recipient, so an acknowledgement up to 100 for bob must not
+	// touch carol's identically numbered entry.
+	_ = enqueueAt(store, "bob", "alice", 1, []byte("b1"))
+	_ = enqueueAt(store, "carol", "alice", 1, []byte("c1"))
 
 	if err := store.Acknowledge("bob", 100); err != nil {
 		t.Fatalf("ack: %v", err)
@@ -703,29 +710,232 @@ func TestAcknowledgeIsScopedToRecipient(t *testing.T) {
 	if n, _ := store.PendingCount(); n != 1 {
 		t.Fatalf("pending = %d, want 1 (carol's message must survive)", n)
 	}
-}
-
-// ---- Health ------------------------------------------------------------
-
-func TestHealthEndpoint(t *testing.T) {
-	h := newHarness(t)
-
-	resp, err := http.Get(h.srv.URL + "/health")
-	if err != nil {
-		t.Fatalf("get: %v", err)
+	if n, _ := store.PendingFor("carol"); n != 1 {
+		t.Fatalf("carol pending = %d, want 1", n)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if n, _ := store.PendingFor("bob"); n != 0 {
+		t.Fatalf("bob pending = %d, want 0", n)
 	}
 }
 
 // ---- Outbox paging -----------------------------------------------------
 
+func TestOutboxSequenceIsDensePerRecipient(t *testing.T) {
+	// A dense per-recipient counter is what makes "I have everything up to N"
+	// meaningful. The global rowid was sparse: carol's inserts advanced the
+	// number bob saw, so bob had to ack ids it never received.
+	store, err := OpenStore(t.TempDir() + "/seq.db")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	var bobs []uint64
+	for i := 0; i < 3; i++ {
+		seq, err := store.Seq("bob")
+		if err != nil {
+			t.Fatalf("seq: %v", err)
+		}
+		bobs = append(bobs, seq)
+		if err := store.Enqueue("bob", "alice", seq, []byte{byte(i)}); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		// Carol's traffic must not advance bob's counter.
+		if _, err := store.Seq("carol"); err != nil {
+			t.Fatalf("seq: %v", err)
+		}
+	}
+
+	if bobs[0] != 1 || bobs[1] != 2 || bobs[2] != 3 {
+		t.Fatalf("bob seq = %v, want 1,2,3", bobs)
+	}
+}
+
+func TestOutboxSweepDropsExpiredAndTrims(t *testing.T) {
+	// The outbox was unbounded storage that any authenticated sender could
+	// fill: nothing removed what a recipient declined to read.
+	store, err := OpenStore(t.TempDir() + "/sweep.db")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	for i := 0; i < outboxPerRecipient+5; i++ {
+		if err := enqueueAt(store, "bob", "alice", uint64(i+1), []byte{byte(i)}); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+	}
+
+	_, trimmed, err := store.Sweep(time.Now())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if trimmed != 5 {
+		t.Fatalf("trimmed = %d, want 5", trimmed)
+	}
+	if n, _ := store.PendingFor("bob"); n != int64(outboxPerRecipient) {
+		t.Fatalf("pending = %d, want %d", n, outboxPerRecipient)
+	}
+
+	// The newest entries are the ones kept.
+	pending, err := store.Drain("bob", 0, 5)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(pending) != 5 || pending[0].ID != 6 {
+		t.Fatalf("oldest surviving seq = %v, want 6", pending[0].ID)
+	}
+
+	// An entry older than the retention window goes regardless.
+	if _, err := store.db.Exec(
+		`INSERT INTO outbox(recipient, sender, seq, payload, created_at)
+		 VALUES('dave','alice',1,'old',? )`,
+		time.Now().Add(-2*outboxTTL).Unix()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	expired, _, err := store.Sweep(time.Now())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if expired != 1 {
+		t.Fatalf("expired = %d, want 1", expired)
+	}
+}
+
+// ---- Send pacing -------------------------------------------------------
+
+func TestSendRateLimit(t *testing.T) {
+	// One connection can otherwise fill the outbox for everybody else: the
+	// relay accepts ciphertext from any authenticated sender for any
+	// recipient, and nothing paced it.
+	lim := newRateLimiter(sendBurst, 10*time.Second)
+
+	allowed := 0
+	for i := 0; i < sendBurst+10; i++ {
+		if lim.allow() {
+			allowed++
+		}
+	}
+	if allowed != sendBurst {
+		t.Fatalf("allowed = %d, want %d", allowed, sendBurst)
+	}
+
+	// Refill restores exactly the burst allowance, not more.
+	lim.last = time.Now().Add(-10 * time.Second)
+	if !lim.allow() {
+		t.Fatal("refill did not restore a token")
+	}
+	if lim.tokens > lim.burst-1+0.001 {
+		t.Fatalf("tokens = %v, burst = %v: refill exceeded the burst", lim.tokens, lim.burst)
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	h := newHarness(t)
+
+	for _, path := range []string{"/healthz", "/readyz", "/health"} {
+		resp, err := http.Get(h.srv.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, resp.StatusCode)
+		}
+		if path != "/healthz" && !strings.Contains(string(body), "outbox=") {
+			t.Fatalf("%s body = %q, want the queue depth", path, body)
+		}
+	}
+}
+
+func TestReadyReportsQueueDepth(t *testing.T) {
+	h := newHarness(t)
+	_ = enqueueAt(h.store, "bob", "alice", 1, []byte("x"))
+	_ = enqueueAt(h.store, "bob", "alice", 2, []byte("y"))
+
+	resp, err := http.Get(h.srv.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if !strings.Contains(string(body), "outbox=2") {
+		t.Fatalf("body = %q, want outbox=2", body)
+	}
+}
+
+func TestReadyFailsWhenStoreIsClosed(t *testing.T) {
+	// A bound port says nothing about whether the store is usable, and the
+	// store is what actually breaks. Readiness has to fail with it.
+	h := newHarness(t)
+	_ = h.store.Close()
+
+	resp, err := http.Get(h.srv.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// ---- Graceful shutdown -------------------------------------------------
+
+func TestShutdownClosesSocketsCleanly(t *testing.T) {
+	// http.Server.Shutdown does not touch hijacked websockets, so without an
+	// explicit close the process sat for 10 seconds and then died, and the
+	// client only learned about it when its next write failed.
+	h := newHarness(t)
+	c := h.dial(t, "alice", newTestIdentity(t, 70))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.hub.Shutdown(context.Background())
+	}()
+
+	// The client must see a real close frame, not a dropped TCP connection.
+	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err := c.conn.ReadMessage()
+	if err == nil {
+		t.Fatal("expected the socket to close")
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("closed with %v, want a websocket close frame", err)
+	}
+	if closeErr.Code != websocket.CloseGoingAway {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseGoingAway)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not finish")
+	}
+
+	// And a new handshake is refused while draining.
+	if _, _, err := websocket.DefaultDialer.Dial(h.wsURL, nil); err == nil {
+		t.Fatal("handshake accepted while shutting down")
+	}
+}
+
+// ---- Outbox paging -----------------------------------------------------
+
+// floor the ceiling for the duration of one test, so a test can flood the
+// outbox on purpose without the pacing bucket stopping it.
+func allowFlood(t *testing.T) {
+	t.Helper()
+	previous := sendBurst
+	sendBurst = 1 << 20
+	t.Cleanup(func() { sendBurst = previous })
+}
+
 func TestOutboxDrainsAcrossPages(t *testing.T) {
-	// A backlog larger than one page used to strand everything past the first
-	// page until the next reconnect, with the client showing an empty
-	// conversation and no hint that more was waiting.
+	allowFlood(t)
 	h := newHarness(t)
 	alice := h.dial(t, "alice", newTestIdentity(t, 60))
 
@@ -755,7 +965,7 @@ func TestOutboxDrainsAcrossPages(t *testing.T) {
 	}
 
 	var a writer
-	a.u32(uint32(received[len(received)-1]))
+	a.u64(received[len(received)-1])
 	bob.send(typeAck, a.bytes())
 
 	rest := readPage(t, bob, total-flushPageSize)
@@ -765,7 +975,7 @@ func TestOutboxDrainsAcrossPages(t *testing.T) {
 
 	// Payloads must arrive in order, with nothing dropped or duplicated across
 	// the page boundary.
-	all := append(append([]uint32{}, received...), rest...)
+	all := append(append([]uint64{}, received...), rest...)
 	for i := 1; i < len(all); i++ {
 		if all[i] <= all[i-1] {
 			t.Fatalf("outbox ids out of order across pages: %d then %d", all[i-1], all[i])
@@ -778,15 +988,15 @@ func TestOutboxDrainsAcrossPages(t *testing.T) {
 }
 
 // readPage collects up to n DELIVER frames, stopping early on more-pending.
-func readPage(t *testing.T, c *testClient, n int) []uint32 {
+func readPage(t *testing.T, c *testClient, n int) []uint64 {
 	t.Helper()
-	var ids []uint32
+	var ids []uint64
 	for len(ids) < n {
 		msgType, payload := c.recv()
 		switch msgType {
 		case typeDeliver:
 			r := reader{buf: payload}
-			id, err := r.u32()
+			id, err := r.u64()
 			if err != nil {
 				t.Fatalf("deliver id: %v", err)
 			}
@@ -798,6 +1008,12 @@ func readPage(t *testing.T, c *testClient, n int) []uint32 {
 		}
 	}
 	return ids
+}
+
+// enqueueAt stores a frame under an explicit per-recipient sequence number, so
+// a test does not depend on the counter's current value.
+func enqueueAt(s *Store, recipient, sender string, seq uint64, payload []byte) error {
+	return s.Enqueue(recipient, sender, seq, payload)
 }
 
 // ---- Helpers -----------------------------------------------------------

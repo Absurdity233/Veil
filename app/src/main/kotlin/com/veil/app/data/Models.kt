@@ -10,7 +10,22 @@ data class Peer(
     val userId: String,
     val displayName: String,
     val safetyNumber: String? = null,
+    /**
+     * What the engine actually knows about this peer.
+     *
+     * A cached safety number was being used as a proxy for "a session exists".
+     * That outlived a restart in which the session did not, so the list could
+     * claim a session was live while every message was being dropped.
+     */
+    val sessionState: SessionUiState = SessionUiState.NO_PEER,
 )
+
+/** Mirrors the engine's view of a peer label. */
+enum class SessionUiState {
+    NO_PEER,
+    PINNED_ONLY,
+    READY,
+}
 
 /**
  * Where an outgoing message actually got to.

@@ -34,11 +34,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.veil.app.LinkState
+import com.veil.app.R
 import com.veil.app.data.Peer
+import com.veil.app.data.SessionUiState
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -59,7 +64,7 @@ fun HomeScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Veil", fontWeight = FontWeight.SemiBold) },
+                title = { Text(stringResource(R.string.home_title), fontWeight = FontWeight.SemiBold) },
                 actions = { LinkBadge(link) },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
@@ -79,12 +84,12 @@ fun HomeScreen(
                 containerColor = MaterialTheme.colorScheme.surfaceVariant,
             )) {
                 Column(Modifier.padding(14.dp)) {
-                    Text("Relay", fontWeight = FontWeight.SemiBold)
+                    Text(stringResource(R.string.relay_section), fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = url,
                         onValueChange = { url = it },
-                        label = { Text("WebSocket URL") },
+                        label = { Text(stringResource(R.string.relay_url_label)) },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
                     )
@@ -92,7 +97,7 @@ fun HomeScreen(
                     OutlinedTextField(
                         value = userId,
                         onValueChange = { userId = it },
-                        label = { Text("Your id") },
+                        label = { Text(stringResource(R.string.user_id_label)) },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
                     )
@@ -103,7 +108,12 @@ fun HomeScreen(
                             enabled = url.isNotBlank() && userId.isNotBlank() &&
                                 link != LinkState.Connecting,
                         ) {
-                            Text(if (link == LinkState.Online) "Reconnect" else "Connect")
+                            Text(
+                                stringResource(
+                                    if (link == LinkState.Online) R.string.action_reconnect
+                                    else R.string.action_connect,
+                                ),
+                            )
                         }
                         Spacer(Modifier.width(12.dp))
                         status?.let {
@@ -123,7 +133,7 @@ fun HomeScreen(
                 OutlinedTextField(
                     value = peerId,
                     onValueChange = { peerId = it },
-                    label = { Text("Add someone by id") },
+                    label = { Text(stringResource(R.string.add_peer_label)) },
                     modifier = Modifier.weight(1f),
                     singleLine = true,
                 )
@@ -136,18 +146,17 @@ fun HomeScreen(
                     },
                     enabled = peerId.isNotBlank() && link == LinkState.Online,
                 ) {
-                    Text("Add")
+                    Text(stringResource(R.string.action_add))
                 }
             }
 
             Spacer(Modifier.height(16.dp))
-            Text("Conversations", fontWeight = FontWeight.SemiBold)
+            Text(stringResource(R.string.conversations), fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
 
             if (peers.isEmpty()) {
                 Text(
-                    "No conversations yet. Add someone by their id once both " +
-                        "devices are connected to the same relay.",
+                    stringResource(R.string.empty_conversations),
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -165,10 +174,18 @@ fun HomeScreen(
 
 @Composable
 private fun PeerRow(peer: Peer, onClick: () -> Unit) {
+    val stateLabel = when (peer.sessionState) {
+        SessionUiState.READY -> stringResource(R.string.peer_state_ready)
+        SessionUiState.PINNED_ONLY -> stringResource(R.string.peer_state_pinned)
+        SessionUiState.NO_PEER -> stringResource(R.string.peer_state_no_session)
+    }
+    val openLabel = stringResource(R.string.cd_open_conversation, peer.displayName)
+
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(onClickLabel = openLabel, onClick = onClick)
+            .semantics(mergeDescendants = true) { contentDescription = openLabel }
             .padding(vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -189,7 +206,7 @@ private fun PeerRow(peer: Peer, onClick: () -> Unit) {
         Column {
             Text(peer.displayName, fontWeight = FontWeight.Medium)
             Text(
-                if (peer.safetyNumber == null) "no session yet" else "verified key available",
+                stateLabel,
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

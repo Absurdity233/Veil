@@ -35,10 +35,18 @@ constexpr size_t kBindingSize = kSigSize;
 // ratchet state before it can derive the message key.
 constexpr size_t kHeaderSize = 32 + 4 + 4;  // dh public || pn || n
 
-// Upper bound on cached message keys. Without a cap, a peer could pin an
-// arbitrary amount of memory by claiming to have skipped a huge run of
+// Upper bound on cached message keys *per chain*. Without a cap, a peer could
+// pin an arbitrary amount of memory by claiming to have skipped a huge run of
 // messages.
 constexpr size_t kMaxSkippedKeys = 1000;
+
+// Upper bound on cached message keys *across all chains* in one session.
+//
+// The per-chain cap alone was not a bound at all: a peer opens a fresh bucket
+// by publishing a new ratchet key, so 1000 keys x any number of buckets meant
+// the memory a remote party could pin was limited only by how many ratchet
+// steps it felt like taking. The global cap is what actually holds.
+constexpr size_t kMaxSkippedKeysTotal = 2000;
 
 inline void wipe(void* p, size_t n) {
     if (p != nullptr && n != 0) {

@@ -1,4 +1,48 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Veil</string>
+
+    <!-- Home -->
+    <string name="home_title">Veil</string>
+    <string name="relay_section">Relay</string>
+    <string name="relay_url_label">WebSocket URL</string>
+    <string name="user_id_label">Your id</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_reconnect">Reconnect</string>
+    <string name="add_peer_label">Add someone by id</string>
+    <string name="action_add">Add</string>
+    <string name="conversations">Conversations</string>
+    <string name="empty_conversations">No conversations yet. Add someone by their id once both devices are connected to the same relay.</string>
+    <string name="peer_state_no_session">no session yet</string>
+    <string name="peer_state_pinned">identity pinned, no session</string>
+    <string name="peer_state_ready">session ready</string>
+
+    <!-- Chat -->
+    <string name="action_back">Back</string>
+    <string name="action_verify">Verify</string>
+    <string name="action_hide_code">Hide code</string>
+    <string name="message_placeholder">Message</string>
+    <string name="action_send">Send</string>
+    <string name="send_state_queued">sending</string>
+    <string name="send_state_failed">not sent</string>
+
+    <!-- Safety number -->
+    <string name="safety_title">Safety number with %1$s</string>
+    <string name="safety_no_session">No session yet — send or receive a message first.</string>
+    <string name="safety_hint">Compare this with the same screen on the other device. If the digits match, no one is sitting in the middle.</string>
+
+    <!-- Link badge -->
+    <string name="link_online">online</string>
+    <string name="link_connecting">connecting</string>
+    <string name="link_error">error</string>
+    <string name="link_offline">offline</string>
+
+    <!-- Accessibility -->
+    <string name="cd_link_state">Connection: %1$s</string>
+    <string name="cd_avatar">Avatar for %1$s</string>
+    <string name="cd_open_conversation">Open conversation with %1$s</string>
+    <string name="cd_message_from">Message from %1$s at %2$s</string>
+    <string name="cd_message_to">Message to %1$s at %2$s</string>
+    <string name="cd_message_state">Delivery: %1$s</string>
+    <string name="cd_safety_number">Safety number, read out digit by digit</string>
 </resources>

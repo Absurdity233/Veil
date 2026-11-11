@@ -7,11 +7,14 @@ import com.veil.app.data.ChatMessage
 import com.veil.app.data.ChatStore
 import com.veil.app.data.Peer
 import com.veil.app.data.SendState
+import com.veil.app.data.SessionUiState
 import com.veil.app.data.StoreHolder
 import com.veil.app.net.RelayClient
 import com.veil.app.net.Reader
 import com.veil.app.net.Writer
+import com.veil.core.DecryptOutcome
 import com.veil.core.Handshake
+import com.veil.core.SessionState
 import com.veil.core.VeilEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +47,7 @@ class ChatController(context: Context) {
     private val vault = IdentityVault(appContext)
     private val sessions = SessionVault(appContext, "veil.sessions.v1")
     private val peerPins = SessionVault(appContext, "veil.peers.v1")
+    private val prekeyState = SessionVault(appContext, "veil.prekeys.v1")
     private val store: ChatStore = StoreHolder.get(appContext)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -86,11 +90,13 @@ class ChatController(context: Context) {
      */
     private val pending = ArrayDeque<PendingFrame>()
 
-    // Regenerating prekeys on every reconnect would destroy the private half
-    // of a signed prekey that peers may already have fetched, silently
-    // breaking their next handshake. They are generated once per process.
+    // Regenerating prekeys on every reconnect would destroy the private half of a
+    // signed prekey that peers may already have fetched, silently breaking
+    // their next handshake. The state is persisted instead, so a restart
+    // continues the same generation (and the same id counter) rather than
+    // minting a new one under a reused id.
     @Volatile
-    private var preKeysPublished = false
+    private var hasPublishedPreKeys = false
 
     @Volatile
     private var selfUserId: String = ""
@@ -128,8 +134,22 @@ class ChatController(context: Context) {
     }
 
     private fun restoreSessions(engine: VeilEngine) {
-        // Pins first: a session is only meaningful for the identity it was
-        // built against.
+        // Prekeys first: a session is built against a generation of them, and
+        // the id counter plus the spent flags have to come back with the
+        // engine or a restart mints a new generation under an id that was
+        // already published, and forgets which one-time keys are gone.
+        prekeyState.load(PREKEY_STATE)?.let { blob ->
+            try {
+                if (!engine.importPreKeyState(blob)) {
+                    _status.value = "stored prekey state was unreadable; a fresh set will be published"
+                }
+            } finally {
+                blob.fill(0)
+            }
+        }
+
+        // Pins before sessions: a session is only meaningful for the identity
+        // it was built against.
         peerPins.load()?.let { blob ->
             try {
                 engine.importPeerRegistry(blob)
@@ -163,7 +183,17 @@ class ChatController(context: Context) {
         val engine = engine ?: return
         val blob = engine.exportPeerRegistry() ?: return
         try {
-            peerPins.store("registry", blob)
+            peerPins.store(PIN_REGISTRY, blob)
+        } finally {
+            blob.fill(0)
+        }
+    }
+
+    private fun persistPreKeyState() {
+        val engine = engine ?: return
+        val blob = engine.exportPreKeyState() ?: return
+        try {
+            prekeyState.store(PREKEY_STATE, blob)
         } finally {
             blob.fill(0)
         }
@@ -258,15 +288,26 @@ class ChatController(context: Context) {
     private suspend fun publishPreKeys() {
         val engine = engine ?: return
         val client = relay ?: return
-        if (preKeysPublished) return
+
+        // A refill is needed when the unspent supply runs low, not "once per
+        // process". The old flag meant the twenty keys published at first
+        // launch were the only ones this device would ever offer, so every
+        // session after the twentieth silently dropped the one-time prekey.
+        val needsRotation = withContext(crypto) {
+            !hasPublishedPreKeys || engine.needsPreKeyRefill(REFILL_LOW_WATER)
+        }
+        if (!needsRotation) return
+
+        val set = withContext(crypto) {
+            engine.generatePreKeys().also {
+                persistPreKeyState()   // the id counter and spent flags move on
+            }
+        }
 
         // exportPreKeySet() is a compact fixed-width layout, not the
         // length-prefixed one used on the wire:
         //   [4] signed id | [32] signed pub | [64] signature | [4] count
         //   then per one-time key: [4] id | [32] pub
-        val set = withContext(crypto) {
-            engine.generatePreKeys(SIGNED_PREKEY_ID, ONE_TIME_COUNT)
-        }
         val r = Reader(set)
         val signedId = r.u32()
         val signedPub = r.raw(32)
@@ -274,7 +315,7 @@ class ChatController(context: Context) {
         val oneTime = r.raw(r.remaining)
 
         if (client.publishPreKeys(signedId, signedPub, signature, oneTime)) {
-            preKeysPublished = true
+            hasPublishedPreKeys = true
         }
     }
 
@@ -437,16 +478,40 @@ class ChatController(context: Context) {
         val engine = engine ?: return
         val peerId = event.sender
 
-        val plain = withContext(crypto) {
-            engine.decrypt(peerId, event.frame)?.also { persistSession(peerId) }
+        val (plain, outcome) = withContext(crypto) {
+            val result = engine.decrypt(peerId, event.frame)
+            if (result.second == DecryptOutcome.OK) persistSession(peerId)
+            result
         }
-        if (plain == null) {
-            // A frame that will not authenticate is dropped, not surfaced: it
-            // is either tampered with or belongs to a session we no longer
-            // have the keys for.
-            _status.value = "dropped a message that failed authentication"
-            return
+
+        when (outcome) {
+            DecryptOutcome.OK -> Unit
+
+            DecryptOutcome.DUPLICATE -> {
+                // The relay delivers at-least-once: a live push plus a replay
+                // of the same outbox entry is routine. Acknowledge it so the
+                // relay stops resending, and say nothing to the user.
+                if (event.outboxId > 0) relay?.acknowledge(event.outboxId)
+                return
+            }
+
+            DecryptOutcome.NO_SESSION -> {
+                _status.value = "dropped a message from $peerId: no session"
+                return
+            }
+
+            DecryptOutcome.TOO_FAR_AHEAD -> {
+                _status.value = "dropped a message from $peerId: too far ahead of the ratchet"
+                return
+            }
+
+            DecryptOutcome.AUTH_FAILED -> {
+                _status.value = "dropped a message that failed authentication"
+                return
+            }
         }
+
+        if (plain == null) return
 
         val text = String(plain, Charsets.UTF_8)
         if (store.peer(peerId) == null) {
@@ -459,6 +524,13 @@ class ChatController(context: Context) {
         appendMessage(peerId, outgoing = false, text = text, state = SendState.SENT)
 
         if (event.outboxId > 0) relay?.acknowledge(event.outboxId)
+
+        // The peer used up a one-time prekey, so the supply may be running
+        // low. Publishing a refill now keeps the next handshake cheap.
+        val client = relay
+        if (client != null && withContext(crypto) { engine.needsPreKeyRefill(REFILL_LOW_WATER) }) {
+            publishPreKeys()
+        }
     }
 
     private fun appendMessage(peerId: String, outgoing: Boolean, text: String, state: SendState) {
@@ -486,16 +558,56 @@ class ChatController(context: Context) {
         _messages.value[peerId] ?: store.loadMessages(peerId)
 
     private fun refreshPeers() {
-        _peers.value = store.peers()
+        // Ask the engine for the truth about each peer rather than trusting
+        // the cached safety number. It is a snapshot, so it is taken on the
+        // crypto thread and published as a plain list.
+        val engine = engine
+        val cached = store.peers()
+        if (engine == null) {
+            _peers.value = cached
+            return
+        }
+        scope.launch {
+            val withState = withContext(crypto) {
+                cached.map { peer ->
+                    peer.copy(sessionState = engineStates(engine, peer.userId))
+                }
+            }
+            _peers.value = withState
+        }
     }
+
+    private fun engineStates(engine: VeilEngine, peerId: String): SessionUiState =
+        when (engine.sessionState(peerId)) {
+            SessionState.READY -> SessionUiState.READY
+            SessionState.PINNED_ONLY -> SessionUiState.PINNED_ONLY
+            SessionState.NO_PEER -> SessionUiState.NO_PEER
+        }
 
     /** Cached value from the store; safe to call from the UI thread. */
     fun safetyNumberFor(peerId: String): String? = store.peer(peerId)?.safetyNumber
 
+    /**
+     * The engine's view of a peer, which is the only one that stays true.
+     *
+     * The UI used "a safety number is cached" as a proxy for "a session
+     * exists". That survived a restart in which the session did not, so the
+     * screen could claim a session was live while every message in both
+     * directions was being dropped.
+     */
+    suspend fun sessionState(peerId: String): SessionUiState = withContext(crypto) {
+        val engine = engine ?: return@withContext SessionUiState.NO_PEER
+        engineStates(engine, peerId)
+    }
+
     fun hasSession(peerId: String): Boolean = store.peer(peerId)?.safetyNumber != null
 
     private companion object {
-        const val SIGNED_PREKEY_ID = 1
-        const val ONE_TIME_COUNT = 20
+        const val PIN_REGISTRY = "registry"
+        const val PREKEY_STATE = "state"
+
+        // How few unspent one-time prekeys trigger a refill. Half a batch
+        // leaves room for a burst of new peers without ever running dry.
+        const val REFILL_LOW_WATER = 10
     }
 }

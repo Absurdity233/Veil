@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Home -->
+    <string name="home_title">Veil</string>
+    <string name="relay_section">中继</string>
+    <string name="relay_url_label">WebSocket 地址</string>
+    <string name="user_id_label">你的 ID</string>
+    <string name="action_connect">连接</string>
+    <string name="action_reconnect">重新连接</string>
+    <string name="add_peer_label">按 ID 添加联系人</string>
+    <string name="action_add">添加</string>
+    <string name="conversations">会话</string>
+    <string name="empty_conversations">还没有会话。两台设备连上同一个中继后，按对方 ID 添加即可。</string>
+    <string name="peer_state_no_session">尚无会话</string>
+    <string name="peer_state_pinned">身份已固定，尚无会话</string>
+    <string name="peer_state_ready">会话就绪</string>
+
+    <!-- Chat -->
+    <string name="action_back">返回</string>
+    <string name="action_verify">验证</string>
+    <string name="action_hide_code">收起</string>
+    <string name="message_placeholder">消息</string>
+    <string name="action_send">发送</string>
+    <string name="send_state_queued">发送中</string>
+    <string name="send_state_failed">未发送</string>
+
+    <!-- Safety number -->
+    <string name="safety_title">与 %1$s 的安全码</string>
+    <string name="safety_no_session">尚无会话——先发一条或收一条消息。</string>
+    <string name="safety_hint">与对方设备上的同一界面比对。数字一致，说明中间没有人。</string>
+
+    <!-- Link badge -->
+    <string name="link_online">在线</string>
+    <string name="link_connecting">连接中</string>
+    <string name="link_error">出错</string>
+    <string name="link_offline">离线</string>
+
+    <!-- Accessibility -->
+    <string name="cd_link_state">连接状态：%1$s</string>
+    <string name="cd_avatar">%1$s 的头像</string>
+    <string name="cd_open_conversation">打开与 %1$s 的会话</string>
+    <string name="cd_message_from">%2$s 来自 %1$s 的消息</string>
+    <string name="cd_message_to">%2$s 发给 %1$s 的消息</string>
+    <string name="cd_message_state">投递状态：%1$s</string>
+    <string name="cd_safety_number">安全码，逐位朗读</string>
+</resources>

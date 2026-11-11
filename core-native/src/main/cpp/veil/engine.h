@@ -55,6 +55,11 @@ public:
         IdentityChanged  = 3,  // peer label is pinned to a different identity
         NoSession        = 4,  // no session for that peer
         AuthFailed       = 5,  // frame did not authenticate
+        // A frame that has already been accepted once. The relay delivers
+        // at-least-once - a live push plus a replay of the same entry - and
+        // the ratchet refuses the second copy. That is correct behaviour, not
+        // an error, and it must not be surfaced as one.
+        Duplicate        = 6,
     };
 
     // ---- Identity -------------------------------------------------------
@@ -86,7 +91,15 @@ public:
 
     // ---- Prekeys --------------------------------------------------------
 
-    bool generatePreKeys(uint32_t signed_id, uint32_t one_time_count);
+    // Rotates the signed prekey and generates a fresh batch of one-time keys.
+    //
+    // The signed prekey id comes from a counter carried in the persisted
+    // prekey state, not from the caller. It used to be a constant, which made
+    // a stale bundle indistinguishable from a current one across restarts.
+    bool rotatePreKeys();
+
+    // True when fewer than `low_water` one-time prekeys are unspent.
+    bool needsPreKeyRefill(size_t low_water) const;
 
     // The public prekey set as the server should store it:
     //   [4] signed id, [32] signed pub, [64] signature, [4] count,
@@ -94,12 +107,35 @@ public:
     Bytes exportPreKeySet() const;
 
     // A bundle for one peer to download. `one_time_index` < 0 omits the
-    // one-time prekey.
+    // one-time prekey, and the index counts unspent keys only.
     Bytes publishBundle(int one_time_index) const;
+
+    // ---- Prekey state persistence ---------------------------------------
+    //
+    // Carries private keys: signed prekey halves and the one-time secrets.
+    // Whoever holds them can read the first message of any session that used
+    // them, so this goes into the same encrypted store as ratchet state.
+    //
+    // Persisting it is what makes the id counter and the consumed flags
+    // survive a restart; without it every launch minted a new generation under
+    // id 1 and forgot which one-time keys had already been spent.
+    Bytes exportPreKeyState() const;
+    bool importPreKeyState(const uint8_t* data, size_t size);
 
     // ---- Sessions -------------------------------------------------------
 
     bool hasSession(const std::string& peer) const;
+
+    // The real state of a peer label, for a UI that has to show something
+    // truthful. "safetyNumber != null" was being used as a proxy for "a
+    // session exists", which went stale the moment a session was dropped and
+    // was never true for a label that was pinned without a session.
+    enum SessionState : int32_t {
+        NoPeer      = 0,  // nothing known about this label
+        PinnedOnly  = 1,  // identity pinned, no live ratchet
+        Ready       = 2,  // session usable, safety number comparable
+    };
+    SessionState sessionState(const std::string& peer) const;
     // Same as establishOutbound() but reports why it failed, so the caller can
     // tell a bad signature from a changed identity.
     Result establishOutboundStatus(const std::string& peer,
@@ -131,6 +167,13 @@ public:
 
     // Returns false on unknown peer, bad framing, or authentication failure.
     bool decrypt(const std::string& peer, const uint8_t* frame, size_t size, Bytes& out);
+
+    // As above, but reports *why*. The distinction that matters is
+    // Result::Duplicate: the relay delivers at-least-once, so the same frame
+    // legitimately arrives twice and the second copy is refused by the
+    // ratchet. Treating that as a failure put a scary status line in front of
+    // the user every time a live delivery happened to also be replayed.
+    Result decryptStatus(const std::string& peer, const uint8_t* frame, size_t size, Bytes& out);
 
     // ---- Verification ---------------------------------------------------
 

@@ -98,13 +98,20 @@ field is read.
 | `GET_BUNDLE` | client → relay | fetch a peer's prekey bundle |
 | `BUNDLE` | relay → client | identity, signed prekey, one one-time prekey |
 | `SEND` | client → relay | opaque body for a recipient |
-| `DELIVER` | relay → client | `[4] outbox id \| [sender] \| [body]` |
+| `DELIVER` | relay → client | `[8] outbox id \| [sender] \| [body]` |
 | `MORE_PENDING` | relay → client | the last page was full; ACK to pull the next |
-| `ACK` | client → relay | drop outbox entries up to an id, and pull the next page |
+| `ACK` | client → relay | `[8]` seq: drop entries up to it, and pull the next page |
 | `ERROR` | relay → client | human-readable rejection |
 
 A live delivery carries outbox id `0`; a replayed one carries the real id so
 the client can acknowledge it.
+
+The id is **8 bytes** and is a *per-recipient* sequence number. It used to be
+the SQLite rowid truncated to 4 bytes: that counter is global, so it was sparse
+per recipient (a client had to acknowledge ids it never received), it wrapped
+at 2^32, and after the wrap an acknowledgement could delete a different
+recipient's entry. A dense per-recipient counter scoped to the recipient has
+neither problem.
 
 Registration is a challenge-response, not a claim. `HELLO` gets a nonce back,
 and the user id is only bound once the client proves it holds the identity
@@ -115,6 +122,25 @@ own under it.
 Replay is paged. A connection that has a backlog receives up to 200 entries,
 then `MORE_PENDING`; each `ACK` acknowledges what was consumed and pulls the
 following page, so nothing is stranded behind the first page.
+
+Delivery is **at-least-once**: a message can arrive live and then again as a
+replay out of the outbox. The ratchet refuses the second copy, and the client
+is told *why* — `DUPLICATE` is acknowledged silently, while a frame that fails
+on a counter never seen before is surfaced as an authentication failure. Before
+that distinction existed, every duplicated delivery looked like an attack.
+
+Sends are paced per connection (a token bucket, 30 burst / 1 per 10s). The
+outbox is not free storage: it expires after 7 days, is capped at 2000 entries
+per recipient, and the oldest entries go first when the cap is reached.
+
+### Endpoints
+
+| Path | Purpose |
+|---|---|
+| `/ws` | the relay itself |
+| `/healthz` | liveness only; touches nothing, so a slow disk cannot cause a restart |
+| `/readyz` | readiness; reports queue depth, live connections, and fails 503 when the store cannot be written |
+| `/health` | alias of `/readyz`, for the container probe and older deployments |
 
 ### Ratchet frame
 
@@ -165,9 +191,12 @@ before a rotation still works.
 key), and a DH ratchet advances whenever the peer publishes a new ratchet key.
 Message keys are discarded after use, which is what gives forward secrecy.
 
-**Skipped keys** — up to 1000 message keys are cached per chain so out-of-order
-delivery still decrypts. The bound exists so a peer cannot pin arbitrary memory
-by claiming a huge gap.
+**Skipped keys** — message keys are cached so out-of-order delivery still
+decrypts, under two bounds: 1000 per chain, and 2000 across the whole session.
+The per-chain cap alone bounded nothing, because a peer opens a new chain every
+time it publishes a ratchet key — the memory a remote party could pin grew with
+the number of ratchet steps it felt like taking. The global cap is what holds,
+and it evicts the oldest chain first.
 
 **Safety number** — BLAKE2b-256 over **both halves of both identities**, in
 sorted order by DH key, rendered as five groups of five digits. Hashing only
@@ -181,10 +210,25 @@ reported as `IDENTITY_CHANGED` and nothing is sent; the pin survives a restart
 and is *not* cleared by dropping the session, because otherwise a re-handshake
 could silently swap the peer.
 
-**Forward secrecy of state** — ratchet state and identity pins are stored
-through an AES-GCM key held by the Android Keystore. Whoever holds that state
-can read unacknowledged messages and impersonate the device to that peer, so it
-never touches disk in the clear.
+**Prekey lifecycle** — the signed prekey id comes from a counter carried in the
+persisted prekey state, so it only moves forward. It used to be the constant
+`1`, regenerated with fresh keys on every launch: same id, different key, which
+is indistinguishable from a stale bundle on the wire. Two generations are kept
+(current and retired), and every one-time prekey carries a *consumed* flag that
+is persisted — the relay pops an entry when it hands it out, but without a local
+record the private half stayed usable, and a replayed first frame could run
+X3DH against it a second time. A fresh batch is generated when the unspent
+supply drops below half.
+
+**Forward secrecy of state** — ratchet state, identity pins and prekey state
+are stored through AES-GCM keys held by the Android Keystore. Prekey state is
+in that set because whoever holds it can read the first message of any session
+that used it. None of it touches disk in the clear.
+
+**Session state is asked for, not cached** — the engine reports
+`NoPeer / PinnedOnly / Ready`. The UI used to infer "a session exists" from a
+cached safety number, which outlived a restart in which the session did not, so
+the screen could claim a session was live while every frame was being dropped.
 
 ## Building
 
@@ -212,11 +256,20 @@ usable.
 From outside the container, `scripts/healthcheck.sh [host] [port]` does the same
 probe with `curl`, falling back to `wget`.
 
-The relay speaks plain `ws://` and expects TLS to be terminated in front of it.
+The relay speaks plain `ws://` and expects TLS to be terminated in front of it,
+or serves TLS itself when `VEIL_TLS_CERT` and `VEIL_TLS_KEY` are both set. It
+says which mode it is in at startup, because "TLS is somebody else's job" is the
+assumption that quietly does not hold.
+
 Browser clients are only accepted from origins named in `VEIL_ALLOWED_ORIGINS`
 (a comma-separated list); native clients send no `Origin` header and are always
 accepted. Leaving the list empty is therefore the correct setting for an
 Android-only deployment.
+
+On `SIGTERM` the relay stops accepting handshakes, closes every live socket
+with a `1001 going away` status, and waits up to 5 seconds for the handlers to
+unwind. `http.Server.Shutdown` does not touch hijacked websockets, so without
+this step clients learned about a deploy only when their next write failed.
 
 ### Android
 
@@ -230,50 +283,83 @@ build produces `arm64-v8a` and `x86_64` only.
 Point the client at the relay with the URL field on the home screen. The
 default, `ws://10.0.2.2:8080/ws`, reaches the host loopback from an emulator.
 
+The UI is localised (English and Simplified Chinese) and every interactive
+element and message bubble carries a content description; the link state is
+spelled out as a word as well as a colour. `FLAG_SECURE` is set in
+`MainActivity`, so plaintext stays out of screenshots, screen recordings and the
+recents thumbnail.
+
 ## Tests
 
-Three suites, none of which needs a device.
+Four suites, none of which needs a device.
 
 ```bash
 # Protocol engine, on the build machine
 #   Windows:  core-native\host\run_host_tests.bat
 #   Linux/macOS:
 cmake -S core-native/host -B build/host-cmake -DCMAKE_BUILD_TYPE=Release
-cmake --build build/host-cmake && ./build/host-cmake/veil_host_tests
+cmake --build build/host-cmake && ctest --test-dir build/host-cmake --output-on-failure
 
 # Relay
-cd server && go test ./...
+cd server && go test -race ./...
 
 # Client wire code against a real relay process
 #   (builds nothing itself: it starts the binary at build/relay/veil-relay,
 #    and skips if that file is absent)
 cd server && go build -o ../build/relay/veil-relay . && cd ..
 ./gradlew :app:testDebugUnitTest
+
+# Fuzzers
+./build-fuzz-parsers -max_total_time=60          # C++, libFuzzer
+cd server && go test -fuzz=FuzzEnvelope -fuzztime=60s
 ```
 
 The host suite covers agreement, round-trip, out-of-order delivery, replay
-rejection, tamper detection, forward secrecy, the skipped-key bound, session
-persistence, the identity binding and prekey signature, rejects a spliced
-signing key, the retired-prekey path, the prekey header surviving a lost first
-frame, identity pinning surviving a restart, and the exact byte layouts the
-relay and client share.
+rejection, tamper detection, forward secrecy, the skipped-key budget (per chain
+*and* globally), session persistence, the identity binding and prekey signature,
+rejection of a spliced signing key, the retired-prekey path, the prekey header
+surviving a lost first frame, identity pinning surviving a restart, prekey state
+surviving a restart, one-time prekeys being spent exactly once, the difference
+between a duplicated delivery and a tampered one, the engine's session-state
+enum, and the exact byte layouts the relay and client share.
 
 The relay suite covers the challenge handshake, forged proofs, the origin
 allow-list, prekey hand-out, live and offline delivery, paging a backlog larger
-than one page, and that an acknowledgement stays scoped to its recipient.
+than one page, acknowledgement scoping, the per-recipient sequence being dense,
+the expiry and per-recipient trim sweep, the send-rate limiter, readiness
+reporting, and a clean shutdown that clients can observe.
+
+The fuzz targets cover every parser that reads attacker bytes: the envelope and
+field codec, the prekey set, and the three C++ deserialisers (wire frame,
+prekey header, bundle, session state, prekey state).
+
+CI (`.github/workflows/ci.yml`) runs the host suite, the same suite under
+ASan+UBSan, a short libFuzzer pass, `go vet` and `go test -race`, a Go fuzz
+pass, the client/relay interop test against a relay it builds itself, the APK
+build, Android Lint, and the vendored-dependency hash check.
+
+## Dependency pinning
+
+`core-native/src/main/cpp/third_party/DEPENDENCIES.md` records the Monocypher
+sources by SHA-256; `verify.sh` next to it checks them and runs in CI. Upstream
+stamps `__git__` into the header rather than a release number, so a version
+string alone is not a pin — the content hash is.
 
 ## Deliberate limits
 
 - **One-to-one only.** Group messaging needs Sender Keys or per-member
   fan-out; neither is implemented.
-- **Messages are in memory.** The session and the identity pin are persisted
-  (encrypted, see above), but conversation history is not: a restart keeps the
-  ability to talk, and loses the transcript.
+- **Messages are in memory.** The session, the identity pin and the prekey
+  state are persisted (encrypted, see above), but conversation history is not:
+  a restart keeps the ability to talk, and loses the transcript.
 - **Metadata is visible to the relay.** Who talks to whom, when, and how much
   — the protocol hides content, not traffic shape.
 - **No account recovery.** The identity lives in the Android Keystore; losing
   the device means losing the identity. A keystore reset is reported rather
   than papered over as a first run.
+- **No push notifications.** A message waits in the outbox until the client
+  reconnects. FCM would carry an encrypted payload, and saying so plainly is
+  cheaper than implying delivery is instant.
 
 ## Licence
 

@@ -75,6 +75,20 @@ class Writer {
         ))
     }
 
+    /**
+     * Writes a 64-bit unsigned big-endian value.
+     *
+     * Outbox ids are u64 on the relay. They used to be a u32 view of a global
+     * rowid, which overflowed at 2^32 and made an acknowledgement able to
+     * delete the wrong recipient's entry.
+     */
+    fun u64(v: Long) = apply {
+        out.write(byteArrayOf(
+            (v ushr 56).toByte(), (v ushr 48).toByte(), (v ushr 40).toByte(), (v ushr 32).toByte(),
+            (v ushr 24).toByte(), (v ushr 16).toByte(), (v ushr 8).toByte(), v.toByte(),
+        ))
+    }
+
     fun blob(b: ByteArray) = apply {
         u32(b.size)
         out.write(b)
@@ -102,6 +116,14 @@ class Reader(private val data: ByteArray) {
                 (data[pos + 3].toInt() and 0xFF)
         pos += 4
         return v
+    }
+
+    /** Reads an outbox id: 8 bytes, big endian, unsigned. */
+    fun u64(): Long {
+        require(remaining >= 8) { "truncated" }
+        val hi = u32().toLong() and 0xFFFFFFFFL
+        val lo = u32().toLong() and 0xFFFFFFFFL
+        return (hi shl 32) or lo
     }
 
     fun blob(): ByteArray {

@@ -84,7 +84,7 @@ int main() {
     check(bob.generate(), "bob identity");
 
     PreKeys bob_prekeys;
-    check(bob_prekeys.generate(bob, 7, 5), "bob prekeys");
+    check(bob_prekeys.rotate(bob, 5), "bob prekeys");
     check(bob_prekeys.one_time.size() == 5, "five one-time prekeys");
 
     section("X3DH agreement");
@@ -173,7 +173,7 @@ int main() {
         carol.generate();
         dave.generate();
         PreKeys dp;
-        dp.generate(dave, 11, 3);
+        dp.rotate(dave, 3);
         PreKeyBundle b = publishBundle(dave, dp, &dp.one_time[0]);
 
         Session cs, ds;
@@ -212,7 +212,7 @@ int main() {
         e.generate();
         f.generate();
         PreKeys fp;
-        fp.generate(f, 21, 3);
+        fp.rotate(f, 3);
         PreKeyBundle b = publishBundle(f, fp, &fp.one_time[0]);
 
         Session es, fs;
@@ -238,7 +238,7 @@ int main() {
         g.generate();
         h.generate();
         PreKeys hp;
-        hp.generate(h, 31, 3);
+        hp.rotate(h, 3);
         PreKeyBundle b = publishBundle(h, hp, &hp.one_time[0]);
 
         Session gs, hs;
@@ -275,7 +275,7 @@ int main() {
         i.generate();
         j.generate();
         PreKeys jp;
-        jp.generate(j, 41, 3);
+        jp.rotate(j, 3);
         PreKeyBundle b = publishBundle(j, jp, &jp.one_time[0]);
 
         Session is, js;
@@ -312,7 +312,7 @@ int main() {
         k.generate();
         l.generate();
         PreKeys lp;
-        lp.generate(l, 51, 3);
+        lp.rotate(l, 3);
         PreKeyBundle b = publishBundle(l, lp, &lp.one_time[0]);
 
         Session ks, ls;
@@ -337,8 +337,8 @@ int main() {
         Engine a, b;
         check(a.createIdentity(), "engine a identity");
         check(b.createIdentity(), "engine b identity");
-        check(a.generatePreKeys(1, 4), "engine a prekeys");
-        check(b.generatePreKeys(1, 4), "engine b prekeys");
+        check(a.rotatePreKeys(), "engine a prekeys");
+        check(b.rotatePreKeys(), "engine b prekeys");
 
         Bytes bundle = b.publishBundle(0);
         check(!bundle.empty(), "bundle published");
@@ -385,7 +385,7 @@ int main() {
         {
             Engine mallory;
             mallory.createIdentity();
-            mallory.generatePreKeys(9, 1);
+            mallory.rotatePreKeys();
             // Alice's bundle points at Bob, so Mallory's frame is a stranger.
             Bytes mb = a.publishBundle(0);
             (void)mb;
@@ -394,11 +394,11 @@ int main() {
             // as a different identity.
             Engine carol;
             carol.createIdentity();
-            carol.generatePreKeys(3, 1);
+            carol.rotatePreKeys();
             Bytes cb = carol.publishBundle(0);
             Engine dave;
             dave.createIdentity();
-            dave.generatePreKeys(3, 1);
+            dave.rotatePreKeys();
             dave.establishOutbound("carol", cb.data(), cb.size());
 
             Bytes carol_frame = carol.encrypt("dave",
@@ -423,8 +423,8 @@ int main() {
         Engine a, b;
         a.createIdentity();
         b.createIdentity();
-        a.generatePreKeys(2, 2);
-        b.generatePreKeys(2, 2);
+        a.rotatePreKeys();
+        b.rotatePreKeys();
 
         Bytes bundle = b.publishBundle(0);
         a.establishOutbound("bob", bundle.data(), bundle.size());
@@ -454,19 +454,28 @@ int main() {
         //   then per one-time key: [4] id | [32] pub
         Engine e;
         e.createIdentity();
-        check(e.generatePreKeys(3, 4), "prekeys generated");
+        check(e.rotatePreKeys(), "prekeys generated");
 
         Bytes set = e.exportPreKeySet();
-        check(set.size() == 4 + 32 + 64 + 4 + 4 * 36, "prekey set size");
+        check(set.size() == 4 + 32 + 64 + 4 + kOneTimeBatch * 36, "prekey set size");
 
-        check(get_u32(set.data()) == 3, "signed id at offset 0");
-        check(get_u32(set.data() + 4 + 32 + 64) == 4, "count at offset 100");
+        // The signed prekey id is a monotonic counter, not a constant. It used
+        // to restart at 1 on every launch, which made a stale bundle
+        // indistinguishable from a fresh one.
+        check(get_u32(set.data()) == 1, "first signed id is 1");
+        check(get_u32(set.data() + 4 + 32 + 64) == kOneTimeBatch, "one-time count");
+
+        // Rotating again must move the id forward, so the relay cannot
+        // overwrite the previous row under the same name.
+        check(e.rotatePreKeys(), "second rotation");
+        Bytes set2 = e.exportPreKeySet();
+        check(get_u32(set2.data()) == 2, "second signed id is 2");
 
         // Each one-time id must be unique, or the relay could hand the same
         // key to two different senders.
         std::vector<uint32_t> ids;
         size_t off = 4 + 32 + 64 + 4;
-        for (int i = 0; i < 4; ++i) {
+        for (uint32_t i = 0; i < kOneTimeBatch; ++i) {
             ids.push_back(get_u32(set.data() + off));
             off += 36;
         }
@@ -486,7 +495,7 @@ int main() {
         // device.
         Engine bob;
         bob.createIdentity();
-        bob.generatePreKeys(5, 2);
+        bob.rotatePreKeys();
 
         Bytes pub = bob.exportIdentityPublic();
         Bytes set = bob.exportPreKeySet();
@@ -559,10 +568,10 @@ int main() {
         Identity bob;
         bob.generate();
         PreKeys bp;
-        bp.generate(bob, 11, 2);
+        bp.rotate(bob, 2);
 
         check(verifySignedPreKey(bob.dh_pub, bob.sign_pub,
-                                 bp.signed_pub, bp.signed_signature),
+                                 bp.current.pub, bp.current.signature),
               "signed prekey verifies");
 
         // The exact attack the binding closes: keep the victim's DH key, swap
@@ -571,7 +580,7 @@ int main() {
         Identity evil;
         evil.generate();
         check(!verifySignedPreKey(bob.dh_pub, evil.sign_pub,
-                                  bp.signed_pub, bp.signed_signature),
+                                  bp.current.pub, bp.current.signature),
               "spliced signing key rejected by the prekey signature");
 
         // A bundle built that way must not establish a session either.
@@ -598,41 +607,49 @@ int main() {
         Identity bob;
         bob.generate();
         PreKeys bp;
-        bp.generate(bob, 21, 2);
+        bp.rotate(bob, 2);
 
-        const uint32_t first_id = bp.signed_prekey_id;
+        // Rotate: the old prekey is retired by rotate() itself, not gone. The
+        // same PreKeys object gains a second generation, exactly as a real
+        // rotation would.
         const PreKeyBundle stale_bundle = publishBundle(bob, bp, &bp.one_time[0]);
+        const uint32_t first_id = bp.current.id;
 
-        // Rotate: the old prekey is now retired, not gone.
-        PreKeys rotated;
-        rotated.generate(bob, 22, 2);
-        rotated.retired_signed_id = first_id;
-        rotated.has_retired_signed = true;
-        rotated.retired_signed_pub[0] = 0;  // only the private half matters here
+        PreKeys rotated = bp;
+        rotated.rotate(bob, 2);
+        check(rotated.has_retired && rotated.retired.id == first_id,
+              "rotation retires the previous prekey");
+        check(rotated.current.id > first_id, "signed prekey id moves forward");
 
         Identity alice;
         alice.generate();
         Session as;
         check(as.establishOutbound(alice, stale_bundle), "stale bundle establishes");
 
-        // The header carries the retired id, and the receiver must still be
-        // able to complete the handshake with it.
+        // The header carries the now-retired id, and the receiver must still
+        // be able to complete the handshake with it.
         Session bs;
-        check(bs.establishInbound(bob, bp, as.pendingPreKeyHeader()),
+        check(bs.establishInbound(bob, rotated, as.pendingPreKeyHeader()),
               "handshake against the retired prekey");
+
+        // The same header, offered twice, is refused: a replayed first frame
+        // must not re-run X3DH against the same one-time key.
+        Session replay;
+        check(!replay.establishInbound(bob, rotated, as.pendingPreKeyHeader()),
+              "spent one-time prekey refused on replay");
 
         // A header naming an id we never issued is refused.
         PreKeyHeader unknown = as.pendingPreKeyHeader();
         unknown.signed_prekey_id = 9999;
         Session nope;
-        check(!nope.establishInbound(bob, bp, unknown),
+        check(!nope.establishInbound(bob, rotated, unknown),
               "unknown signed prekey id refused");
 
         // zero is not a valid signed prekey id either; it would otherwise
         // look like "no prekey" and re-key the session silently.
         unknown.signed_prekey_id = 0;
         Session zero;
-        check(!zero.establishInbound(bob, bp, unknown),
+        check(!zero.establishInbound(bob, rotated, unknown),
               "missing signed prekey id refused");
     }
 
@@ -644,8 +661,8 @@ int main() {
         Engine a, b;
         a.createIdentity();
         b.createIdentity();
-        a.generatePreKeys(1, 2);
-        b.generatePreKeys(1, 2);
+        a.rotatePreKeys();
+        b.rotatePreKeys();
 
         Bytes bundle = b.publishBundle(0);
         check(a.establishOutboundStatus("bob", bundle.data(), bundle.size()) == Engine::Result::Ok,
@@ -680,8 +697,8 @@ int main() {
         alice.createIdentity();
         bob.createIdentity();
         mallory.createIdentity();
-        bob.generatePreKeys(1, 2);
-        mallory.generatePreKeys(1, 2);
+        bob.rotatePreKeys();
+        mallory.rotatePreKeys();
 
         Bytes bob_bundle = bob.publishBundle(0);
         check(alice.establishOutboundStatus("bob", bob_bundle.data(), bob_bundle.size()) ==
@@ -708,8 +725,8 @@ int main() {
         Engine a, b;
         a.createIdentity();
         b.createIdentity();
-        a.generatePreKeys(1, 2);
-        b.generatePreKeys(1, 2);
+        a.rotatePreKeys();
+        b.rotatePreKeys();
 
         Bytes bundle = b.publishBundle(0);
         a.establishOutbound("bob", bundle.data(), bundle.size());
@@ -731,12 +748,12 @@ int main() {
     {
         Engine a;
         a.createIdentity();
-        a.generatePreKeys(1, 2);
+        a.rotatePreKeys();
         Bytes self_bundle = a.publishBundle(0);
 
         Engine b;
         b.createIdentity();
-        b.generatePreKeys(1, 2);
+        b.rotatePreKeys();
         b.establishOutbound("alice", self_bundle.data(), self_bundle.size());
         std::string before = b.safetyNumber("alice");
 
@@ -757,7 +774,7 @@ int main() {
         Identity other;
         other.generate();
         PreKeys op;
-        op.generate(other, 1, 1);
+        op.rotate(other, 1);
         Bytes evil = publishBundle(other, op, &op.one_time[0]).serialize();
         check(b2.establishOutboundStatus("alice", evil.data(), evil.size()) ==
                   Engine::Result::IdentityChanged,
@@ -770,6 +787,228 @@ int main() {
                   Engine::Result::IdentityChanged,
               "dropping a session keeps the pin");
     }
+    section("skipped-key budget is global, not per chain");
+    {
+        // A fresh bucket is opened every time the peer publishes a new ratchet
+        // key, so "1000 per chain" bounded nothing at all: the amount a remote
+        // party could pin grew with the number of ratchet steps it felt like
+        // taking. The global cap is what actually holds.
+        Identity alice, bob;
+        alice.generate();
+        bob.generate();
+        PreKeys bp;
+        bp.rotate(bob, 2);
+        PreKeyBundle bundle = publishBundle(bob, bp, &bp.one_time[0]);
+
+        Session as, bs;
+        check(as.establishOutbound(alice, bundle), "session up");
+
+        // Drive many separate chains: each round skips a long run on the
+        // receiving side, then the peer ratchets, opening a new bucket.
+        RatchetMessage first;
+        check(as.encrypt(reinterpret_cast<const uint8_t*>("open"), 4, nullptr, 0, first),
+              "opening frame");
+        check(bs.establishInbound(bob, bp, as.pendingPreKeyHeader()), "bob handshake");
+        Bytes p;
+        check(bs.decrypt(first, nullptr, 0, p), "opening frame decrypts");
+
+        for (int round = 0; round < 8; ++round) {
+            // Alice burns 400 counters on the current chain without Bob
+            // seeing them, so Bob caches 400 keys when the next frame lands.
+            for (int i = 0; i < 400; ++i) {
+                RatchetMessage skipped;
+                as.encrypt(reinterpret_cast<const uint8_t*>("x"), 1, nullptr, 0, skipped);
+            }
+            RatchetMessage landed;
+            check(as.encrypt(reinterpret_cast<const uint8_t*>("y"), 1, nullptr, 0, landed),
+                  "landed frame");
+            check(bs.decrypt(landed, nullptr, 0, p), "landed frame decrypts");
+
+            // Bob replies, which makes both sides ratchet and opens a new
+            // bucket on Bob's side next round.
+            RatchetMessage reply;
+            check(bs.encrypt(reinterpret_cast<const uint8_t*>("r"), 1, nullptr, 0, reply),
+                  "bob replies");
+            Bytes rp;
+            check(as.decrypt(reply, nullptr, 0, rp), "reply decrypts");
+
+            // The invariant, checked every round rather than only at the end.
+            check(bs.skippedKeyCount() <= kMaxSkippedKeysTotal,
+                  "total skipped keys stay inside the budget");
+        }
+    }
+
+    section("prekey state survives a restart");
+    {
+        // Before this, every launch minted a fresh generation under id 1 and
+        // forgot which one-time keys had already been handed out. Same id with
+        // different keys is indistinguishable from a stale bundle on the wire,
+        // and an unrecorded spend lets a one-time key be used twice.
+        Engine a;
+        a.createIdentity();
+        a.rotatePreKeys();
+        a.rotatePreKeys();  // two generations, so the id is past 1
+
+        Bytes state = a.exportPreKeyState();
+        check(!state.empty(), "prekey state exports");
+
+        Bytes published = a.exportPreKeySet();
+        const uint32_t id_before = get_u32(published.data());
+
+        Engine restored;
+        restored.createIdentity();
+        check(restored.importPreKeyState(state.data(), state.size()),
+              "prekey state imports");
+
+        Bytes after = restored.exportPreKeySet();
+        check(get_u32(after.data()) == id_before, "signed id survives a restart");
+
+        // The retired prekey has to come back too, or a bundle fetched just
+        // before the rotation stops working after a restart.
+        check(after.size() == published.size(), "one-time set size survives");
+
+        // Continuing after a restart must not reuse an id.
+        check(restored.rotatePreKeys(), "rotate after restore");
+        Bytes next = restored.exportPreKeySet();
+        check(get_u32(next.data()) > id_before, "id keeps moving forward");
+
+        // A truncated state blob is refused rather than half-applied.
+        Engine bad;
+        bad.createIdentity();
+        check(!bad.importPreKeyState(state.data(), state.size() - 1),
+              "truncated prekey state refused");
+    }
+
+    section("a one-time prekey is spent exactly once");
+    {
+        Identity bob, alice;
+        bob.generate();
+        alice.generate();
+        PreKeys bp;
+        bp.rotate(bob, 3);
+        check(bp.one_time.size() == 3, "three one-time keys generated");
+
+        const OneTimePreKey* first = nullptr;
+        for (const auto& ot : bp.one_time) {
+            if (!ot.consumed) { first = &ot; break; }
+        }
+        check(first != nullptr, "an unspent key is available");
+
+        PreKeyBundle bundle = publishBundle(bob, bp, first);
+        Session as;
+        check(as.establishOutbound(alice, bundle), "session against a prekey");
+        PreKeyHeader header = as.pendingPreKeyHeader();
+
+        // The handshake spends the key the header names, and only that one.
+        Session one;
+        check(one.establishInbound(bob, bp, header), "first inbound spends it");
+
+        const uint32_t id = header.one_time_prekey_id;
+        check(bp.consumeOneTime(id) == nullptr, "the key is recorded as spent");
+
+        // A replayed first frame names the same key, which is now spent. It
+        // must be refused: re-running X3DH on a used one-time key is exactly
+        // the weakness the "one-time" in the name excludes.
+        Session two;
+        check(!two.establishInbound(bob, bp, header), "same header replayed is refused");
+
+        // Fewer unspent keys remain, so a refill becomes due sooner.
+        size_t unused = 0;
+        for (const auto& ot : bp.one_time) {
+            if (!ot.consumed) ++unused;
+        }
+        check(unused == 2, "exactly one of three keys was spent");
+        check(!bp.needsRefill(unused), "no refill while the supply lasts");
+        check(bp.needsRefill(unused + 1), "refill due once below the low-water mark");
+    }
+
+    section("a duplicated delivery is not an error");
+    {
+        // The relay delivers at-least-once: a live push can also be replayed
+        // out of the outbox. The ratchet refuses the second copy, which is
+        // correct - but reporting it as authentication failure put a scary line
+        // in front of the user on a perfectly normal event.
+        Engine a, b;
+        check(a.createIdentity(), "a identity");
+        check(b.createIdentity(), "b identity");
+        check(a.rotatePreKeys(), "a prekeys");
+        check(b.rotatePreKeys(), "b prekeys");
+
+        Bytes bundle = b.publishBundle(0);
+        check(a.establishOutboundStatus("bob", bundle.data(), bundle.size()) ==
+                  Engine::Result::Ok,
+              "session established");
+
+        Bytes frame = a.encrypt("bob", reinterpret_cast<const uint8_t *>("once"), 4);
+        Bytes plain;
+
+        check(b.decryptStatus("alice", frame.data(), frame.size(), plain) ==
+                  Engine::Result::Ok,
+              "first delivery accepted");
+        check(toString(plain) == "once", "content");
+
+        check(b.decryptStatus("alice", frame.data(), frame.size(), plain) ==
+                  Engine::Result::Duplicate,
+              "replay reported as duplicate, not as tamper");
+
+        // A tampered frame on a counter we have *not* consumed is a different
+        // failure from a duplicate. The two must stay distinguishable, or a
+        // duplicate delivery looks like an attack and a real one looks like a
+        // duplicate.
+        Bytes next = a.encrypt("bob", reinterpret_cast<const uint8_t *>("second"), 6);
+        next[next.size() - 1] ^= 0xFF;
+        check(b.decryptStatus("alice", next.data(), next.size(), plain) ==
+                  Engine::Result::AuthFailed,
+              "tampered frame reported as auth failure");
+
+        // A truncated frame no longer carries a MAC at all.
+        Bytes tiny(next.begin(), next.begin() + 8);
+        check(b.decryptStatus("alice", tiny.data(), tiny.size(), plain) ==
+                  Engine::Result::BadBundle,
+              "truncated frame reported as bad bundle");
+
+        // A frame under an unknown peer label has no session at all. The frame
+        // used here is a plain ratchet frame (the header was dropped once Bob
+        // answered), so there is nothing to bootstrap a handshake from.
+        Bytes plainFrame = b.encrypt("alice", reinterpret_cast<const uint8_t *>("back"), 4);
+        check(!hasPreKeyHeader(plainFrame), "reply carries no prekey header");
+        check(b.decryptStatus("nobody", plainFrame.data(), plainFrame.size(), plain) ==
+                  Engine::Result::NoSession,
+              "unknown peer reported as no session");
+    }
+
+    section("engine reports the real session state");
+    {
+        // The UI used "safetyNumber != null" as a proxy for "a session
+        // exists". That went stale as soon as a session was dropped, and was
+        // never true for a label that was pinned without one.
+        Engine a;
+        a.createIdentity();
+        a.rotatePreKeys();
+        check(a.sessionState("bob") == Engine::SessionState::NoPeer,
+              "unknown label is NoPeer");
+
+        Engine b;
+        b.createIdentity();
+        b.rotatePreKeys();
+        Bytes bundle = b.publishBundle(0);
+        check(a.establishOutboundStatus("bob", bundle.data(), bundle.size()) ==
+                  Engine::Result::Ok,
+              "session established");
+        check(a.sessionState("bob") == Engine::SessionState::Ready, "live session is Ready");
+
+        a.dropSession("bob");
+        check(a.sessionState("bob") == Engine::SessionState::PinnedOnly,
+              "dropping the session leaves the pin");
+
+        Bytes registry = a.exportPeerRegistry();
+        Engine a2;
+        a2.createIdentity();
+        a2.importPeerRegistry(registry.data(), registry.size());
+        check(a2.sessionState("bob") == Engine::SessionState::PinnedOnly,
+              "the pin reports itself after a restart");
+    }
+
     section("ratchet does not move backwards");
     {
         // Alice sends two messages; Bob reads only the first, then replies.
@@ -779,7 +1018,7 @@ int main() {
         alice.generate();
         bob.generate();
         PreKeys bp;
-        bp.generate(bob, 61, 3);
+        bp.rotate(bob, 3);
         PreKeyBundle bundle = publishBundle(bob, bp, &bp.one_time[0]);
 
         Session as, bs;
@@ -833,7 +1072,7 @@ int main() {
         alice.generate();
         bob.generate();
         PreKeys bp;
-        bp.generate(bob, 71, 3);
+        bp.rotate(bob, 3);
         PreKeyBundle bundle = publishBundle(bob, bp, &bp.one_time[0]);
 
         Session as, bs;
@@ -878,7 +1117,7 @@ int main() {
         alice.generate();
         bob.generate();
         PreKeys bp;
-        bp.generate(bob, 81, 3);
+        bp.rotate(bob, 3);
         PreKeyBundle bundle = publishBundle(bob, bp, &bp.one_time[0]);
 
         Session as, bs;
@@ -926,7 +1165,7 @@ int main() {
         alice.generate();
         bob.generate();
         PreKeys bp;
-        bp.generate(bob, 91, 3);
+        bp.rotate(bob, 3);
         PreKeyBundle bundle = publishBundle(bob, bp, &bp.one_time[0]);
 
         Session as, bs;

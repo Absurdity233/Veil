@@ -51,39 +51,92 @@ struct Identity {
 //
 // `signed_prekey` is medium-lived and rotated periodically; the one-time
 // prekeys are consumed by the server as peers fetch them.
+// One signed prekey generation plus the one-time prekeys that went with it.
+//
+// Two generations are kept. A peer may have downloaded the previous bundle
+// just before a rotation and only send its first message afterwards, and
+// without the retired private half that handshake could never complete.
+struct SignedPreKey {
+    uint32_t id = 0;
+    uint8_t  pub[kKeySize]{};
+    uint8_t  priv[kKeySize]{};
+    uint8_t  signature[kSigSize]{};
+};
+
+// A one-time prekey, plus whether it has already been handed to somebody.
+//
+// The consumed flag matters locally, not just at the relay: the relay pops an
+// entry when it hands it out, but the *private* half stays here forever unless
+// something marks it. Reusing a one-time prekey across two sessions is exactly
+// the weakness the "one-time" in the name is meant to exclude.
+struct OneTimePreKey {
+    uint32_t id = 0;
+    uint8_t  pub[kKeySize]{};
+    uint8_t  priv[kKeySize]{};
+    bool     consumed = false;
+};
+
 struct PreKeys {
-    uint32_t signed_prekey_id = 0;
-    uint8_t  signed_pub[kKeySize]{};
-    uint8_t  signed_priv[kKeySize]{};
-    uint8_t  signed_signature[kSigSize]{};
+    // Current and previous generation. Both stay decryptable.
+    SignedPreKey current;
+    SignedPreKey retired;
+    bool         has_retired = false;
 
-    // The signed prekey that was live before the current one. A peer may have
-    // downloaded the old bundle just before a rotation and send its first
-    // message afterwards; without this the handshake would fail and the user
-    // would have no way to tell why.
-    uint32_t retired_signed_id = 0;
-    bool     has_retired_signed = false;
-    uint8_t  retired_signed_pub[kKeySize]{};
-    uint8_t  retired_signed_priv[kKeySize]{};
-    uint8_t  retired_signed_signature[kSigSize]{};
+    // Every one-time prekey this device ever generated. Bounded, because it
+    // is persisted: `kTombstoneKeep` of them are kept per generation so a
+    // late first message can still name one, and the rest are dropped.
+    std::vector<OneTimePreKey> one_time;
 
-    struct OneTime {
-        uint32_t id = 0;
-        uint8_t  pub[kKeySize]{};
-        uint8_t  priv[kKeySize]{};
-    };
-    std::vector<OneTime> one_time;
+    // The signed prekey *id* counter is monotonic across restarts.
+    //
+    // It used to be the constant 1, regenerated with fresh keys on every
+    // launch. Same id, different key: a peer holding a bundle fetched before
+    // the restart could not tell a stale bundle from a current one, and the
+    // relay overwrote the row with the new keys under the same name.
+    uint32_t next_signed_id = 1;
 
-    // Signs the signed prekey with `identity`. The signature covers the
-    // identity's DH public key too - see verifySignedPreKey().
-    bool generate(const Identity& identity, uint32_t signed_id, uint32_t one_time_count);
+    uint32_t signed_prekey_id() const { return current.id; }
+
+    // Signs a fresh signed prekey with `identity`, retires the previous one,
+    // and generates a fresh batch of one-time prekeys.
+    //
+    // The signature covers the identity's DH public key as well as the prekey
+    // itself - see verifySignedPreKey().
+    bool rotate(const Identity& identity, uint32_t one_time_count);
 
     // Returns the private half that a prekey header was addressed to, or
     // nullptr when the id matches neither the current nor the retired prekey.
     const uint8_t* signedPrivFor(uint32_t signed_id) const;
 
+    // Looks up an unconsumed one-time prekey by id and marks it consumed.
+    // Returns nullptr when the id is unknown or already spent.
+    const OneTimePreKey* consumeOneTime(uint32_t id);
+
+    // True when fewer than `low_water` one-time prekeys remain unspent, which
+    // is the signal to publish a fresh batch.
+    bool needsRefill(size_t low_water) const;
+
+    // Drops spent one-time prekeys beyond the tombstone budget.
+    void pruneOneTime();
+
+    // ---- Persistence ----------------------------------------------------
+    //
+    // Prekey state is as sensitive as the sessions: whoever holds the signed
+    // prekey's private half can read the first message of any session that
+    // used it. It is therefore exported for encrypted storage, never as plain
+    // bytes on disk.
+    Bytes serialize() const;
+    bool deserialize(const uint8_t* data, size_t size);
+
     void wipeSecrets();
 };
+
+// How many one-time prekeys are generated per rotation.
+constexpr uint32_t kOneTimeBatch = 20;
+
+// How many spent one-time prekeys are kept so a late handshake can still name
+// one, and so a duplicate cannot silently reuse it.
+constexpr size_t kTombstoneKeep = 64;
 
 // What a peer downloads from the server in order to start a session.
 struct PreKeyBundle {
@@ -102,7 +155,7 @@ struct PreKeyBundle {
 
 // The public half of a published prekey set.
 PreKeyBundle publishBundle(const Identity& identity, const PreKeys& prekeys,
-                           const PreKeys::OneTime* one_time);
+                           const OneTimePreKey* one_time);
 
 // ---- Prekey signature binding -----------------------------------------
 //

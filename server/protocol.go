@@ -105,6 +105,15 @@ func (w *writer) u32(v uint32) {
 	w.buf = append(w.buf, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
+// u64 is used for outbox ids. The wire carried them as u32, which meant the
+// SQLite rowid was truncated and an acknowledgement could name the wrong
+// entry once the counter wrapped.
+func (w *writer) u64(v uint64) {
+	w.buf = append(w.buf,
+		byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32),
+		byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+}
+
 func (w *writer) blob(b []byte) {
 	w.u32(uint32(len(b)))
 	w.buf = append(w.buf, b...)
@@ -132,6 +141,21 @@ func (r *reader) u32() (uint32, error) {
 		uint32(r.buf[r.pos+2])<<8 | uint32(r.buf[r.pos+3])
 	r.pos += 4
 	return v, nil
+}
+
+func (r *reader) u64() (uint64, error) {
+	if len(r.buf)-r.pos < 8 {
+		return 0, errTruncated
+	}
+	hi, err := r.u32()
+	if err != nil {
+		return 0, err
+	}
+	lo, err := r.u32()
+	if err != nil {
+		return 0, err
+	}
+	return uint64(hi)<<32 | uint64(lo), nil
 }
 
 func (r *reader) blob() ([]byte, error) {

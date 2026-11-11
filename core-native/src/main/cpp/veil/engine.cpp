@@ -120,23 +120,36 @@ Bytes Engine::signChallenge(const uint8_t* data, size_t size) const {
     return out;
 }
 
-bool Engine::generatePreKeys(uint32_t signed_id, uint32_t one_time_count) {
-    return prekeys_.generate(identity_, signed_id, one_time_count);
+bool Engine::rotatePreKeys() {
+    return prekeys_.rotate(identity_, kOneTimeBatch);
 }
 
+bool Engine::needsPreKeyRefill(size_t low_water) const {
+    return prekeys_.needsRefill(low_water);
+}
+
+// The public prekey set as the relay should store it. Only unspent one-time
+// keys are published: a key that has already been handed to somebody must not
+// be offered again.
 Bytes Engine::exportPreKeySet() const {
+    size_t unused = 0;
+    for (const auto& ot : prekeys_.one_time) {
+        if (!ot.consumed) ++unused;
+    }
+
     Bytes out;
-    out.reserve(4 + 32 + 64 + 4 + prekeys_.one_time.size() * 36);
+    out.reserve(4 + 32 + 64 + 4 + unused * 36);
 
     uint8_t buf[4];
-    put_u32(buf, prekeys_.signed_prekey_id);
+    put_u32(buf, prekeys_.current.id);
     out.insert(out.end(), buf, buf + 4);
-    out.insert(out.end(), prekeys_.signed_pub, prekeys_.signed_pub + 32);
-    out.insert(out.end(), prekeys_.signed_signature, prekeys_.signed_signature + 64);
+    out.insert(out.end(), prekeys_.current.pub, prekeys_.current.pub + 32);
+    out.insert(out.end(), prekeys_.current.signature, prekeys_.current.signature + 64);
 
-    put_u32(buf, static_cast<uint32_t>(prekeys_.one_time.size()));
+    put_u32(buf, static_cast<uint32_t>(unused));
     out.insert(out.end(), buf, buf + 4);
     for (const auto& ot : prekeys_.one_time) {
+        if (ot.consumed) continue;
         put_u32(buf, ot.id);
         out.insert(out.end(), buf, buf + 4);
         out.insert(out.end(), ot.pub, ot.pub + 32);
@@ -148,9 +161,31 @@ Bytes Engine::publishBundle(int one_time_index) const {
     if (one_time_index < 0) {
         return veil::publishBundle(identity_, prekeys_, nullptr).serialize();
     }
-    if (static_cast<size_t>(one_time_index) >= prekeys_.one_time.size()) return {};
-    return veil::publishBundle(identity_, prekeys_, &prekeys_.one_time[one_time_index])
-        .serialize();
+
+    // Only an unspent key may be offered. Indexing into the raw vector would
+    // happily hand out a key that some earlier session already used.
+    size_t seen = 0;
+    for (const auto& ot : prekeys_.one_time) {
+        if (ot.consumed) continue;
+        if (seen++ == static_cast<size_t>(one_time_index)) {
+            return veil::publishBundle(identity_, prekeys_, &ot).serialize();
+        }
+    }
+    return {};
+}
+
+// ---- Prekey state ------------------------------------------------------
+
+Bytes Engine::exportPreKeyState() const {
+    return prekeys_.serialize();
+}
+
+bool Engine::importPreKeyState(const uint8_t* data, size_t size) {
+    PreKeys loaded;
+    if (!loaded.deserialize(data, size)) return false;
+    prekeys_.wipeSecrets();
+    prekeys_ = std::move(loaded);
+    return true;
 }
 
 // ---- Sessions ----------------------------------------------------------
@@ -276,10 +311,15 @@ Bytes Engine::encrypt(const std::string& peer, const uint8_t* plain, size_t size
 }
 
 bool Engine::decrypt(const std::string& peer, const uint8_t* frame, size_t size, Bytes& out) {
+    return decryptStatus(peer, frame, size, out) == Result::Ok;
+}
+
+Engine::Result Engine::decryptStatus(const std::string& peer, const uint8_t* frame,
+                                     size_t size, Bytes& out) {
     bool has_prekey = false;
     PreKeyHeader prekey;
     RatchetMessage msg;
-    if (!WireMessage::decode(frame, size, has_prekey, prekey, msg)) return false;
+    if (!WireMessage::decode(frame, size, has_prekey, prekey, msg)) return Result::BadBundle;
 
     Bytes prekey_aad;
     if (has_prekey) {
@@ -294,14 +334,28 @@ bool Engine::decrypt(const std::string& peer, const uint8_t* frame, size_t size,
     // yet. With no session, this is the handshake. With a session, the header
     // is stale and must not re-run X3DH.
     if (s == nullptr) {
-        if (!has_prekey) return false;
+        if (!has_prekey) return Result::NoSession;
 
-        if (establishInbound(peer, prekey) != Result::Ok) return false;
+        Result established = establishInbound(peer, prekey);
+        if (established != Result::Ok) return established;
         s = findSession(peer);
-        if (s == nullptr) return false;
+        if (s == nullptr) return Result::NoSession;
     }
 
-    if (!s->decrypt(msg, prekey_aad.data(), prekey_aad.size(), out)) return false;
+    Session::DecryptResult r =
+        s->decryptDetailed(msg, prekey_aad.data(), prekey_aad.size(), out);
+    if (r != Session::DecryptOk) {
+        // A duplicated delivery is a normal event - the relay is
+        // at-least-once, so one frame can arrive live and again from the
+        // outbox - and must not be reported as tampering. A frame that fails
+        // on a counter we have not consumed is the real failure.
+        switch (r) {
+            case Session::DecryptDuplicate:  return Result::Duplicate;
+            case Session::DecryptTooFarAhead: return Result::BadSignature;
+            case Session::DecryptAuthFailed:  return Result::AuthFailed;
+            default:                          return Result::AuthFailed;
+        }
+    }
 
     // A frame that authenticated proves the peer holds this session. Once it
     // arrives *without* a prekey header, the peer has already completed X3DH
@@ -313,7 +367,13 @@ bool Engine::decrypt(const std::string& peer, const uint8_t* frame, size_t size,
     // outbox entry is retried instead of orphaning the session forever.
     if (!has_prekey && s->hasPendingPreKeyHeader()) s->clearPendingPreKeyHeader();
 
-    return true;
+    return Result::Ok;
+}
+
+Engine::SessionState Engine::sessionState(const std::string& peer) const {
+    if (findSession(peer) != nullptr) return Ready;
+    if (peer_identity_.find(peer) != peer_identity_.end()) return PinnedOnly;
+    return NoPeer;
 }
 
 Bytes Engine::peerIdentity(const std::string& peer) const {
