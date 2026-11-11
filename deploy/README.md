@@ -111,9 +111,27 @@ What does not work is plain `http://<ip>:8080`. The page will load and the clien
 will refuse to create keys, because `crypto.subtle` is undefined on an insecure
 origin. That is the client doing its job.
 
-## This deployment: HOST_ADDRESS
+## Verifying a deployed host
 
-Live and verified:
+Live and verified on an IP-only host:
+
+| check | result |
+|---|---|
+| `/health` over public https | `200 ok` |
+| `/` (the page) | `200` |
+| `/wasm/veil.wasm` | `200`, ~180 KB |
+| `/app.js` | `200`, ~76 KB |
+| certificate chain | `Verify return code: 0 (ok)` against the local CA |
+| foreign `Origin` on `/ws` | `403` |
+| deployment's own `Origin` on `/ws` | upgrade reaches the relay |
+| CSP / HSTS / `X-Frame-Options` | present on every response |
+
+On that host port 80 belongs to another service, so Caddy binds 443 only. That is
+recorded in the compose file rather than left as a surprise.
+
+Addresses are deliberately not recorded in this repository. A deployment's host
+is deployment configuration, not project documentation, and it lives only in the
+`.env` on the server.
 
 | check | result |
 |---|---|
