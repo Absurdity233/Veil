@@ -875,3 +875,23 @@ extern "C" int veil_encrypt_to_account(void* handle, const char* user_id,
     }
     return static_cast<int>(total);
 }
+extern "C" int veil_export_group_state(const void* handle, uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    int written = 0;
+    veil::Bytes state = engine->exportGroupState();
+    if (state.empty()) return VEIL_NO_SESSION;
+
+    const int status = copyOut(state, out, out_size, &written);
+    veil::wipe(state);
+    return status == VEIL_OK ? written : status;
+}
+
+extern "C" int veil_import_group_state(void* handle, const uint8_t* data, size_t size) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (data == nullptr) return VEIL_ERR_NULL_ARG;
+
+    return engine->importGroupState(data, size) ? VEIL_OK : VEIL_BAD_BUNDLE;
+}

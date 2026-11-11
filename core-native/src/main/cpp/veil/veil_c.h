@@ -368,6 +368,17 @@ VEIL_API int veil_decrypt_from_group(void* handle, const char* group_id,
                                      const uint8_t* data, size_t size,
                                      uint8_t* out, size_t out_size, size_t* out_len);
 
+// The whole group state, for the encrypted store.
+//
+// This carries secrets: every incoming chain key decrypts that sender's messages
+// and the outgoing chain can forge them. It belongs in the same encrypted store
+// as ratchet state.
+VEIL_API int veil_export_group_state(const void* handle, uint8_t* out, size_t out_size);
+
+// Restores group state. A malformed blob is refused whole, leaving live groups
+// untouched rather than half-loaded.
+VEIL_API int veil_import_group_state(void* handle, const uint8_t* data, size_t size);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

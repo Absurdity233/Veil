@@ -22,6 +22,10 @@ export const FrameType = {
   AUTH_CHALLENGE: 0x0a,
   AUTH_RESPONSE: 0x0b,
   MORE_PENDING: 0x0c,
+  // Device lists. See docs/multi-device.md.
+  PUBLISH_DEVICES: 0x0d,
+  GET_DEVICES: 0x0e,
+  DEVICES: 0x0f,
 } as const;
 
 export type FrameTypeValue = (typeof FrameType)[keyof typeof FrameType];

@@ -379,6 +379,33 @@ public:
                             const GroupMessage& message,
                             Bytes& out);
 
+    // ---- Group persistence ----------------------------------------------
+    //
+    // Groups carry secrets: every incoming chain key can decrypt that sender's
+    // messages, and the outgoing chain can forge them. This blob goes into the
+    // same encrypted store as ratchet state, and is wiped on export.
+    //
+    // Persisting it is what stops a restart from silently dropping every group.
+    // Without it a member restarts and can no longer read anything sent to a
+    // group they are still in, which looks exactly like being removed.
+    //
+    // Layout:
+    //   [4] group count
+    //   per group:
+    //     [4] id len | id
+    //     [4] epoch | [4] member count | per member: [4] len | id
+    //     [4] founder len | founder
+    //     [2] has-founder-key | [32] founder sign pub   (only when set)
+    //     [64] membership signature
+    //     [2] has-outgoing
+    //     [4] out epoch | [4] out iteration | [32] out chain key  (when set)
+    //     [4] incoming count
+    //     per incoming: [4] sender len | sender | [4] epoch | [4] iteration
+    //                   | [32] chain key | [4] skipped count
+    //                   | per skipped: [4] index | [32] key
+    Bytes exportGroupState() const;
+    bool importGroupState(const uint8_t* data, size_t size);
+
 private:
     struct GroupState {
         GroupMembership membership;

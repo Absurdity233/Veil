@@ -534,6 +534,39 @@ var init_engine = __esm({
         return this.withPeer(userId2, (ptr) => mod._veil_peer_device_version(this.handle, ptr));
       }
       /**
+       * Starts sessions with each device of a peer.
+       *
+       * Both blobs are already in the ABI's shape by the time they arrive here; the
+       * caller builds them because it is the one that knows which bundles it managed
+       * to fetch.
+       */
+      establishWithDevices(userId2, deviceIds, bundles) {
+        const mod = _VeilEngine.require();
+        return this.withPeer(userId2, (ptr) => {
+          const idsPtr = mod._malloc(deviceIds.length || 1);
+          const bundlesPtr = mod._malloc(bundles.length || 1);
+          const failed = mod._malloc(1024);
+          try {
+            if (deviceIds.length) mod.HEAPU8.set(deviceIds, idsPtr);
+            if (bundles.length) mod.HEAPU8.set(bundles, bundlesPtr);
+            return mod._veil_establish_with_devices(
+              this.handle,
+              ptr,
+              idsPtr,
+              deviceIds.length,
+              bundlesPtr,
+              bundles.length,
+              failed,
+              1024
+            );
+          } finally {
+            mod._free(idsPtr);
+            mod._free(bundlesPtr);
+            mod._free(failed);
+          }
+        });
+      }
+      /**
        * Fills `out` with one frame per device of a peer.
        *
        * The ABI's size query needs a valid plaintext pointer, so this allocates the
@@ -649,6 +682,22 @@ var init_engine = __esm({
           mod._free(p);
         }
       }
+      // ---- Group persistence ------------------------------------------------
+      //
+      // The blob carries chain keys: every incoming chain decrypts that sender's
+      // messages and the outgoing chain can forge them. It belongs in the sealed
+      // vault, beside ratchet state.
+      //
+      // Without it a reload drops every group and a member can no longer read
+      // anything sent to a group they are still in, which is indistinguishable from
+      // having been removed.
+      exportGroupState() {
+        return this.produceVariable(65536, (mod, out, size) => mod._veil_export_group_state(this.handle, out, size));
+      }
+      importGroupState(blob) {
+        const mod = _VeilEngine.require();
+        return this.callWithBlob(blob, (m, ptr, size) => m._veil_import_group_state(this.handle, ptr, size));
+      }
     };
   }
 });
@@ -670,7 +719,11 @@ var FrameType = {
   ERROR: 9,
   AUTH_CHALLENGE: 10,
   AUTH_RESPONSE: 11,
-  MORE_PENDING: 12
+  MORE_PENDING: 12,
+  // Device lists. See docs/multi-device.md.
+  PUBLISH_DEVICES: 13,
+  GET_DEVICES: 14,
+  DEVICES: 15
 };
 var MAX_PAYLOAD = 1 << 20;
 function frame(type, payload) {
@@ -790,6 +843,12 @@ var RelayClient = class {
   closed = false;
   listeners = /* @__PURE__ */ new Set();
   openWaiters = [];
+  // One waiter per in-flight request, keyed by the user id being asked about.
+  // A promise rather than an event because the caller wants the answer, not a
+  // subscription, and a page that has to reconstruct the correlation itself is
+  // a page that will eventually get it wrong.
+  bundleWaiters = /* @__PURE__ */ new Map();
+  deviceWaiters = /* @__PURE__ */ new Map();
   get isConnected() {
     return this.connected && this.socket !== null && !this.closed;
   }
@@ -806,8 +865,14 @@ var RelayClient = class {
       }
     }
   }
-  /** Opens the socket and sends HELLO. Resolves once the socket is open. */
-  connect(userId2, publicIdentity) {
+  /**
+   * Opens the socket and sends HELLO. Resolves once the socket is open.
+   *
+   * `deviceId` announces which device this connection speaks for, so the relay
+   * can hand it only the frames addressed to it. Empty keeps the two-field HELLO
+   * a single-device client sends.
+   */
+  connect(userId2, publicIdentity, deviceId = "") {
     this.closed = false;
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(this.url);
@@ -815,8 +880,9 @@ var RelayClient = class {
       this.socket = socket;
       this.openWaiters.push((ok) => ok ? resolve() : reject(new Error("connect failed")));
       socket.onopen = () => {
-        const hello = new Writer().string(userId2).blob(publicIdentity).build();
-        socket.send(frame(FrameType.HELLO, hello));
+        const hello = new Writer().string(userId2).blob(publicIdentity);
+        if (deviceId) hello.string(deviceId);
+        socket.send(frame(FrameType.HELLO, hello.build()));
         this.settleOpenWaiters(true);
       };
       socket.onmessage = (event) => {
@@ -868,18 +934,52 @@ var RelayClient = class {
             frame: r.blob()
           });
           break;
-        case FrameType.BUNDLE:
+        case FrameType.BUNDLE: {
+          const userId2 = r.string();
+          const identity = r.blob();
+          const signedId = r.u32();
+          const signedPub = r.blob();
+          const signature = r.blob();
+          const oneTimeId = r.u32();
+          const oneTimePub = r.blob();
+          const waiters = this.bundleWaiters.get(userId2);
+          if (waiters) {
+            waiters(encodeBundle(
+              identity,
+              signedId,
+              signedPub,
+              signature,
+              oneTimeId,
+              oneTimePub
+            ));
+          }
           this.emit({
             kind: "bundle",
-            userId: r.string(),
-            identity: r.blob(),
-            signedId: r.u32(),
-            signedPub: r.blob(),
-            signature: r.blob(),
-            oneTimeId: r.u32(),
-            oneTimePub: r.blob()
+            userId: userId2,
+            identity,
+            signedId,
+            signedPub,
+            signature,
+            oneTimeId,
+            oneTimePub
           });
           break;
+        }
+        case FrameType.DEVICES: {
+          const version = r.u32();
+          const count = r.u32();
+          const devices = [];
+          let owner = "";
+          for (let i = 0; i < count; ++i) {
+            const deviceId = r.string();
+            const credential = r.blob();
+            owner = credentialOwner(credential);
+            devices.push({ deviceId, credential });
+          }
+          const waiter = this.deviceWaiters.get(owner);
+          if (waiter) waiter({ version, devices });
+          break;
+        }
         case FrameType.ERROR:
           this.emit({ kind: "failed", message: r.string() });
           break;
@@ -911,8 +1011,63 @@ var RelayClient = class {
   requestBundle(userId2) {
     return this.send(FrameType.GET_BUNDLE, new Writer().string(userId2).build());
   }
-  sendMessage(recipient, frameBytes) {
-    return this.send(FrameType.SEND, new Writer().string(recipient).blob(frameBytes).build());
+  /**
+   * Requests a peer's device list.
+   *
+   * The reply arrives asynchronously as a `devices` event, so this resolves a
+   * promise rather than returning the list: the caller wants the answer, not a
+   * subscription.
+   */
+  getDevices(userId2, timeoutMs = 8e3) {
+    if (!this.send(FrameType.GET_DEVICES, new Writer().string(userId2).build())) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.deviceWaiters.delete(userId2);
+        resolve(null);
+      }, timeoutMs);
+      this.deviceWaiters.set(userId2, (result) => {
+        clearTimeout(timer);
+        this.deviceWaiters.delete(userId2);
+        resolve(result);
+      });
+    });
+  }
+  /**
+   * Requests a prekey bundle and resolves with the encoded form the engine
+   * parses.
+   *
+   * The relay's BUNDLE frame is a set of fields; the engine wants the fixed-width
+   * encoding, so the fields are reassembled here rather than in the engine.
+   */
+  getBundle(userId2, timeoutMs = 8e3) {
+    if (!this.send(FrameType.GET_BUNDLE, new Writer().string(userId2).build())) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.bundleWaiters.delete(userId2);
+        resolve(null);
+      }, timeoutMs);
+      this.bundleWaiters.set(userId2, (bundle) => {
+        clearTimeout(timer);
+        this.bundleWaiters.delete(userId2);
+        resolve(bundle);
+      });
+    });
+  }
+  /**
+   * Sends a frame to a recipient.
+   *
+   * `deviceId` addresses one device of a peer. Empty means the whole account,
+   * which is what a single-device peer and a group frame both use: a group
+   * message is addressed by group id so every member receives it.
+   */
+  sendMessage(recipient, frameBytes, deviceId = "") {
+    const writer = new Writer().string(recipient).blob(frameBytes);
+    if (deviceId) writer.string(deviceId);
+    return this.send(FrameType.SEND, writer.build());
   }
   acknowledge(outboxId) {
     return this.send(FrameType.ACK, new Writer().u64(outboxId).build());
@@ -936,15 +1091,31 @@ var RelayClient = class {
   }
 };
 function buildBundle(event) {
-  if (event.identity.length !== 64) return null;
-  if (event.signedPub.length !== 32) return null;
-  if (event.signature.length !== 64) return null;
-  const hasOneTime = event.oneTimeId !== 0 && event.oneTimePub.length === 32;
-  const w = new Writer().raw(event.identity).u32(event.signedId).raw(event.signedPub).raw(event.signature).raw(new Uint8Array([hasOneTime ? 1 : 0]));
+  return encodeBundle(
+    event.identity,
+    event.signedId,
+    event.signedPub,
+    event.signature,
+    event.oneTimeId,
+    event.oneTimePub
+  );
+}
+function encodeBundle(identity, signedId, signedPub, signature, oneTimeId, oneTimePub) {
+  if (identity.length !== 64) return null;
+  if (signedPub.length !== 32) return null;
+  if (signature.length !== 64) return null;
+  const hasOneTime = oneTimeId !== 0 && oneTimePub.length === 32;
+  const w = new Writer().raw(identity).u32(signedId).raw(signedPub).raw(signature).raw(new Uint8Array([hasOneTime ? 1 : 0]));
   if (hasOneTime) {
-    w.u32(event.oneTimeId).raw(event.oneTimePub);
+    w.u32(oneTimeId).raw(oneTimePub);
   }
   return w.build();
+}
+function credentialOwner(credential) {
+  if (credential.length < 2) return "";
+  const len = credential[0] << 8 | credential[1];
+  if (len === 0 || credential.length < 2 + len) return "";
+  return new TextDecoder().decode(credential.slice(2, 2 + len));
 }
 
 // src/vault.ts
@@ -1120,6 +1291,40 @@ var Vault = class {
   async storeMessages(peerId, messages) {
     await put(`messages:${peerId}`, messages);
   }
+  // ---- Groups -----------------------------------------------------------
+  //
+  // Group state carries chain keys: every incoming chain decrypts that sender's
+  // messages and the outgoing chain can forge them. It is sealed like ratchet
+  // state, for the same reason.
+  async loadGroupState() {
+    const stored = await get("group-state");
+    return stored ? this.unseal(stored) : null;
+  }
+  async storeGroupState(blob) {
+    await put("group-state", await this.seal(blob));
+  }
+  /** The group ids this client is in, so a reload can enumerate them. */
+  async loadGroupIds() {
+    return await get("group-ids") ?? null;
+  }
+  async storeGroupIds(ids) {
+    await put("group-ids", ids);
+  }
+  // ---- Device identity --------------------------------------------------
+  /** This device's hex id, so a reload keeps the same device rather than
+   *  minting a second one for the same account. */
+  async loadDeviceId() {
+    return await get("device-id") ?? null;
+  }
+  async storeDeviceId(id) {
+    await put("device-id", id);
+  }
+  async loadGroupMessages(groupId) {
+    return await get(`group-messages:${groupId}`) ?? [];
+  }
+  async storeGroupMessages(groupId, messages) {
+    await put(`group-messages:${groupId}`, messages);
+  }
   async clearAll() {
     const db = await openDb();
     db.close();
@@ -1141,6 +1346,10 @@ var ChatApp = class {
   peers = [];
   messages = /* @__PURE__ */ new Map();
   queue = [];
+  groups = [];
+  groupMessages = /* @__PURE__ */ new Map();
+  /** This device's id, hex. Empty until the engine has one. */
+  selfDeviceId = "";
   nextMessageId = 1;
   hasPublishedPreKeys = false;
   selfUserId = "";
@@ -1210,7 +1419,36 @@ var ChatApp = class {
       registry.fill(0);
     }
     await this.restorePeers();
+    await this.restoreGroups();
     this.notify();
+  }
+  /**
+   * Restores groups, including their chain keys.
+   *
+   * Without this a reload drops every group, and a member can no longer read
+   * anything sent to a group they are still in 閳?indistinguishable from having
+   * been removed. The blob carries secrets, so it lives in the same encrypted
+   * vault as ratchet state.
+   */
+  async restoreGroups() {
+    if (!this.engine) return;
+    const state = await this.vault.loadGroupState();
+    if (state) {
+      this.engine.importGroupState(state);
+      state.fill(0);
+    }
+    const ids = await this.vault.loadGroupIds() ?? [];
+    for (const groupId of ids) {
+      const epoch = this.engine.groupEpoch(groupId);
+      if (epoch === 0) continue;
+      this.groups.push({
+        groupId,
+        epoch,
+        members: this.engine.groupMembers(groupId),
+        canSend: this.engine.isGroupMember(groupId)
+      });
+      this.groupMessages.set(groupId, await this.vault.loadGroupMessages(groupId) ?? []);
+    }
   }
   /**
    * Rebuilds the peer list from whatever sessions are on disk.
@@ -1233,7 +1471,8 @@ var ChatApp = class {
         userId: userId2,
         displayName: userId2,
         safetyNumber: this.engine.safetyNumber(userId2),
-        state: this.engine.sessionState(userId2)
+        state: this.engine.sessionState(userId2),
+        devices: this.engine.peerDevices(userId2)
       });
     }
   }
@@ -1253,12 +1492,24 @@ var ChatApp = class {
     if (this.linkState === "connecting") return;
     this.selfUserId = userId2;
     this.setLink("connecting");
+    if (!this.selfDeviceId) {
+      const stored = await this.vault.loadDeviceId();
+      if (stored) {
+        this.selfDeviceId = stored;
+      } else if (this.engine.initDevice(userId2)) {
+        const id = this.engine.deviceId();
+        if (id) {
+          this.selfDeviceId = Array.from(id, (b) => b.toString(16).padStart(2, "0")).join("");
+          await this.vault.storeDeviceId(this.selfDeviceId);
+        }
+      }
+    }
     const relay = new RelayClient(url);
     this.relay = relay;
     this.unsubscribeRelay?.();
     this.unsubscribeRelay = relay.onEvent((event) => this.onRelayEvent(event));
     try {
-      await relay.connect(userId2, this.engine.publicIdentity());
+      await relay.connect(userId2, this.engine.publicIdentity(), this.selfDeviceId);
     } catch (e) {
       this.setLink("error");
       this.setStatus(e instanceof Error ? e.message : "connection failed");
@@ -1335,7 +1586,8 @@ var ChatApp = class {
       userId: peerId,
       displayName: peerId,
       safetyNumber: null,
-      state: 0 /* NoPeer */
+      state: 0 /* NoPeer */,
+      devices: []
     });
     this.messages.set(peerId, []);
     void this.persistPeerIds();
@@ -1385,8 +1637,8 @@ var ChatApp = class {
     const engine = this.engine;
     if (!engine || !text.trim()) return;
     const plain = new TextEncoder().encode(text);
-    const frame2 = engine.encrypt(peerId, plain);
-    if (!frame2) {
+    const frames = engine.encryptToAccount(peerId, plain);
+    if (frames.length === 0) {
       this.setStatus(`could not encrypt for ${peerId}: no session`);
       return;
     }
@@ -1401,20 +1653,269 @@ var ChatApp = class {
     this.appendMessage(message);
     void this.persistSession(peerId);
     const connected = this.relay?.isConnected === true;
-    if (connected && this.relay.sendMessage(peerId, frame2)) {
+    let allSent = connected;
+    for (const item of frames) {
+      if (!connected || !this.relay.sendMessage(peerId, item.frame, item.deviceId)) {
+        this.queue.push({
+          peerId,
+          deviceId: item.deviceId,
+          frame: Array.from(item.frame),
+          text
+        });
+        allSent = false;
+      }
+    }
+    if (allSent) {
       this.updateMessageState(message.id, "sent");
     } else {
-      this.queue.push({ peerId, frame: Array.from(frame2), text });
       this.updateMessageState(message.id, "failed");
       this.setStatus("offline: the message is queued and will be retried");
     }
+  }
+  // ---- Groups -----------------------------------------------------------
+  groupViews() {
+    return this.groups;
+  }
+  groupMessagesFor(groupId) {
+    return this.groupMessages.get(groupId) ?? [];
+  }
+  /** Creates a group with this client as founder and sole member. */
+  async createGroup(groupId) {
+    if (!this.engine || !groupId.trim()) return false;
+    if (!this.engine.createGroup(groupId)) return false;
+    await this.refreshGroup(groupId);
+    return true;
+  }
+  /**
+   * Replaces the member list.
+   *
+   * Every chain is discarded and the epoch moves, so nobody 閳?including this
+   * client 閳?can send until each member republishes a chain. That is the point:
+   * a removed member holds the old chain key and re-keying is the only thing
+   * that stops them reading what follows.
+   */
+  async setGroupMembers(groupId, members) {
+    if (!this.engine) return 0;
+    const epoch = this.engine.setGroupMembers(groupId, members);
+    if (epoch === 0) return 0;
+    await this.refreshGroup(groupId);
+    await this.persistGroups();
+    return epoch;
+  }
+  /** The signed member list, to hand to the other members out of band. */
+  exportMembership(groupId) {
+    return this.engine?.exportMembership(groupId) ?? null;
+  }
+  /**
+   * Adopts a member list a founder signed.
+   *
+   * `founderSignPub` is the founder's account signing key, which the caller got
+   * by verifying the founder's safety number out of band 閳?the same trust anchor
+   * the rest of the protocol uses.
+   */
+  async adoptMembership(groupId, record, founderSignPub) {
+    if (!this.engine) return null;
+    const status = this.engine.adoptMembership(record, founderSignPub);
+    if (status !== Status.OK) return status;
+    await this.refreshGroup(groupId);
+    await this.persistGroups();
+    return status;
+  }
+  /**
+   * Publishes this device's chain, to be handed to each member inside a pairwise
+   * session.
+   *
+   * Returned rather than sent: the caller decides how it travels, because the
+   * chain has to arrive over a channel that already authenticates this device.
+   */
+  exportSenderKey(groupId) {
+    return this.engine?.exportSenderKey(groupId, 0) ?? null;
+  }
+  /** Installs a member's chain, as received over a pairwise session. */
+  async adoptSenderKey(groupId, record, senderId, senderSignPub) {
+    if (!this.engine) return null;
+    const status = this.engine.adoptSenderKey(record, senderId, senderSignPub);
+    if (status === Status.OK) await this.persistGroups();
+    return status;
+  }
+  /** Sends one message to the whole group: one frame, regardless of size. */
+  async sendToGroup(groupId, text) {
+    const engine = this.engine;
+    if (!engine || !text.trim()) return;
+    const record = engine.encryptToGroup(groupId, new TextEncoder().encode(text));
+    if (!record) {
+      this.setStatus(`cannot send to ${groupId}: the group has no live chain`);
+      return;
+    }
+    this.appendGroupMessage({
+      groupId,
+      senderId: this.selfUserId,
+      text,
+      at: Date.now()
+    });
+    if (this.relay?.isConnected !== true || !this.relay.sendMessage(groupId, record)) {
+      this.setStatus("offline: the group message was not delivered");
+    }
+    await this.persistGroups();
+  }
+  /** Decrypts a group frame that arrived as a delivery. */
+  onGroupDelivered(senderId, body) {
+    const engine = this.engine;
+    if (!engine) return false;
+    for (const group of this.groups) {
+      const result = engine.decryptFromGroup(group.groupId, body);
+      if (result.status === Status.OK && result.plain) {
+        this.appendGroupMessage({
+          groupId: group.groupId,
+          senderId,
+          text: new TextDecoder().decode(result.plain),
+          at: Date.now()
+        });
+        void this.persistGroups();
+        return true;
+      }
+    }
+    return false;
+  }
+  async refreshGroup(groupId) {
+    if (!this.engine) return;
+    const epoch = this.engine.groupEpoch(groupId);
+    if (epoch === 0) return;
+    const view = {
+      groupId,
+      epoch,
+      members: this.engine.groupMembers(groupId),
+      canSend: this.engine.isGroupMember(groupId)
+    };
+    const index = this.groups.findIndex((g) => g.groupId === groupId);
+    if (index >= 0) this.groups[index] = view;
+    else this.groups.push(view);
+    if (!this.groupMessages.has(groupId)) this.groupMessages.set(groupId, []);
+    this.notify();
+  }
+  appendGroupMessage(message) {
+    const list = this.groupMessages.get(message.groupId) ?? [];
+    list.push(message);
+    this.groupMessages.set(message.groupId, list);
+    this.notify();
+  }
+  async persistGroups() {
+    if (!this.engine) return;
+    const state = this.engine.exportGroupState();
+    if (state) await this.vault.storeGroupState(state);
+    await this.vault.storeGroupIds(this.groups.map((g) => g.groupId));
+    for (const [groupId, list] of this.groupMessages) {
+      await this.vault.storeGroupMessages(groupId, list);
+    }
+  }
+  // ---- Devices ----------------------------------------------------------
+  /** This client's own device id, hex. */
+  deviceId() {
+    return this.selfDeviceId;
+  }
+  /** Fetches a peer's device list from the relay and adopts it. */
+  async refreshPeerDevices(peerId, accountDhPub, accountSignPub) {
+    const relay = this.relay;
+    if (!relay || !this.engine) return false;
+    const listing = await relay.getDevices(peerId);
+    if (!listing || listing.devices.length === 0) return false;
+    const devices = listing.devices;
+    const total = 4 + devices.reduce((sum, d) => sum + d.credential.length, 0);
+    const blob = new Uint8Array(total);
+    new DataView(blob.buffer).setUint32(0, devices.length, false);
+    let off = 4;
+    for (const device of devices) {
+      blob.set(device.credential, off);
+      off += device.credential.length;
+    }
+    const status = this.engine.adoptDeviceList(
+      peerId,
+      listing.version,
+      blob,
+      accountDhPub,
+      accountSignPub
+    );
+    if (status !== Status.OK) return false;
+    const peer = this.peers.find((p) => p.userId === peerId);
+    if (peer) peer.devices = this.engine.peerDevices(peerId);
+    this.notify();
+    return true;
+  }
+  /**
+   * Starts sessions with every device of a peer that has a published list.
+   *
+   * One bundle is fetched per device: a fan-out frame is encrypted to one
+   * device's ratchet, so a bundle for the wrong device would produce a session
+   * that can never read anything.
+   */
+  async connectPeerDevices(peerId) {
+    const relay = this.relay;
+    const engine = this.engine;
+    if (!relay || !engine) return 0;
+    const devices = engine.peerDevices(peerId);
+    if (devices.length === 0) return 0;
+    const ids = [];
+    const bundles = [];
+    for (const deviceId of devices) {
+      const bundle = await relay.getBundle(peerId);
+      if (!bundle) continue;
+      ids.push(deviceId);
+      bundles.push(bundle);
+    }
+    if (ids.length === 0) return 0;
+    const idsSize = 4 + ids.reduce((sum, id) => sum + 2 + id.length, 0);
+    const bundlesSize = bundles.reduce((sum, b) => sum + 4 + b.length, 0);
+    const idBlob = new Uint8Array(idsSize);
+    const bundleBlob = new Uint8Array(bundlesSize);
+    const idView = new DataView(idBlob.buffer);
+    const bundleView = new DataView(bundleBlob.buffer);
+    idView.setUint32(0, ids.length, false);
+    let off = 4;
+    for (const id of ids) {
+      idView.setUint16(off, id.length, false);
+      off += 2;
+      for (let i = 0; i < id.length; ++i) idBlob[off + i] = id.charCodeAt(i);
+      off += id.length;
+    }
+    off = 0;
+    for (const bundle of bundles) {
+      bundleView.setUint32(off, bundle.length, false);
+      off += 4;
+      bundleBlob.set(bundle, off);
+      off += bundle.length;
+    }
+    return engine.establishWithDevices(peerId, idBlob, bundleBlob);
+  }
+  /** The signed member list, to hand to a device being linked. */
+  deviceCredential() {
+    return this.engine?.deviceCredential() ?? null;
+  }
+  /**
+   * Links this client to an existing account.
+   *
+   * The credential has to arrive over a channel that already authenticates the
+   * account — the whole point is that a relay cannot issue one — so this takes
+   * an already-signed blob and verifies it against the account keys.
+   */
+  async adoptDeviceCredential(credential, accountDhPub, accountSignPub) {
+    if (!this.engine) return false;
+    if (!this.engine.adoptDeviceCredential(credential, accountDhPub, accountSignPub)) {
+      return false;
+    }
+    const id = this.engine.deviceId();
+    if (id) {
+      this.selfDeviceId = Array.from(id, (b) => b.toString(16).padStart(2, "0")).join("");
+      await this.vault.storeDeviceId(this.selfDeviceId);
+    }
+    this.notify();
+    return true;
   }
   flushQueue() {
     const relay = this.relay;
     if (!relay || !relay.isConnected) return;
     const stillQueued = [];
     for (const item of this.queue) {
-      if (relay.sendMessage(item.peerId, new Uint8Array(item.frame))) {
+      if (relay.sendMessage(item.peerId, new Uint8Array(item.frame), item.deviceId)) {
         const messages = this.messages.get(item.peerId) ?? [];
         const last = [...messages].reverse().find((m) => m.outgoing && m.state === "failed");
         if (last) this.updateMessageState(last.id, "sent");
@@ -1436,6 +1937,10 @@ var ChatApp = class {
         if (outboxId > 0n) this.relay?.acknowledge(outboxId);
         return;
       case Status.NO_SESSION:
+        if (this.onGroupDelivered(peerId, frame2)) {
+          if (outboxId > 0n) this.relay?.acknowledge(outboxId);
+          return;
+        }
         this.setStatus(`dropped a message from ${peerId}: no session`);
         return;
       case Status.AUTH_FAILED:
@@ -1453,7 +1958,8 @@ var ChatApp = class {
         userId: peerId,
         displayName: peerId,
         safetyNumber: engine.safetyNumber(peerId),
-        state: 2 /* Ready */
+        state: 2 /* Ready */,
+        devices: []
       };
       this.peers.push(peer);
       this.messages.set(peerId, []);

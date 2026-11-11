@@ -1,4 +1,4 @@
-﻿// Veil - host-side tests for the crypto core.
+// Veil - host-side tests for the crypto core.
 //
 // These run on the build machine (no Android device needed) so the protocol
 // can be exercised quickly while iterating. They cover the properties that
@@ -1867,6 +1867,128 @@ section("groups: out-of-order and skipped keys");
               "1 arrives late from the cache");
         check(bob.decryptFromGroup("team", sent[3], plain) == Engine::Result::Ok,
               "3 arrives late from the cache");
+    }
+
+section("groups survive a restart");
+    {
+        // Without this, a restart silently drops every group and a member can no
+        // longer read anything sent to a group they are still in — which looks
+        // exactly like having been removed.
+        Engine alice, bob;
+        alice.createIdentity(); alice.initDevice("alice");
+        bob.createIdentity();   bob.initDevice("bob");
+
+        alice.createGroup("team");
+        alice.setGroupMembers("team", {"alice", "bob"});
+
+        Bytes alice_pub = alice.exportIdentityPublic();
+        Bytes membership = alice.exportMembership("team");
+        bob.adoptMembership(membership.data(), membership.size(), alice_pub.data() + kKeySize);
+
+        Bytes chain = alice.exportSenderKey("team", 0);
+        bob.adoptSenderKey(chain.data(), chain.size(), "alice", deviceSignPub(alice).data());
+
+        // Alice sends three messages; bob reads the first and leaves two in
+        // flight, so the restart has to preserve skipped keys as well.
+        GroupMessage m0, m1, m2;
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>("zero"), 4, m0), "m0");
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>("one"), 3, m1), "m1");
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>("two"), 3, m2), "m2");
+
+        Bytes plain;
+        check(bob.decryptFromGroup("team", m0, plain) == Engine::Result::Ok, "bob reads m0");
+        check(toString(plain) == "zero", "content intact");
+
+        // ---- Restart bob ----
+        Bytes state = bob.exportGroupState();
+        check(!state.empty(), "group state exports");
+
+        Engine restarted;
+        check(restarted.createIdentity(), "restarted identity");
+        check(restarted.initDevice("bob"), "restarted device");
+        check(restarted.importGroupState(state.data(), state.size()), "group state imports");
+
+        check(restarted.groupEpoch("team") == 2, "the epoch survived");
+        check(restarted.groupMembers("team").size() == 2, "the members survived");
+        check(restarted.isGroupMember("team"), "bob is still a member");
+
+        // The messages that were in flight are readable, which only works if the
+        // skipped keys were persisted too.
+        Bytes after;
+        check(restarted.decryptFromGroup("team", m1, after) == Engine::Result::Ok,
+              "m1 arrives after the restart");
+        check(toString(after) == "one", "m1 content intact");
+        check(restarted.decryptFromGroup("team", m2, after) == Engine::Result::Ok,
+              "m2 arrives after the restart");
+        check(toString(after) == "two", "m2 content intact");
+
+        // And the sender's own chain survived: alice restarts and keeps sending.
+        Bytes alice_state = alice.exportGroupState();
+        Engine alice2;
+        check(alice2.createIdentity(), "alice restarted");
+        check(alice2.initDevice("alice"), "alice device");
+        check(alice2.importGroupState(alice_state.data(), alice_state.size()),
+              "alice's groups import");
+
+        GroupMessage m3;
+        check(alice2.encryptToGroup("team", reinterpret_cast<const uint8_t*>("three"),
+                                    5, m3), "alice keeps sending after the restart");
+        check(m3.iteration == 3, "the iteration continued rather than restarting");
+
+        Bytes bob_three;
+        check(restarted.decryptFromGroup("team", m3, bob_three) == Engine::Result::Ok,
+              "bob reads it");
+        check(toString(bob_three) == "three", "content intact");
+
+        // A replayed pre-restart message is still refused.
+        check(restarted.decryptFromGroup("team", m0, after) != Engine::Result::Ok,
+              "a replay across the restart is still refused");
+    }
+
+section("group state rejects a malformed blob");
+    {
+        Engine alice;
+        alice.createIdentity(); alice.initDevice("alice");
+        alice.createGroup("team");
+        alice.setGroupMembers("team", {"alice", "bob"});
+
+        Bytes good = alice.exportGroupState();
+
+        Engine target;
+        target.createIdentity(); target.initDevice("target");
+        target.createGroup("survivor");
+
+        // Every truncation must be refused, and none may leave a half-loaded
+        // state behind.
+        bool all_refused = true;
+        for (size_t cut = 0; cut < good.size(); ++cut) {
+            if (target.importGroupState(good.data(), cut)) {
+                all_refused = false;
+                break;
+            }
+        }
+        check(all_refused, "every truncation of a group blob is refused");
+        check(target.groupEpoch("survivor") == 1,
+              "and a refused blob leaves the live groups untouched");
+
+        // A single flipped bit almost always breaks a length prefix or the
+        // member count, which is what makes the parser refuse rather than read
+        // out of bounds.
+        int accepted = 0;
+        for (size_t i = 0; i < good.size(); ++i) {
+            Bytes bad = good;
+            bad[i] ^= 0x40;
+            if (target.importGroupState(bad.data(), bad.size())) ++accepted;
+        }
+        // A bit flip inside a chain key or a skipped key is a valid blob and is
+        // legitimately accepted — that is a wrong key, not a malformed one, and
+        // the MAC catches it later. What must not happen is a crash.
+        check(accepted < static_cast<int>(good.size()),
+              "not every mutation is accepted");
+
+        // An empty blob and a null pointer are refused.
+        check(!target.importGroupState(good.data(), 0), "an empty blob is refused");
+        check(!target.importGroupState(nullptr, 100), "a null pointer is refused");
     }
 
 section("ratchet does not move backwards");

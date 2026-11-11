@@ -111,7 +111,26 @@ accepted.
   the chains is what stops that; there is no cryptographic erasure beyond it.
 - **Group history for a new member.** A newly added member sees nothing from
   before they joined, because they were never given a chain for it.
-- **Persistence.** Groups live in memory. `veil_c.h` exposes no export/import for
-  them yet, so a restart loses every group.
+- **Distribution over the wire.** A chain and a member list travel inside a
+  pairwise session, and the clients expose them as export/adopt pairs rather than
+  sending them automatically. A caller has to hand them over; there is no
+  "invite" message yet.
 
-That last one is the largest gap and the next piece of work.
+## Persistence
+
+Group state is persisted, and it has to be: the blob carries every incoming chain
+key and the outgoing chain. Without it a reload drops every group and a member
+can no longer read anything sent to a group they are still in — which looks
+exactly like having been removed.
+
+Two properties the format has:
+
+- **Skipped keys are included.** Dropping them would make every message
+  currently in flight permanently unreadable after a restart.
+- **Import validates everything before replacing anything.** A malformed blob
+  leaves the live groups untouched rather than half-loaded, which is tested by
+  truncating a valid blob at every possible length.
+
+The blob is secret material and belongs in the same encrypted store as ratchet
+state — the Android Keystore, the desktop vault file, or the web client's
+non-extractable key.

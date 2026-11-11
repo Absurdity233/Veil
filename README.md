@@ -160,17 +160,17 @@ transcript.
 **At the protocol layer:** one-to-one messaging, multi-device accounts (identity
 plus a list of account-signed device credentials, per-device sessions, fan-out
 sending), and group messaging with Sender Keys (one frame per message regardless
-of group size, epoch-based re-keying when membership changes). The relay
-addresses frames per device and stores device lists.
+of group size, epoch-based re-keying when membership changes, persisted across
+restarts). The relay addresses frames per device and stores device lists.
 
-**Not yet surfaced in a client:** none of the above has UI. There is no device
-linking flow, no group creation screen, and no device-aware send path in
-`app/`, `desktop/` or `web/` — so today each client is still a single-device
-client talking one-to-one. The protocol is done; the clients are a separate
-piece of work.
+**Surfaced in the web client:** device identity, fan-out sending, group
+create/send/receive, and group state in the sealed vault. The engine and C ABI
+support all of it; Android and desktop still call the one-to-one paths and need
+the same wiring.
 
-**Not implemented at all:** push notifications, account recovery, and
-persistence for groups (they live in memory, so a restart loses them).
+**Not implemented at all:** push notifications, account recovery, a device
+linking UI, and group invitations over the wire (chains and member lists travel
+through export/adopt pairs, so a caller has to hand them over).
 
 The designs, and the honest account of what is missing from each, are in
 [Multi-device](docs/multi-device.md) and [Groups](docs/group.md).

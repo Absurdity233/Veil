@@ -36,6 +36,16 @@ export class RelayClient {
   private readonly listeners = new Set<(event: RelayEvent) => void>();
   private readonly openWaiters: Array<(ok: boolean) => void> = [];
 
+  // One waiter per in-flight request, keyed by the user id being asked about.
+  // A promise rather than an event because the caller wants the answer, not a
+  // subscription, and a page that has to reconstruct the correlation itself is
+  // a page that will eventually get it wrong.
+  private readonly bundleWaiters = new Map<string, (bundle: Uint8Array | null) => void>();
+  private readonly deviceWaiters = new Map<string, (result: {
+    version: number;
+    devices: Array<{ deviceId: string; credential: Uint8Array }>;
+  } | null) => void>();
+
   constructor(private readonly url: string) {}
 
   get isConnected(): boolean {
@@ -59,8 +69,14 @@ export class RelayClient {
     }
   }
 
-  /** Opens the socket and sends HELLO. Resolves once the socket is open. */
-  connect(userId: string, publicIdentity: Uint8Array): Promise<void> {
+  /**
+   * Opens the socket and sends HELLO. Resolves once the socket is open.
+   *
+   * `deviceId` announces which device this connection speaks for, so the relay
+   * can hand it only the frames addressed to it. Empty keeps the two-field HELLO
+   * a single-device client sends.
+   */
+  connect(userId: string, publicIdentity: Uint8Array, deviceId = ""): Promise<void> {
     this.closed = false;
 
     return new Promise((resolve, reject) => {
@@ -71,8 +87,10 @@ export class RelayClient {
       this.openWaiters.push((ok) => (ok ? resolve() : reject(new Error("connect failed"))));
 
       socket.onopen = () => {
-        const hello = new Writer().string(userId).blob(publicIdentity).build();
-        socket.send(frame(FrameType.HELLO, hello));
+        const hello = new Writer().string(userId).blob(publicIdentity);
+        if (deviceId) hello.string(deviceId);
+
+        socket.send(frame(FrameType.HELLO, hello.build()));
         this.settleOpenWaiters(true);
       };
 
@@ -130,18 +148,55 @@ export class RelayClient {
             frame: r.blob(),
           });
           break;
-        case FrameType.BUNDLE:
+        case FrameType.BUNDLE: {
+          const userId = r.string();
+          const identity = r.blob();
+          const signedId = r.u32();
+          const signedPub = r.blob();
+          const signature = r.blob();
+          const oneTimeId = r.u32();
+          const oneTimePub = r.blob();
+
+          // The engine parses one fixed-width encoding, so the fields are
+          // reassembled here rather than teaching the engine the frame layout.
+          const waiters = this.bundleWaiters.get(userId);
+          if (waiters) {
+            waiters(encodeBundle(
+              identity, signedId, signedPub, signature, oneTimeId, oneTimePub,
+            ));
+          }
+
           this.emit({
             kind: "bundle",
-            userId: r.string(),
-            identity: r.blob(),
-            signedId: r.u32(),
-            signedPub: r.blob(),
-            signature: r.blob(),
-            oneTimeId: r.u32(),
-            oneTimePub: r.blob(),
+            userId,
+            identity,
+            signedId,
+            signedPub,
+            signature,
+            oneTimeId,
+            oneTimePub,
           });
           break;
+        }
+        case FrameType.DEVICES: {
+          const version = r.u32();
+          const count = r.u32();
+
+          const devices: Array<{ deviceId: string; credential: Uint8Array }> = [];
+          let owner = "";
+          for (let i = 0; i < count; ++i) {
+            const deviceId = r.string();
+            const credential = r.blob();
+            // The credential names its own account; that is the key the waiter
+            // was registered under, so it is read back rather than guessed.
+            owner = credentialOwner(credential);
+            devices.push({ deviceId, credential });
+          }
+
+          const waiter = this.deviceWaiters.get(owner);
+          if (waiter) waiter({ version, devices });
+          break;
+        }
         case FrameType.ERROR:
           this.emit({ kind: "failed", message: r.string() });
           break;
@@ -184,8 +239,76 @@ export class RelayClient {
     return this.send(FrameType.GET_BUNDLE, new Writer().string(userId).build());
   }
 
-  sendMessage(recipient: string, frameBytes: Uint8Array): boolean {
-    return this.send(FrameType.SEND, new Writer().string(recipient).blob(frameBytes).build());
+  /**
+   * Requests a peer's device list.
+   *
+   * The reply arrives asynchronously as a `devices` event, so this resolves a
+   * promise rather than returning the list: the caller wants the answer, not a
+   * subscription.
+   */
+  getDevices(userId: string, timeoutMs = 8000): Promise<{
+    version: number;
+    devices: Array<{ deviceId: string; credential: Uint8Array }>;
+  } | null> {
+    if (!this.send(FrameType.GET_DEVICES, new Writer().string(userId).build())) {
+      return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.deviceWaiters.delete(userId);
+        resolve(null);
+      }, timeoutMs);
+
+      this.deviceWaiters.set(userId, (result) => {
+        clearTimeout(timer);
+        this.deviceWaiters.delete(userId);
+        resolve(result);
+      });
+    });
+  }
+
+  /**
+   * Requests a prekey bundle and resolves with the encoded form the engine
+   * parses.
+   *
+   * The relay's BUNDLE frame is a set of fields; the engine wants the fixed-width
+   * encoding, so the fields are reassembled here rather than in the engine.
+   */
+  getBundle(userId: string, timeoutMs = 8000): Promise<Uint8Array | null> {
+    if (!this.send(FrameType.GET_BUNDLE, new Writer().string(userId).build())) {
+      return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.bundleWaiters.delete(userId);
+        resolve(null);
+      }, timeoutMs);
+
+      this.bundleWaiters.set(userId, (bundle) => {
+        clearTimeout(timer);
+        this.bundleWaiters.delete(userId);
+        resolve(bundle);
+      });
+    });
+  }
+
+  /**
+   * Sends a frame to a recipient.
+   *
+   * `deviceId` addresses one device of a peer. Empty means the whole account,
+   * which is what a single-device peer and a group frame both use: a group
+   * message is addressed by group id so every member receives it.
+   */
+  sendMessage(recipient: string, frameBytes: Uint8Array, deviceId = ""): boolean {
+    const writer = new Writer().string(recipient).blob(frameBytes);
+    // The device id is written only when there is one, so a frame for a
+    // single-device peer is byte-identical to what the relay saw before device
+    // addressing existed.
+    if (deviceId) writer.string(deviceId);
+
+    return this.send(FrameType.SEND, writer.build());
   }
 
   acknowledge(outboxId: bigint): boolean {
@@ -223,21 +346,57 @@ export class RelayClient {
  * relay carrying the fields separately instead of the blob.
  */
 export function buildBundle(event: Extract<RelayEvent, { kind: "bundle" }>): Uint8Array | null {
-  if (event.identity.length !== 64) return null;
-  if (event.signedPub.length !== 32) return null;
-  if (event.signature.length !== 64) return null;
+  return encodeBundle(
+    event.identity, event.signedId, event.signedPub, event.signature,
+    event.oneTimeId, event.oneTimePub,
+  );
+}
 
-  const hasOneTime = event.oneTimeId !== 0 && event.oneTimePub.length === 32;
+/**
+ * The engine's fixed-width bundle encoding, from the fields the relay sends.
+ *
+ * Kept as a free function so both the event path and the promise path produce
+ * the same bytes: two encoders for one format is how a format drifts.
+ */
+function encodeBundle(
+  identity: Uint8Array,
+  signedId: number,
+  signedPub: Uint8Array,
+  signature: Uint8Array,
+  oneTimeId: number,
+  oneTimePub: Uint8Array,
+): Uint8Array | null {
+  if (identity.length !== 64) return null;
+  if (signedPub.length !== 32) return null;
+  if (signature.length !== 64) return null;
+
+  const hasOneTime = oneTimeId !== 0 && oneTimePub.length === 32;
 
   const w = new Writer()
-    .raw(event.identity)
-    .u32(event.signedId)
-    .raw(event.signedPub)
-    .raw(event.signature)
+    .raw(identity)
+    .u32(signedId)
+    .raw(signedPub)
+    .raw(signature)
     .raw(new Uint8Array([hasOneTime ? 1 : 0]));
 
   if (hasOneTime) {
-    w.u32(event.oneTimeId).raw(event.oneTimePub);
+    w.u32(oneTimeId).raw(oneTimePub);
   }
   return w.build();
+}
+
+/**
+ * The account a credential names.
+ *
+ * A credential starts with a two-byte user id length and the id, so this reads
+ * exactly that and nothing else: the relay's frame does not repeat the user id,
+ * and trusting a guess would be worse than parsing four bytes.
+ */
+function credentialOwner(credential: Uint8Array): string {
+  if (credential.length < 2) return "";
+
+  const len = (credential[0]! << 8) | credential[1]!;
+  if (len === 0 || credential.length < 2 + len) return "";
+
+  return new TextDecoder().decode(credential.slice(2, 2 + len));
 }

@@ -232,6 +232,50 @@ export class Vault {
     await put(`messages:${peerId}`, messages);
   }
 
+  // ---- Groups -----------------------------------------------------------
+  //
+  // Group state carries chain keys: every incoming chain decrypts that sender's
+  // messages and the outgoing chain can forge them. It is sealed like ratchet
+  // state, for the same reason.
+
+  async loadGroupState(): Promise<Uint8Array | null> {
+    const stored = await get<StoredIdentity>("group-state");
+    return stored ? this.unseal(stored) : null;
+  }
+
+  async storeGroupState(blob: Uint8Array): Promise<void> {
+    await put("group-state", await this.seal(blob));
+  }
+
+  /** The group ids this client is in, so a reload can enumerate them. */
+  async loadGroupIds(): Promise<string[] | null> {
+    return (await get<string[]>("group-ids")) ?? null;
+  }
+
+  async storeGroupIds(ids: string[]): Promise<void> {
+    await put("group-ids", ids);
+  }
+
+  // ---- Device identity --------------------------------------------------
+
+  /** This device's hex id, so a reload keeps the same device rather than
+   *  minting a second one for the same account. */
+  async loadDeviceId(): Promise<string | null> {
+    return (await get<string>("device-id")) ?? null;
+  }
+
+  async storeDeviceId(id: string): Promise<void> {
+    await put("device-id", id);
+  }
+
+  async loadGroupMessages(groupId: string): Promise<GroupMessageRecord[]> {
+    return (await get<GroupMessageRecord[]>(`group-messages:${groupId}`)) ?? [];
+  }
+
+  async storeGroupMessages(groupId: string, messages: GroupMessageRecord[]): Promise<void> {
+    await put(`group-messages:${groupId}`, messages);
+  }
+
   async clearAll(): Promise<void> {
     const db = await openDb();
     db.close();
@@ -251,4 +295,17 @@ export interface StoredMessage {
   text: string;
   timestamp: number;
   state: "queued" | "sent" | "failed";
+}
+
+/**
+ * One group message, as stored.
+ *
+ * A separate type from StoredMessage because a group message has no peer: the
+ * sender is a member id and the conversation is the group.
+ */
+export interface GroupMessageRecord {
+  groupId: string;
+  senderId: string;
+  text: string;
+  at: number;
 }

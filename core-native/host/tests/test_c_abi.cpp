@@ -621,6 +621,57 @@ int main() {
         veil_engine_free(bob);
     }
 
+section("group state survives a restart through the ABI");
+    {
+        void* alice = veil_engine_new();
+        void* bob = veil_engine_new();
+        check(alice && bob, "two engines");
+
+        check(veil_init_device(alice, "alice") == VEIL_OK, "alice has a device");
+        check(veil_init_device(bob, "bob") == VEIL_OK, "bob has a device");
+
+        check(veil_create_group(alice, "team") == VEIL_OK, "a group");
+        const char members[] = "alice\0bob";
+        check(veil_set_group_members(alice, "team",
+                                     reinterpret_cast<const uint8_t*>(members),
+                                     sizeof(members) - 1) == 2,
+              "two members");
+
+        // Alice's own group is enough to prove the export works: bob is not a
+        // member of anything, so his blob has nothing to carry.
+        const int state_size = veil_export_group_state(alice, nullptr, 0);
+        check(state_size > 0, "group state exports");
+
+        uint8_t state[8192];
+        check(veil_export_group_state(alice, state, sizeof(state)) == state_size,
+              "it fits its own size query");
+
+        // Restore into a fresh engine that has the same device identity.
+        uint8_t secrets[VEIL_IDENTITY_SECRET_SIZE];
+        veil_identity_secrets(alice, secrets, sizeof(secrets));
+        void* restored = veil_engine_restore(secrets, sizeof(secrets));
+        check(restored != nullptr, "restored identity");
+        check(veil_init_device(restored, "alice") == VEIL_OK, "restored device");
+
+        check(veil_import_group_state(restored, state, static_cast<size_t>(state_size)) ==
+                  VEIL_OK,
+              "group state imports");
+        check(veil_group_epoch(restored, "team") == 2, "the epoch survived");
+        check(veil_is_group_member(restored, "team") == 1, "membership survived");
+
+        // A truncated blob is refused, and refusing leaves the live state alone.
+        check(veil_import_group_state(restored, state,
+                                      static_cast<size_t>(state_size) - 1) ==
+                  VEIL_BAD_BUNDLE,
+              "a truncated blob is refused");
+        check(veil_group_epoch(restored, "team") == 2,
+              "and the live groups are untouched");
+
+        veil_engine_free(restored);
+        veil_engine_free(alice);
+        veil_engine_free(bob);
+    }
+
 section("safety number is a string across the boundary");
     {
         void* engine = veil_engine_new();

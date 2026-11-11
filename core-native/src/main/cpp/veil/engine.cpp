@@ -1,5 +1,6 @@
 #include "veil/engine.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -496,8 +497,7 @@ std::string hex(const uint8_t* data, size_t size) {
     return out;
 }
 
-bool fromHex(const std::string& text, uint8_t* out, size_t size) {
-    if (text.size() != size * 2) return false;
+bool fromHex(const std::string& text, uint8_t* out, size_t size) {    if (text.size() != size * 2) return false;
     for (size_t i = 0; i < size; ++i) {
         const char hi = text[i * 2];
         const char lo = text[i * 2 + 1];
@@ -512,6 +512,35 @@ bool fromHex(const std::string& text, uint8_t* out, size_t size) {
         if (h < 0 || l < 0) return false;
         out[i] = static_cast<uint8_t>((h << 4) | l);
     }
+    return true;
+}
+
+}  // namespace
+
+// Serialisation helpers for the persistence blobs. Local to this file because
+// they are the only readers and writers of those layouts, and a shared helper
+// would invite a second caller to depend on a format that is allowed to change.
+namespace {
+
+void put_u32_append(Bytes& out, uint32_t value) {
+    uint8_t num[4];
+    put_u32(num, value);
+    out.insert(out.end(), num, num + 4);
+}
+
+void put_string(Bytes& out, const std::string& text) {
+    put_u32_append(out, static_cast<uint32_t>(text.size()));
+    out.insert(out.end(), text.begin(), text.end());
+}
+
+bool get_string(std::string& out, const uint8_t* data, size_t size, size_t& off) {
+    if (size - off < 4) return false;
+    const uint32_t len = get_u32(data + off);
+    off += 4;
+    // Subtraction rather than addition, so the comparison cannot overflow.
+    if (static_cast<size_t>(len) > size - off) return false;
+    out.assign(reinterpret_cast<const char*>(data + off), len);
+    off += len;
     return true;
 }
 
@@ -1066,6 +1095,184 @@ Engine::Result Engine::decryptFromGroup(const std::string& group_id,
     if (!ok) return Result::AuthFailed;
     out = std::move(plain);
     return Result::Ok;
+}
+
+// ---- Group persistence -------------------------------------------------
+
+Bytes Engine::exportGroupState() const {
+    Bytes out;
+    put_u32_append(out, static_cast<uint32_t>(groups_.size()));
+
+    for (const auto& [group_id, state] : groups_) {
+        put_string(out, group_id);
+
+        const auto& m = state.membership;
+        put_u32_append(out, m.epoch);
+
+        // Members are written sorted so two exports of the same group produce
+        // identical bytes; a caller comparing blobs for equality then gets a
+        // meaningful answer.
+        std::vector<std::string> members = m.members;
+        std::sort(members.begin(), members.end());
+        members.erase(std::unique(members.begin(), members.end()), members.end());
+
+        put_u32_append(out, static_cast<uint32_t>(members.size()));
+        for (const auto& member : members) put_string(out, member);
+
+        put_string(out, m.founder);
+
+        out.push_back(state.has_founder_key ? 1 : 0);
+        if (state.has_founder_key) {
+            out.insert(out.end(), state.founder_sign_pub.begin(),
+                       state.founder_sign_pub.end());
+        }
+        out.insert(out.end(), m.signature, m.signature + kSigSize);
+
+        out.push_back(state.has_outgoing ? 1 : 0);
+        if (state.has_outgoing) {
+            put_u32_append(out, state.outgoing.epoch);
+            put_u32_append(out, state.outgoing.iteration);
+            out.insert(out.end(), state.outgoing.chain_key.begin(),
+                       state.outgoing.chain_key.end());
+        }
+
+        put_u32_append(out, static_cast<uint32_t>(state.incoming.size()));
+        for (const auto& [sender, chain] : state.incoming) {
+            put_string(out, sender);
+            put_u32_append(out, chain.epoch);
+            put_u32_append(out, chain.iteration);
+            out.insert(out.end(), chain.chain_key.begin(), chain.chain_key.end());
+
+            // Skipped keys are part of the state: dropping them would silently
+            // make every message that is currently in flight permanently
+            // unreadable after a restart.
+            put_u32_append(out, static_cast<uint32_t>(chain.skipped.size()));
+            for (const auto& [index, key] : chain.skipped) {
+                put_u32_append(out, index);
+                out.insert(out.end(), key.begin(), key.end());
+            }
+        }
+    }
+    return out;
+}
+
+bool Engine::importGroupState(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 4) return false;
+
+    size_t off = 0;
+    const uint32_t count = get_u32(data + off);
+    off += 4;
+
+    // A count that could not possibly fit is malformed rather than merely large.
+    if (static_cast<size_t>(count) > (size - off) / 8) return false;
+
+    std::map<std::string, GroupState> loaded;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string group_id;
+        if (!get_string(group_id, data, size, off)) return false;
+        if (group_id.empty() || loaded.count(group_id) != 0) return false;
+
+        GroupState state;
+        if (size - off < 4) return false;
+        state.membership.epoch = get_u32(data + off);
+        off += 4;
+        if (state.membership.epoch == 0) return false;
+        state.membership.group_id = group_id;
+
+        if (size - off < 4) return false;
+        const uint32_t member_count = get_u32(data + off);
+        off += 4;
+        if (member_count == 0 || static_cast<size_t>(member_count) > (size - off) / 6) {
+            return false;
+        }
+        for (uint32_t j = 0; j < member_count; ++j) {
+            std::string member;
+            if (!get_string(member, data, size, off)) return false;
+            state.membership.members.push_back(std::move(member));
+        }
+
+        if (!get_string(state.membership.founder, data, size, off)) return false;
+
+        if (size - off < 1) return false;
+        const uint8_t has_key = data[off++];
+        if (has_key > 1) return false;
+        if (has_key == 1) {
+            if (size - off < 32) return false;
+            std::memcpy(state.founder_sign_pub.data(), data + off, 32);
+            off += 32;
+            state.has_founder_key = true;
+        }
+
+        if (size - off < kSigSize) return false;
+        std::memcpy(state.membership.signature, data + off, kSigSize);
+        off += kSigSize;
+
+        if (size - off < 1) return false;
+        const uint8_t has_out = data[off++];
+        if (has_out > 1) return false;
+        if (has_out == 1) {
+            if (size - off < 40) return false;
+            state.outgoing.epoch = get_u32(data + off); off += 4;
+            state.outgoing.iteration = get_u32(data + off); off += 4;
+            std::memcpy(state.outgoing.chain_key.data(), data + off, 32);
+            off += 32;
+            state.has_outgoing = true;
+        }
+
+        if (size - off < 4) return false;
+        const uint32_t incoming_count = get_u32(data + off);
+        off += 4;
+        if (static_cast<size_t>(incoming_count) > (size - off) / 44) return false;
+
+        for (uint32_t j = 0; j < incoming_count; ++j) {
+            std::string sender;
+            if (!get_string(sender, data, size, off)) return false;
+
+            if (size - off < 40) return false;
+            GroupChain chain;
+            chain.epoch = get_u32(data + off); off += 4;
+            chain.iteration = get_u32(data + off); off += 4;
+            std::memcpy(chain.chain_key.data(), data + off, 32);
+            off += 32;
+
+            if (size - off < 4) return false;
+            const uint32_t skipped_count = get_u32(data + off);
+            off += 4;
+            if (static_cast<size_t>(skipped_count) > kMaxSkippedGroupKeys) return false;
+            if (static_cast<size_t>(skipped_count) > (size - off) / 36) return false;
+
+            for (uint32_t k = 0; k < skipped_count; ++k) {
+                if (size - off < 36) return false;
+                const uint32_t index = get_u32(data + off); off += 4;
+                std::array<uint8_t, 32> key{};
+                std::memcpy(key.data(), data + off, 32);
+                off += 32;
+                chain.skipped[index] = key;
+            }
+
+            state.incoming[sender] = std::move(chain);
+        }
+
+        loaded[group_id] = std::move(state);
+    }
+
+    // Everything parsed before anything is replaced, so a malformed blob leaves
+    // the live groups untouched rather than half-loaded.
+    for (auto& [id, state] : groups_) {
+        for (auto& [sender, chain] : state.incoming) {
+            veil::wipe(chain.chain_key.data(), chain.chain_key.size());
+            for (auto& [index, key] : chain.skipped) {
+                veil::wipe(key.data(), key.size());
+            }
+        }
+        if (state.has_outgoing) {
+            veil::wipe(state.outgoing.chain_key.data(), state.outgoing.chain_key.size());
+        }
+    }
+
+    groups_ = std::move(loaded);
+    return true;
 }
 
 }  // namespace veil

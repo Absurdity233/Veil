@@ -109,6 +109,8 @@ interface EmscriptenModule {
     handle: number, groupId: number, data: number, size: number,
     out: number, outSize: number, outLen: number,
   ): number;
+  _veil_export_group_state(handle: number, out: number, outSize: number): number;
+  _veil_import_group_state(handle: number, data: number, size: number): number;
 }
 
 declare const createVeilModule: (opts?: unknown) => Promise<EmscriptenModule>;
@@ -701,8 +703,7 @@ export class VeilEngine {
   }
 
   /** The hex device ids known for a peer. */
-  peerDevices(userId: string): string[] {
-    const mod = VeilEngine.require();
+  peerDevices(userId: string): string[] {    const mod = VeilEngine.require();
     return this.withPeer(userId, (ptr) => {
       const need = mod._veil_peer_devices(this.handle, ptr, 0, 0);
       if (need <= 0) return [];
@@ -722,6 +723,37 @@ export class VeilEngine {
   peerDeviceVersion(userId: string): number {
     const mod = VeilEngine.require();
     return this.withPeer(userId, (ptr) => mod._veil_peer_device_version(this.handle, ptr));
+  }
+
+  /**
+   * Starts sessions with each device of a peer.
+   *
+   * Both blobs are already in the ABI's shape by the time they arrive here; the
+   * caller builds them because it is the one that knows which bundles it managed
+   * to fetch.
+   */
+  establishWithDevices(
+    userId: string, deviceIds: Uint8Array, bundles: Uint8Array,
+  ): number {
+    const mod = VeilEngine.require();
+    return this.withPeer(userId, (ptr) => {
+      const idsPtr = mod._malloc(deviceIds.length || 1);
+      const bundlesPtr = mod._malloc(bundles.length || 1);
+      const failed = mod._malloc(1024);
+      try {
+        if (deviceIds.length) mod.HEAPU8.set(deviceIds, idsPtr);
+        if (bundles.length) mod.HEAPU8.set(bundles, bundlesPtr);
+
+        return mod._veil_establish_with_devices(
+          this.handle, ptr, idsPtr, deviceIds.length,
+          bundlesPtr, bundles.length, failed, 1024,
+        );
+      } finally {
+        mod._free(idsPtr);
+        mod._free(bundlesPtr);
+        mod._free(failed);
+      }
+    });
   }
 
   /**
@@ -845,5 +877,26 @@ export class VeilEngine {
     } finally {
       mod._free(p);
     }
+  }
+
+  // ---- Group persistence ------------------------------------------------
+  //
+  // The blob carries chain keys: every incoming chain decrypts that sender's
+  // messages and the outgoing chain can forge them. It belongs in the sealed
+  // vault, beside ratchet state.
+  //
+  // Without it a reload drops every group and a member can no longer read
+  // anything sent to a group they are still in, which is indistinguishable from
+  // having been removed.
+
+  exportGroupState(): Uint8Array | null {
+    return this.produceVariable(65536, (mod, out, size) =>
+      mod._veil_export_group_state(this.handle, out, size));
+  }
+
+  importGroupState(blob: Uint8Array): StatusCode {
+    const mod = VeilEngine.require();
+    return this.callWithBlob(blob, (m, ptr, size) =>
+      m._veil_import_group_state(this.handle, ptr, size)) as StatusCode;
   }
 }
