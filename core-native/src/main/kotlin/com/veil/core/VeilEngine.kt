@@ -200,6 +200,131 @@ class VeilEngine private constructor(handle: Long) : AutoCloseable {
         VeilNative.nativeEncrypt(state.handle, peerId, plain)
             ?: throw VeilException("cannot encrypt for $peerId")
 
+    // ---- Multi-device -----------------------------------------------------
+
+    /** Claims a user id and creates this device. */
+    fun initDevice(userId: String): Boolean =
+        VeilNative.nativeInitDevice(state.handle, userId)
+
+    /** The 32-byte device id, or null when no device has been initialised. */
+    fun deviceId(): ByteArray? = VeilNative.nativeDeviceId(state.handle)
+
+    /** This device's credential, ready to publish. */
+    fun deviceCredential(): ByteArray? = VeilNative.nativeDeviceCredential(state.handle)
+
+    fun adoptDeviceCredential(
+        credential: ByteArray,
+        accountDhPub: ByteArray,
+        accountSignPub: ByteArray,
+    ): Boolean = VeilNative.nativeAdoptDeviceCredential(
+        state.handle, credential, accountDhPub, accountSignPub,
+    )
+
+    /** 0 = ok. See [DecryptOutcome] for the shared result codes. */
+    fun adoptDeviceList(
+        userId: String,
+        version: Int,
+        entries: ByteArray,
+        accountDhPub: ByteArray,
+        accountSignPub: ByteArray,
+    ): Int = VeilNative.nativeAdoptDeviceList(
+        state.handle, userId, version, entries, accountDhPub, accountSignPub,
+    )
+
+    /**
+     * Encrypts one plaintext to every device of a peer that has a session.
+     *
+     * One message becomes N frames: that is the cost of per-device sessions, and
+     * it is why the relay learns how many devices a recipient has.
+     *
+     * A device with no session is skipped rather than failing the send, so one
+     * stale laptop does not make an account unreachable.
+     */
+    fun encryptToAccount(userId: String, plain: ByteArray): List<Pair<String, ByteArray>> {
+        val blob = VeilNative.nativeEncryptToAccount(state.handle, userId, plain)
+            ?: return emptyList()
+
+        val out = mutableListOf<Pair<String, ByteArray>>()
+        var off = 0
+        while (off + 5 <= blob.size) {
+            off += 4  // record length; the loop is bounded by the array
+            val idLen = blob[off].toInt() and 0xFF
+            off += 1
+
+            val deviceId = String(blob, off, idLen, Charsets.UTF_8)
+            off += idLen
+
+            val frameLen = readU32(blob, off)
+            off += 4
+            if (off + frameLen > blob.size) break
+
+            out += deviceId to blob.copyOfRange(off, off + frameLen)
+            off += frameLen
+        }
+        return out
+    }
+
+    private fun readU32(buf: ByteArray, off: Int): Int =
+        ((buf[off].toInt() and 0xFF) shl 24) or
+            ((buf[off + 1].toInt() and 0xFF) shl 16) or
+            ((buf[off + 2].toInt() and 0xFF) shl 8) or
+            (buf[off + 3].toInt() and 0xFF)
+
+    // ---- Groups -----------------------------------------------------------
+
+    /**
+     * Creates a group with this device's user as founder.
+     *
+     * Membership is signed by the founder, because a group with no authority has
+     * no way to tell a legitimate re-key from a hostile one. See docs/group.md.
+     */
+    fun createGroup(groupId: String): Boolean =
+        VeilNative.nativeCreateGroup(state.handle, groupId)
+
+    /**
+     * Replaces the member list and bumps the epoch.
+     *
+     * Every chain is discarded, including this client's: a removed member holds
+     * the old chain key, and re-keying is the only thing that stops them reading
+     * what follows. Returns the new epoch, or 0 on failure.
+     */
+    fun setGroupMembers(groupId: String, members: List<String>): Int =
+        VeilNative.nativeSetGroupMembers(state.handle, groupId, members.toTypedArray())
+
+    fun groupEpoch(groupId: String): Int =
+        VeilNative.nativeGroupEpoch(state.handle, groupId)
+
+    fun groupMembers(groupId: String): List<String> =
+        VeilNative.nativeGroupMembers(state.handle, groupId)?.toList() ?: emptyList()
+
+    fun isGroupMember(groupId: String): Boolean =
+        VeilNative.nativeIsGroupMember(state.handle, groupId)
+
+    fun exportMembership(groupId: String): ByteArray? =
+        VeilNative.nativeExportMembership(state.handle, groupId)
+
+    fun adoptMembership(data: ByteArray, founderSignPub: ByteArray): Int =
+        VeilNative.nativeAdoptMembership(state.handle, data, founderSignPub)
+
+    fun exportSenderKey(groupId: String, epoch: Int = 0): ByteArray? =
+        VeilNative.nativeExportSenderKey(state.handle, groupId, epoch)
+
+    fun adoptSenderKey(data: ByteArray, senderId: String, senderSignPub: ByteArray): Int =
+        VeilNative.nativeAdoptSenderKey(state.handle, data, senderId, senderSignPub)
+
+    /** One message, one frame, regardless of group size. */
+    fun encryptToGroup(groupId: String, plain: ByteArray): ByteArray? =
+        VeilNative.nativeEncryptToGroup(state.handle, groupId, plain)
+
+    fun decryptFromGroup(groupId: String, record: ByteArray): ByteArray? =
+        VeilNative.nativeDecryptFromGroup(state.handle, groupId, record)
+
+    /** Carries chain keys: this belongs in the Keystore-backed vault. */
+    fun exportGroupState(): ByteArray? = VeilNative.nativeExportGroupState(state.handle)
+
+    fun importGroupState(blob: ByteArray): Boolean =
+        VeilNative.nativeImportGroupState(state.handle, blob)
+
     /**
      * Decrypts a wire frame.
      *

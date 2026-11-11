@@ -1,0 +1,101 @@
+# Veil - TLS termination and static hosting.
+#
+# One origin serves both the page and the websocket, which is what keeps the
+# browser's same-origin rules simple: no CORS, no cross-site cookie saga, and a
+# content policy that can stay strict because every script comes from here.
+#
+# VEIL_TLS=internal swaps the public CA for Caddy's local one. That needs a
+# global option rather than a per-site one, and a global option cannot be
+# conditional - so internal mode is selected by editing the one line below rather
+# than by an environment variable. A deployment either has a public name or it
+# does not, and an operator reading this file should see which case they are in.
+#
+#   public certificate (default):   leave this block commented out
+#   local CA (no DNS yet, or no public name):
+#
+#     {
+#         local_certs
+#     }
+
+{
+	# An explicit default so Caddy does not try to be clever about which
+	# interface to bind. In a container that is always :80 and :443.
+	admin off
+}
+
+{$VEIL_DOMAIN} {
+	# ---- Security headers ----
+	#
+	# The page is a self-contained application: it loads one script and one
+	# wasm module from this origin and nothing else. Every relaxation below is
+	# therefore a decision, not a default.
+	header {
+		# HSTS is only meaningful once a working certificate exists, which is
+		# exactly when this file is in play.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		# No framing: a chat client inside somebody else's page is not a thing
+		# this serves, and clickjacking a message-send button is.
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+
+		# No third-party anything. 'wasm-unsafe-eval' is what allows the engine
+		# module to instantiate; without it the client cannot start at all.
+		# 'self' for script is strict on purpose - the threat model's weakest
+		# point is script running on this origin.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'"
+
+		# The relay never wants the page cached, but the assets are fine.
+		-Server
+	}
+
+	# ---- The websocket ----
+	#
+	# A chat socket is long-lived and mostly idle. Caddy's defaults would be
+	# fine, but being explicit documents what the deployment depends on.
+	@ws {
+		path /ws
+	}
+	handle @ws {
+		reverse_proxy relay:8080 {
+			# A websocket must not be killed for being quiet. The client sends
+			# its own heartbeat through the protocol; an idle socket is normal.
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	# ---- Health, for an external monitor ----
+	handle /health {
+		reverse_proxy relay:8080
+	}
+
+	# ---- The web client ----
+	handle {
+		root * /srv
+		encode zstd gzip
+
+		# A short cache for the page, a long one for the bundle it pins. The
+		# filenames are not content-hashed, so a long cache on app.js would
+		# serve a stale client after an update.
+		@immutable path /wasm/*
+		header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+		header Cache-Control "no-cache"
+		file_server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
+
+# Anything that arrives on the bare IP rather than the name gets a redirect, so a
+# half-configured DNS record fails visibly instead of serving the app over http.
+:80 {
+	redir https://{$VEIL_DOMAIN}{uri} permanent
+}

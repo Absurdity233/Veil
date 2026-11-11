@@ -1,4 +1,4 @@
-package com.veil.desktop
+﻿package com.veil.desktop
 
 import com.sun.jna.Library
 import com.sun.jna.Native
@@ -64,6 +64,52 @@ interface VeilC : Library {
 
     // ---- Verification ----
     fun veil_safety_number(handle: Pointer?, peer: String, out: ByteArray, outSize: Int): Int
+
+    // ---- Multi-device ----
+    fun veil_init_device(handle: Pointer?, userId: String): Int
+    fun veil_device_id(handle: Pointer?, out: ByteArray, outSize: Int): Int
+    fun veil_device_credential(handle: Pointer?, out: ByteArray?, outSize: Int): Int
+    fun veil_adopt_device_credential(handle: Pointer?, credential: ByteArray,
+                                     credentialSize: Int, accountDhPub: ByteArray,
+                                     accountSignPub: ByteArray): Int
+    fun veil_adopt_device_list(handle: Pointer?, userId: String, version: Int,
+                               data: ByteArray, size: Int, accountDhPub: ByteArray,
+                               accountSignPub: ByteArray): Int
+    fun veil_peer_devices(handle: Pointer?, userId: String, out: ByteArray?,
+                          outSize: Int): Int
+    fun veil_peer_device_version(handle: Pointer?, userId: String): Int
+    fun veil_device_fingerprint(credential: ByteArray, size: Int, out: ByteArray,
+                                outSize: Int): Int
+    fun veil_establish_with_devices(handle: Pointer?, userId: String,
+                                    deviceIds: ByteArray, deviceIdsSize: Int,
+                                    bundles: ByteArray, bundlesSize: Int,
+                                    failed: ByteArray, failedSize: Int): Int
+    fun veil_encrypt_to_account(handle: Pointer?, userId: String, plain: ByteArray,
+                                plainSize: Int, out: ByteArray?, outSize: Int): Int
+
+    // ---- Groups ----
+    fun veil_create_group(handle: Pointer?, groupId: String): Int
+    fun veil_set_group_members(handle: Pointer?, groupId: String, members: ByteArray,
+                               membersSize: Int): Int
+    fun veil_export_membership(handle: Pointer?, groupId: String, out: ByteArray?,
+                               outSize: Int): Int
+    fun veil_adopt_membership(handle: Pointer?, data: ByteArray, size: Int,
+                              founderSignPub: ByteArray): Int
+    fun veil_group_epoch(handle: Pointer?, groupId: String): Int
+    fun veil_group_members(handle: Pointer?, groupId: String, out: ByteArray?,
+                           outSize: Int): Int
+    fun veil_is_group_member(handle: Pointer?, groupId: String): Int
+    fun veil_export_sender_key(handle: Pointer?, groupId: String, epoch: Int,
+                               out: ByteArray?, outSize: Int): Int
+    fun veil_adopt_sender_key(handle: Pointer?, data: ByteArray, size: Int,
+                              expectedSender: String, senderSignPub: ByteArray): Int
+    fun veil_encrypt_to_group(handle: Pointer?, groupId: String, plain: ByteArray,
+                              plainSize: Int, out: ByteArray?, outSize: Int): Int
+    fun veil_decrypt_from_group(handle: Pointer?, groupId: String, data: ByteArray,
+                                size: Int, out: ByteArray?, outSize: Int,
+                                outLen: IntByReference): Int
+    fun veil_export_group_state(handle: Pointer?, out: ByteArray?, outSize: Int): Int
+    fun veil_import_group_state(handle: Pointer?, data: ByteArray, size: Int): Int
 
     // ---- Version ----
     fun veil_version(major: IntByReference, minor: IntByReference, patch: IntByReference)
@@ -262,6 +308,162 @@ class VeilEngine private constructor(private val handle: Pointer) : AutoCloseabl
     }
 
     override fun close() = lib.veil_engine_free(handle)
+
+    // ---- Multi-device -----------------------------------------------------
+
+    /** Claims a user id and creates this device. */
+    fun initDevice(userId: String): Boolean = lib.veil_init_device(handle, userId) == VeilC.OK
+
+    /** The 32-byte device id, or null when no device is initialised. */
+    fun deviceId(): ByteArray? {
+        val out = ByteArray(32)
+        val n = lib.veil_device_id(handle, out, out.size)
+        return if (n == 32) out else null
+    }
+
+    /** This device's credential, ready to publish. */
+    fun deviceCredential(): ByteArray? =
+        produce(512) { buf, size -> lib.veil_device_credential(handle, buf, size) }
+
+    fun adoptDeviceCredential(
+        credential: ByteArray,
+        accountDhPub: ByteArray,
+        accountSignPub: ByteArray,
+    ): Boolean =
+        lib.veil_adopt_device_credential(
+            handle, credential, credential.size, accountDhPub, accountSignPub,
+        ) == VeilC.OK
+
+    fun adoptDeviceList(
+        userId: String,
+        version: Int,
+        entries: ByteArray,
+        accountDhPub: ByteArray,
+        accountSignPub: ByteArray,
+    ): Int = lib.veil_adopt_device_list(
+        handle, userId, version, entries, entries.size, accountDhPub, accountSignPub,
+    )
+
+    /** The hex device ids known for a peer. */
+    fun peerDevices(userId: String): List<String> {
+        // A size query has to pass NULL, not a zero-length array: the ABI
+        // distinguishes "tell me the size" from "write here" by the pointer,
+        // and JNA will happily hand it a valid pointer to an empty array.
+        val need = lib.veil_peer_devices(handle, userId, null, 0)
+        if (need <= 0) return emptyList()
+
+        val buf = ByteArray(need)
+        if (lib.veil_peer_devices(handle, userId, buf, need) != need) return emptyList()
+        return String(buf, Charsets.UTF_8).split('\u0000').filter { it.isNotEmpty() }
+    }
+
+    fun peerDeviceVersion(userId: String): Int =
+        lib.veil_peer_device_version(handle, userId)
+
+    /**
+     * Encrypts one plaintext to every device of a peer that has a session.
+     *
+     * The ABI returns a record sequence; this parses it so a caller iterates
+     * instead of hand-walking lengths.
+     */
+    fun encryptToAccount(userId: String, plain: ByteArray): List<Pair<String, ByteArray>> {
+        val need = lib.veil_encrypt_to_account(handle, userId, plain, plain.size, null, 0)
+        if (need <= 0) return emptyList()
+
+        val buf = ByteArray(need)
+        val total = lib.veil_encrypt_to_account(handle, userId, plain, plain.size, buf, need)
+        if (total <= 0) return emptyList()
+
+        val out = mutableListOf<Pair<String, ByteArray>>()
+        var off = 0
+        while (off + 5 <= total) {
+            off += 4  // record length; the loop is bounded by `total`
+            val idLen = buf[off].toInt() and 0xFF
+            off += 1
+            val deviceId = String(buf, off, idLen, Charsets.UTF_8)
+            off += idLen
+
+            val frameLen = readU32(buf, off)
+            off += 4
+            out += deviceId to buf.copyOfRange(off, off + frameLen)
+            off += frameLen
+        }
+        return out
+    }
+
+    // ---- Groups -----------------------------------------------------------
+
+    fun createGroup(groupId: String): Boolean =
+        lib.veil_create_group(handle, groupId) == VeilC.OK
+
+    /** Replaces the member list; returns the new epoch, or 0 on failure. */
+    fun setGroupMembers(groupId: String, members: List<String>): Int {
+        val joined = members.joinToString("\u0000").toByteArray(Charsets.UTF_8)
+        return lib.veil_set_group_members(handle, groupId, joined, joined.size)
+    }
+
+    fun groupEpoch(groupId: String): Int = lib.veil_group_epoch(handle, groupId)
+
+    fun groupMembers(groupId: String): List<String> {
+        val need = lib.veil_group_members(handle, groupId, null, 0)
+        if (need <= 0) return emptyList()
+
+        val buf = ByteArray(need)
+        if (lib.veil_group_members(handle, groupId, buf, need) != need) return emptyList()
+        return String(buf, Charsets.UTF_8).split('\u0000').filter { it.isNotEmpty() }
+    }
+
+    fun isGroupMember(groupId: String): Boolean =
+        lib.veil_is_group_member(handle, groupId) == 1
+
+    fun exportMembership(groupId: String): ByteArray? =
+        produce(2048) { buf, size -> lib.veil_export_membership(handle, groupId, buf, size) }
+
+    fun adoptMembership(data: ByteArray, founderSignPub: ByteArray): Int =
+        lib.veil_adopt_membership(handle, data, data.size, founderSignPub)
+
+    fun exportSenderKey(groupId: String, epoch: Int = 0): ByteArray? =
+        produce(512) { buf, size ->
+            lib.veil_export_sender_key(handle, groupId, epoch, buf, size)
+        }
+
+    fun adoptSenderKey(data: ByteArray, senderId: String, senderSignPub: ByteArray): Int =
+        lib.veil_adopt_sender_key(handle, data, data.size, senderId, senderSignPub)
+
+    fun encryptToGroup(groupId: String, plain: ByteArray): ByteArray? {
+        val need = lib.veil_encrypt_to_group(handle, groupId, plain, plain.size, null, 0)
+        if (need <= 0) return null
+
+        val buf = ByteArray(need)
+        val total = lib.veil_encrypt_to_group(handle, groupId, plain, plain.size, buf, need)
+        return if (total == need) buf else null
+    }
+
+    /** Decrypts a group record; returns the plaintext or null. */
+    fun decryptFromGroup(groupId: String, record: ByteArray): ByteArray? {
+        // The plaintext is always smaller than the record that carries it, so
+        // sizing from the frame needs no probe - which matters because a probe
+        // must not consume the message key.
+        val out = ByteArray(record.size)
+        val len = IntByReference(0)
+
+        val status = lib.veil_decrypt_from_group(handle, groupId, record, record.size,
+            out, out.size, len)
+        return if (status == VeilC.OK) out.copyOf(len.value) else null
+    }
+
+    fun exportGroupState(): ByteArray? =
+        produce(65536) { buf, size -> lib.veil_export_group_state(handle, buf, size) }
+
+    fun importGroupState(blob: ByteArray): Boolean =
+        lib.veil_import_group_state(handle, blob, blob.size) == VeilC.OK
+
+    /** Reads a big-endian u32, matching the ABI's record format. */
+    private fun readU32(buf: ByteArray, off: Int): Int =
+        ((buf[off].toInt() and 0xFF) shl 24) or
+            ((buf[off + 1].toInt() and 0xFF) shl 16) or
+            ((buf[off + 2].toInt() and 0xFF) shl 8) or
+            (buf[off + 3].toInt() and 0xFF)
 
     /**
      * Runs a producing call, growing the buffer once if the first attempt is

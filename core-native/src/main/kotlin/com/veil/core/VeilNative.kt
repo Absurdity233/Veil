@@ -67,4 +67,67 @@ internal object VeilNative {
     external fun nativeNeedsPreKeyRefill(handle: Long, lowWater: Int): Boolean
 
     external fun nativeSafetyNumber(handle: Long, peerId: String): String?
+
+    // ---- Multi-device -----------------------------------------------------
+    //
+    // The phone is normally the first device of an account, so what it needs is
+    // the ability to create and publish its own credential and to fan out to a
+    // peer's devices. Linking a *second* device happens on the device being
+    // linked, which is why the full surface lives on the C ABI.
+
+    external fun nativeInitDevice(handle: Long, userId: String): Boolean
+    external fun nativeDeviceId(handle: Long): ByteArray?
+    external fun nativeDeviceCredential(handle: Long): ByteArray?
+
+    external fun nativeAdoptDeviceCredential(
+        handle: Long,
+        credential: ByteArray,
+        accountDhPub: ByteArray,
+        accountSignPub: ByteArray,
+    ): Boolean
+
+    /** Engine result code: 0 = ok, 1 = bad bundle, 2 = bad signature. */
+    external fun nativeAdoptDeviceList(
+        handle: Long,
+        userId: String,
+        version: Int,
+        data: ByteArray,
+        accountDhPub: ByteArray,
+        accountSignPub: ByteArray,
+    ): Int
+
+    /**
+     * One frame per device of a peer, in the ABI's record sequence.
+     *
+     * Parsed by [com.veil.core.VeilEngine.encryptToAccount]; a raw array here so
+     * the JNI layer does not have to construct Kotlin objects.
+     */
+    external fun nativeEncryptToAccount(handle: Long, userId: String, plain: ByteArray): ByteArray?
+
+    // ---- Groups -----------------------------------------------------------
+
+    external fun nativeCreateGroup(handle: Long, groupId: String): Boolean
+    external fun nativeSetGroupMembers(handle: Long, groupId: String, members: Array<String>): Int
+    external fun nativeGroupEpoch(handle: Long, groupId: String): Int
+    external fun nativeGroupMembers(handle: Long, groupId: String): Array<String>?
+    external fun nativeIsGroupMember(handle: Long, groupId: String): Boolean
+
+    external fun nativeExportMembership(handle: Long, groupId: String): ByteArray?
+    external fun nativeAdoptMembership(
+        handle: Long, data: ByteArray, founderSignPub: ByteArray,
+    ): Int
+
+    external fun nativeExportSenderKey(handle: Long, groupId: String, epoch: Int): ByteArray?
+    external fun nativeAdoptSenderKey(
+        handle: Long, data: ByteArray, senderId: String, senderSignPub: ByteArray,
+    ): Int
+
+    external fun nativeEncryptToGroup(handle: Long, groupId: String, plain: ByteArray): ByteArray?
+
+    /** The plaintext, or null when the frame does not authenticate. */
+    external fun nativeDecryptFromGroup(handle: Long, groupId: String, record: ByteArray): ByteArray?
+
+    /** Carries chain keys: store it in the Keystore-backed vault, not in the clear. */
+    external fun nativeExportGroupState(handle: Long): ByteArray?
+    external fun nativeImportGroupState(handle: Long, blob: ByteArray): Boolean
 }

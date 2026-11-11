@@ -1,0 +1,113 @@
+# Veil - production deployment.
+#
+# Three containers: Caddy terminates TLS and serves the web client, the relay
+# runs the protocol, and nothing else is exposed to the internet.
+#
+#   internet ──443──▶ caddy ──┬── /            static web client
+#                             └── /ws, /health relay
+#
+# Why TLS is not optional here: a browser only exposes crypto.subtle on a secure
+# origin. Over plain ws:// the web client refuses to generate keys rather than
+# falling back to something predictable, so an http:// deployment does not
+# degrade - it does not work at all.
+#
+# Before starting:
+#
+#   1. Point a DNS A record at this host. Caddy needs a real name to get a
+#      certificate; an IP address on its own cannot have one.
+#   2. Set VEIL_DOMAIN below (or in .env) to that name.
+#   3. docker compose up -d
+#
+# For a name that is not yet resolvable, or for testing, set VEIL_TLS to
+# "internal" to use Caddy's local CA. Browsers will warn, and the web client
+# will keep working after you accept the certificate.
+
+services:
+  relay:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    image: veil-relay:latest
+    container_name: veil-relay
+    restart: unless-stopped
+
+    # No ports. The relay is reachable only from Caddy on the compose network,
+    # so the plaintext port cannot be hit from outside by mistake.
+    expose:
+      - "8080"
+
+    volumes:
+      - veil-data:/data
+
+    environment:
+      VEIL_ADDR: ":8080"
+      VEIL_DB: "/data/veil.db"
+      # The browser client's origin. Without this the websocket handshake is
+      # refused with a 403, which is the correct behaviour and looks like a
+      # broken deployment if you do not know to expect it.
+      VEIL_ALLOWED_ORIGINS: "https://${VEIL_DOMAIN}"
+      # The healthcheck probes this from inside the container.
+      VEIL_HEALTH_URL: "http://127.0.0.1:8080/health"
+
+    healthcheck:
+      # The image is distroless: no shell, no curl. The relay binary is the only
+      # thing guaranteed to exist in there, so it probes itself. This checks
+      # /health rather than just the port, because a bound port says nothing
+      # about whether the SQLite store is usable.
+      test: ["CMD", "/usr/local/bin/veil-relay", "-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: veil-caddy
+    restart: unless-stopped
+
+    depends_on:
+      relay:
+        condition: service_healthy
+
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The web client, served from the same origin as the relay. Same origin
+      # matters: it is what lets the page's cookies and CSP story stay simple.
+      - ../web/public:/srv:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+    environment:
+      VEIL_DOMAIN: "${VEIL_DOMAIN}"
+      VEIL_TLS: "${VEIL_TLS:-}"
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  veil-data:
+  caddy-data:
+  caddy-config:

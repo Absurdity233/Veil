@@ -14,7 +14,8 @@ ciphertext it holds no key for.
 [Threat model](docs/threat-model.md) ·
 [Multi-device](docs/multi-device.md) ·
 [Groups](docs/group.md) ·
-[Building](docs/building.md)
+[Building](docs/building.md) ·
+[Deploying](deploy/README.md)
 
 [![ci](https://github.com/Absurdity233/Veil/actions/workflows/ci.yml/badge.svg)](https://github.com/Absurdity233/Veil/actions/workflows/ci.yml)
 ![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)
@@ -163,10 +164,11 @@ sending), and group messaging with Sender Keys (one frame per message regardless
 of group size, epoch-based re-keying when membership changes, persisted across
 restarts). The relay addresses frames per device and stores device lists.
 
-**Surfaced in the web client:** device identity, fan-out sending, group
-create/send/receive, and group state in the sealed vault. The engine and C ABI
-support all of it; Android and desktop still call the one-to-one paths and need
-the same wiring.
+**Surfaced in the clients:** the web client has device identity, fan-out sending,
+group create/send/receive and group state in the sealed vault. Android and
+desktop have the same engine surface (`encryptToAccount`, groups, group
+persistence) and announce their device id on connect; what they still lack is UI
+for it.
 
 **Not implemented at all:** push notifications, account recovery, a device
 linking UI, and group invitations over the wire (chains and member lists travel
@@ -174,6 +176,7 @@ through export/adopt pairs, so a caller has to hand them over).
 
 The designs, and the honest account of what is missing from each, are in
 [Multi-device](docs/multi-device.md) and [Groups](docs/group.md).
+To run it, see [Deploying](deploy/README.md) — Docker, Caddy, TLS.
 
 ## Licence
 

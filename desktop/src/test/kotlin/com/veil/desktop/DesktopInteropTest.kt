@@ -33,7 +33,7 @@ class DesktopInteropTest {
     @Test
     fun `the native library loads and reports its version`() {
         val version = VeilEngine.version()
-        assertEquals("0.3.0", version)
+        assertEquals("0.4.0", version)
     }
 
     @Test
@@ -177,6 +177,131 @@ class DesktopInteropTest {
     // ---- Helpers ---------------------------------------------------------
 
     /** Builds the fixed-width bundle the engine parses, from a public set. */
+    @Test
+    fun `multi-device and groups work through the JNA binding`() {
+        // The ABI surface for devices and groups is only useful if the Kotlin
+        // wrapper can actually drive it: a mis-declared JNA signature fails at
+        // call time, not at compile time, so this asserts behaviour rather than
+        // the presence of the functions.
+        val alice = VeilEngine.create()
+        val bob = VeilEngine.create()
+        try {
+            assertTrue("alice has a device", alice.initDevice("alice"))
+            assertTrue("bob has a device", bob.initDevice("bob"))
+
+            val aliceDeviceId = alice.deviceId()
+            assertNotNull("alice's device id", aliceDeviceId)
+            assertEquals("a device id is 32 bytes", 32, aliceDeviceId!!.size)
+
+            val alicePub = alice.publicIdentity()!!
+
+            // ---- A group of two ----
+            assertTrue("alice founds a group", alice.createGroup("team"))
+            assertEquals("adding a member bumps the epoch", 2,
+                alice.setGroupMembers("team", listOf("alice", "bob")))
+            assertEquals("the epoch reads back", 2, alice.groupEpoch("team"))
+            assertEquals("the members read back", listOf("alice", "bob"),
+                alice.groupMembers("team"))
+            assertTrue("alice is a member", alice.isGroupMember("team"))
+
+            val membership = alice.exportMembership("team")
+            assertNotNull("a membership record is produced", membership)
+
+            // Membership is signed by the *account*: the founder is the
+            // authority on who is in the group, and that authority is the
+            // identity rather than a device.
+            assertEquals("bob adopts the membership", VeilC.OK,
+                bob.adoptMembership(membership!!, alicePub.copyOfRange(32, 64)))
+            assertEquals("bob knows the epoch", 2, bob.groupEpoch("team"))
+
+            // ---- A removed member cannot read the next epoch ----
+            assertEquals("removal bumps the epoch", 3,
+                alice.setGroupMembers("team", listOf("alice")))
+
+            val staleAfterRemoval = alice.encryptToGroup("team", "after".toByteArray())
+            assertNotNull("alice can still send on the new epoch", staleAfterRemoval)
+
+            // Bob was never told about the rotation, so he is on epoch 2 and the
+            // message is addressed to epoch 3. Unreadable is the point.
+            assertEquals("bob cannot read the new epoch", null,
+                bob.decryptFromGroup("team", staleAfterRemoval!!))
+
+            // ---- Group state survives a restart ----
+            val state = alice.exportGroupState()
+            assertNotNull("group state exports", state)
+
+            val restarted = VeilEngine.restore(alice.identitySecrets())
+            try {
+                assertTrue("the device is re-claimed", restarted.initDevice("alice"))
+                assertTrue("group state imports", restarted.importGroupState(state!!))
+                assertEquals("the epoch survived", 3, restarted.groupEpoch("team"))
+                assertTrue("membership survived", restarted.isGroupMember("team"))
+            } finally {
+                restarted.close()
+            }
+        } finally {
+            alice.close()
+            bob.close()
+        }
+    }
+
+    @Test
+    fun `a device list is adopted from the relay's shape`() {
+        // The ABI takes [4] count followed by credential blobs, which is what a
+        // client assembles from a GET_DEVICES reply. Getting that shape wrong is
+        // a runtime parse failure, so the assembly is exercised here.
+        val alice = VeilEngine.create()
+        val bob = VeilEngine.create()
+        try {
+            alice.initDevice("alice")
+            bob.initDevice("bob")
+
+            val alicePub = alice.publicIdentity()!!
+            val credential = alice.deviceCredential()!!
+
+            // [4] count = 1, then the credential.
+            val blob = ByteArray(4 + credential.size)
+            blob[3] = 1
+            credential.copyInto(blob, 4)
+
+            val status = bob.adoptDeviceList(
+                "alice", 1, blob, alicePub.copyOfRange(0, 32), alicePub.copyOfRange(32, 64),
+            )
+            assertEquals("the list is accepted", VeilC.OK, status)
+
+            val devices = bob.peerDevices("alice")
+            assertEquals("one device is known", 1, devices.size)
+            assertEquals("the id is hex", 64, devices[0].length)
+            assertEquals("the version is recorded", 1, bob.peerDeviceVersion("alice"))
+
+            // A list at the same version must not replace what is held, so a
+            // relay cannot roll a revocation back.
+            val stale = ByteArray(4 + credential.size)
+            stale[3] = 1
+            credential.copyInto(stale, 4)
+            bob.adoptDeviceList(
+                "alice", 1, stale, alicePub.copyOfRange(0, 32), alicePub.copyOfRange(32, 64),
+            )
+            assertEquals("a stale list does not move the version", 1,
+                bob.peerDeviceVersion("alice"))
+
+            // A credential the account never signed is refused whole.
+            val forged = credential.copyOf()
+            forged[forged.size - 1] = (forged[forged.size - 1].toInt() xor 0xFF).toByte()
+            val forgedBlob = ByteArray(4 + forged.size)
+            forgedBlob[3] = 1
+            forged.copyInto(forgedBlob, 4)
+
+            assertEquals("a forged credential is refused", VeilC.BAD_SIGNATURE,
+                bob.adoptDeviceList("alice", 2, forgedBlob,
+                    alicePub.copyOfRange(0, 32), alicePub.copyOfRange(32, 64)))
+            assertEquals("and the version did not move", 1, bob.peerDeviceVersion("alice"))
+        } finally {
+            alice.close()
+            bob.close()
+        }
+    }
+
     private fun bundleFrom(engine: VeilEngine, set: ByteArray): ByteArray {
         val identity = engine.publicIdentity()
         val r = Reader(set)

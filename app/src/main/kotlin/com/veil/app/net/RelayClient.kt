@@ -68,15 +68,19 @@ class RelayClient(private val url: String) {
      * that second half, kept separate so the signing key never has to enter
      * this class.
      */
-    suspend fun connect(userId: String, publicIdentity: ByteArray) {
+    suspend fun connect(userId: String, publicIdentity: ByteArray, deviceId: String = "") {
         closed = false
         val request = Request.Builder().url(url).build()
         val opened = suspendCancellableCoroutine { cont ->
             val listener = object : WebSocketListener() {
                 override fun onOpen(ws: WebSocket, response: Response) {
                     socket = ws
-                    val hello = Writer().string(userId).blob(publicIdentity).build()
-                    ws.send(Wire.frame(Wire.TYPE_HELLO, hello).toByteString())
+                    // The device id is written only when there is one, so a
+                    // single-device client sends the same two-field HELLO the
+                    // relay accepted before device addressing existed.
+                    val hello = Writer().string(userId).blob(publicIdentity)
+                    if (deviceId.isNotEmpty()) hello.string(deviceId)
+                    ws.send(Wire.frame(Wire.TYPE_HELLO, hello.build()).toByteString())
                     if (cont.isActive) cont.resume(true)
                 }
 
@@ -173,8 +177,17 @@ class RelayClient(private val url: String) {
      * dropping it leaves a hole in the sending chain that the peer can never
      * decrypt.
      */
-    fun sendMessage(recipient: String, frame: ByteArray): Boolean =
-        send(Wire.TYPE_SEND, Writer().string(recipient).blob(frame).build())
+    /**
+     * Sends a frame to a recipient.
+     *
+     * `deviceId` addresses one device of a peer; empty means the whole account,
+     * which is what a single-device peer and a group frame both use.
+     */
+    fun sendMessage(recipient: String, frame: ByteArray, deviceId: String = ""): Boolean {
+        val writer = Writer().string(recipient).blob(frame)
+        if (deviceId.isNotEmpty()) writer.string(deviceId)
+        return send(Wire.TYPE_SEND, writer.build())
+    }
 
     fun acknowledge(outboxId: Long): Boolean =
         send(Wire.TYPE_ACK, Writer().u64(outboxId).build())

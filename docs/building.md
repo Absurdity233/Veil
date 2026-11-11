@@ -151,6 +151,21 @@ and message bubble carries a content description, and the link state is a word
 as well as a colour. `FLAG_SECURE` is set on the window, so plaintext stays out
 of screenshots, screen recordings and the recents thumbnail.
 
+## Deploying
+
+Not a build step, but the one thing people ask after cloning:
+
+```bash
+cd deploy
+cp .env.example .env && $EDITOR .env    # set VEIL_DOMAIN
+./up.sh
+```
+
+[Deploying](../deploy/README.md) explains why TLS is mandatory rather than
+recommended: a browser does not expose `crypto.subtle` on an insecure origin, so
+the web client refuses to generate keys over plain http. It does not degrade —
+it declines to start.
+
 ## Tests
 
 Five suites, none of which needs a device.
