@@ -10,6 +10,7 @@
 #include <string>
 
 #include "veil/common.h"
+#include "veil/group.h"
 #include "veil/keys.h"
 #include "veil/ratchet.h"
 
@@ -298,6 +299,103 @@ private:
     // that has never linked a second device.
     std::string accountLabel(const std::string& user_id) const;
 
+public:
+    // ---- Groups ---------------------------------------------------------
+    //
+    // Sender Keys. Each member publishes a chain of their own and broadcasts one
+    // message encrypted with it; the others advance their copy of that sender's
+    // chain. A group message therefore costs one frame, not N-1.
+    //
+    // The cost is stated rather than hidden: everyone in the group holds the key
+    // to every message, so removing a member *must* rotate every chain. That is
+    // what `epoch` is for, and why membership changes invalidate the group until
+    // the rotation has happened.
+    //
+    // See docs/group.md.
+
+    // Creates a group with this device's user as founder and sole member.
+    bool createGroup(const std::string& group_id);
+
+    // Adds or removes a member and bumps the epoch.
+    //
+    // Returns the new epoch, or 0 on failure. Every live chain is discarded:
+    // a member who was removed must not be able to read anything after this
+    // point, and the only way to guarantee that is to re-key.
+    uint32_t setGroupMembers(const std::string& group_id,
+                             const std::vector<std::string>& members);
+
+    // The membership record, signed by the founder, ready to hand to members.
+    //
+    // A member who receives this can verify that the list came from the person
+    // who founded the group, which is what stops a relay from silently adding a
+    // device or a stranger.
+    Bytes exportMembership(const std::string& group_id) const;
+
+    // Adopts a signed membership record.
+    //
+    // `founder_sign_pub` is the key the group is anchored to. Once a group has
+    // been adopted, a record for the same group must carry the same founder key
+    // or it is refused: re-anchoring a group is indistinguishable from a relay
+    // handing over a different group under the same name.
+    Result adoptMembership(const uint8_t* data, size_t size,
+                           const uint8_t founder_sign_pub[32]);
+
+    // The epoch currently held for a group; 0 when unknown.
+    uint32_t groupEpoch(const std::string& group_id) const;
+
+    // The members currently held for a group.
+    std::vector<std::string> groupMembers(const std::string& group_id) const;
+
+    // Whether this engine is a member of the group.
+    bool isGroupMember(const std::string& group_id) const;
+
+    // Publishes this sender's chain for the group's current epoch.
+    //
+    // The result is meant to travel inside pairwise sessions, one per member. It
+    // is authenticated with this device's identity signing key so a relay
+    // forwarding it cannot substitute a chain of its own.
+    Bytes exportSenderKey(const std::string& group_id, uint32_t epoch) const;
+
+    // Installs a peer's chain, as received over a pairwise session.
+    //
+    // Refuses a chain for an epoch at or below one already held from that
+    // sender: a member who was rotated out must not be able to re-publish their
+    // old chain and have it accepted.
+    Result adoptSenderKey(const uint8_t* data, size_t size,
+                          const std::string& expected_sender,
+                          const uint8_t sender_sign_pub[32]);
+
+    // Encrypts one message for the whole group.
+    //
+    // Requires a live sending chain for the current epoch; a group whose
+    // membership just changed has none until the rotation is published, which is
+    // the point.
+    bool encryptToGroup(const std::string& group_id,
+                        const uint8_t* plain, size_t size,
+                        GroupMessage& out);
+
+    // Decrypts a message from one member.
+    Result decryptFromGroup(const std::string& group_id,
+                            const GroupMessage& message,
+                            Bytes& out);
+
+private:
+    struct GroupState {
+        GroupMembership membership;
+        bool has_founder_key = false;
+        std::array<uint8_t, 32> founder_sign_pub{};
+
+        // Our own sending chain, absent until we publish one for this epoch.
+        GroupChain outgoing;
+        bool has_outgoing = false;
+
+        // Everyone else's chains, by sender user id.
+        std::map<std::string, GroupChain> incoming;
+    };
+
+    // Rotates the sending chain for a new epoch, deriving a fresh chain key.
+    bool rotateGroupChain(const std::string& group_id, GroupState& state);
+
     Identity identity_;
     PreKeys prekeys_;
     std::map<std::string, Session> sessions_;
@@ -328,6 +426,8 @@ private:
         std::vector<DeviceCredential> devices;
     };
     std::map<std::string, PeerDevices> peer_devices_;
+
+    std::map<std::string, GroupState> groups_;
 };
 
 }  // namespace veil

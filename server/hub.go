@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -170,13 +170,23 @@ func (h *Hub) sessions(userID string) []*client {
 // The id is 8 bytes now, not 4. It used to be the SQLite rowid truncated to
 // u32, which overflows at 2^32 across all recipients and made an
 // acknowledgement able to delete the wrong entry once it wrapped.
-func (h *Hub) deliver(recipient, sender string, body []byte) (bool, error) {
+// deliver pushes body to the recipient, queueing it when nobody is connected.
+//
+// `deviceID` is the device the frame is encrypted to. Empty means "the whole
+// account", which is what a single-device peer and a client that has not
+// fetched a device list send. See sessionsFor for why the distinction matters.
+func (h *Hub) deliver(recipient, deviceID, sender string, body []byte) (bool, error) {
 	var stored writer
 	stored.str(sender)
 	stored.blob(body)
 	payload := stored.bytes()
 
-	targets := h.sessions(recipient)
+	// A frame addressed to a device only reaches that device. An empty device id
+	// means the sender does not know the recipient's devices 鈥?a single-device
+	// account, or a client that has not fetched the list 鈥?and is delivered to
+	// every connection of the user, which is the behaviour that existed before
+	// device addressing.
+	targets := h.sessionsFor(recipient, deviceID)
 	if len(targets) == 0 {
 		seq, err := h.store.Seq(recipient)
 		if err != nil {
@@ -185,7 +195,7 @@ func (h *Hub) deliver(recipient, sender string, body []byte) (bool, error) {
 		if err := h.enforceCeiling(recipient); err != nil {
 			return false, err
 		}
-		return false, h.store.Enqueue(recipient, sender, seq, payload)
+		return false, h.store.EnqueueDevice(recipient, deviceID, sender, seq, payload)
 	}
 
 	var live writer
@@ -207,9 +217,32 @@ func (h *Hub) deliver(recipient, sender string, body []byte) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		return false, h.store.Enqueue(recipient, sender, seq, payload)
+		return false, h.store.EnqueueDevice(recipient, deviceID, sender, seq, payload)
 	}
 	return true, nil
+}
+
+// sessionsFor returns the connections of `recipient` that may receive a frame
+// addressed to `deviceID`.
+//
+// An empty deviceID matches every connection, which is how a single-device
+// account and a not-yet-upgraded client keep working. A non-empty one matches
+// only connections that authenticated as that device: a fan-out frame is
+// encrypted to one device's ratchet, so handing it to a sibling would produce an
+// authentication failure on a message that was never meant for it.
+func (h *Hub) sessionsFor(recipient, deviceID string) []*client {
+	all := h.sessions(recipient)
+	if deviceID == "" {
+		return all
+	}
+
+	out := make([]*client, 0, 1)
+	for _, c := range all {
+		if c.deviceID == deviceID {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // enforceCeiling keeps one recipient's backlog inside the per-user limit by
@@ -232,7 +265,7 @@ func (h *Hub) enforceCeiling(recipient string) error {
 // the first page stranded until the next reconnect, with the UI showing an
 // empty conversation and no indication that more was waiting.
 func (h *Hub) flush(c *client, afterID uint64) (uint64, error) {
-	pending, err := h.store.Drain(c.userID, afterID, flushPageSize)
+	pending, err := h.store.DrainForDevice(c.userID, c.deviceID, afterID, flushPageSize)
 	if err != nil {
 		return afterID, err
 	}
@@ -418,6 +451,16 @@ type client struct {
 	conn *websocket.Conn
 
 	userID  string
+	// The device this connection speaks for, as hex. Empty means the client did
+	// not present one: a relay that predates device addressing, or a
+	// single-device account whose frames are addressed by the bare user id.
+	//
+	// A connection may only receive frames addressed to its own device. That is
+	// the whole point: a fan-out frame for device A is encrypted to A's ratchet,
+	// so handing it to device B would not just leak it, it would produce an
+	// authentication failure on a message that was never meant for B.
+	deviceID string
+
 	send    chan []byte
 	closed  chan struct{}
 	closeMu sync.Once
@@ -426,10 +469,11 @@ type client struct {
 	//
 	// The nonce is issued once per connection and dies with it. A client that
 	// never answers is disconnected rather than left holding it.
-	challenge         []byte
+challenge         []byte
 	challengeSeen     bool
 	authed            bool
 	pendingUserID     string
+	pendingDeviceID   string
 	pendingIdentity   []byte
 
 	// ---- outbox replay cursor ----
@@ -625,7 +669,7 @@ func (c *client) handle(data []byte) error {
 
 // handlePublishDevices stores an account's device list.
 //
-// The relay cannot verify any signature in here — it has no account key — and
+// The relay cannot verify any signature in here 鈥?it has no account key 鈥?and
 // does not try. What it enforces is that the list is *whole*: a device id that
 // does not appear in the new set is removed, and the version moves forward so a
 // peer holding an older copy can tell it is stale.
@@ -785,6 +829,22 @@ func (c *client) handleHello(payload []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// The device id is optional and comes last, so a client that predates
+	// device addressing 鈥?or one whose account has never linked a second
+	// device 鈥?sends the same bytes it always did. Checking `remaining` rather
+	// than requiring the field is what keeps the old shape working.
+	deviceID := ""
+	if r.remaining() > 0 {
+		deviceID, err = r.str()
+		if err != nil {
+			return err
+		}
+		if deviceID == "" || len(deviceID) > 128 {
+			return errBadDeviceID
+		}
+	}
+
 	if !r.done() {
 		return errTruncated
 	}
@@ -802,6 +862,7 @@ func (c *client) handleHello(payload []byte) error {
 	c.challenge = nonce
 	c.challengeSeen = true
 	c.pendingUserID = userID
+	c.pendingDeviceID = deviceID
 	c.pendingIdentity = append([]byte(nil), identity...)
 
 	// Deadline is per-read; the client only has to beat authTimeout overall,
@@ -857,14 +918,19 @@ func (c *client) handleAuthResponse(payload []byte) error {
 	c.challenge = nil
 	c.authed = true
 	c.userID = c.pendingUserID
+	c.deviceID = c.pendingDeviceID
 	c.pendingUserID = ""
+	c.pendingDeviceID = ""
 	c.pendingIdentity = nil
 
 	c.hub.attach(c)
-	c.hub.log.Info("connected", "user", c.userID)
+	c.hub.log.Info("connected", "user", c.userID, "device", c.deviceID)
 
+	// HELLO_OK echoes the device id the relay bound, so a client can tell what
+	// the relay thinks it is talking to rather than assuming.
 	var w writer
 	w.str(c.userID)
+	w.str(c.deviceID)
 	env, err := frame(typeHelloOK, w.bytes())
 	if err != nil {
 		return err
@@ -989,6 +1055,21 @@ func (c *client) handleSend(payload []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// The target device is optional and comes last, so a frame from a client
+	// that does not know the recipient's devices has exactly the shape it had
+	// before. A SEND that names a device reaches only that device.
+	deviceID := ""
+	if r.remaining() > 0 {
+		deviceID, err = r.str()
+		if err != nil {
+			return err
+		}
+		if len(deviceID) > 128 {
+			return errBadDeviceID
+		}
+	}
+
 	if !r.done() {
 		return errTruncated
 	}
@@ -1004,7 +1085,7 @@ func (c *client) handleSend(payload []byte) error {
 		return errRateLimited
 	}
 
-	_, err = c.hub.deliver(recipient, c.userID, body)
+	_, err = c.hub.deliver(recipient, deviceID, c.userID, body)
 	if err == nil {
 		c.hub.statAccepted.Add(1)
 	}

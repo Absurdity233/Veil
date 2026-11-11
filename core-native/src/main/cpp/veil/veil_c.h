@@ -305,6 +305,69 @@ VEIL_API int veil_encrypt_to_account(void* handle, const char* user_id,
                                      const uint8_t* plain, size_t plain_size,
                                      uint8_t* out, size_t out_size);
 
+// ---- Groups ------------------------------------------------------------
+//
+// Sender Keys. Each member publishes a chain of their own and broadcasts one
+// message encrypted with it, so a group message costs one frame rather than N-1.
+//
+// The cost, stated: everyone in the group holds the key to every message, so
+// removing a member *must* rotate every chain. That is what the epoch is for.
+// See docs/group.md.
+
+// Creates a group with this device's user as founder and sole member.
+VEIL_API int veil_create_group(void* handle, const char* group_id);
+
+// Replaces the member list and bumps the epoch. Returns the new epoch, or 0.
+//
+// Every live chain is discarded: a member who was removed must not read anything
+// after this point, and re-keying is the only way to guarantee that.
+VEIL_API uint32_t veil_set_group_members(void* handle, const char* group_id,
+                                         const uint8_t* members, size_t members_size);
+
+// The membership record, signed by the founder. `out` may be NULL for the size.
+VEIL_API int veil_export_membership(const void* handle, const char* group_id,
+                                    uint8_t* out, size_t out_size);
+
+// Adopts a signed membership record against the founder's signing key.
+//
+// Once adopted, a record for the same group must carry the same founder key: a
+// record that re-anchors the group is indistinguishable from a relay handing
+// over a different group under the same name.
+VEIL_API int veil_adopt_membership(void* handle, const uint8_t* data, size_t size,
+                                   const uint8_t* founder_sign_pub);
+
+VEIL_API uint32_t veil_group_epoch(const void* handle, const char* group_id);
+
+// Fills `out` with the members, NUL-separated. NULL for the size.
+VEIL_API int veil_group_members(const void* handle, const char* group_id,
+                                char* out, size_t out_size);
+
+// 1 when this engine is a member, 0 when not, negative on error.
+VEIL_API int veil_is_group_member(const void* handle, const char* group_id);
+
+// This device's chain for the group's current epoch, signed by its device key.
+VEIL_API int veil_export_sender_key(const void* handle, const char* group_id,
+                                    uint32_t epoch, uint8_t* out, size_t out_size);
+
+// Installs a peer's chain. Refuses a chain for an epoch at or below one already
+// held from that sender, which is what stops a rotated-out member re-publishing.
+VEIL_API int veil_adopt_sender_key(void* handle, const uint8_t* data, size_t size,
+                                   const char* expected_sender,
+                                   const uint8_t* sender_sign_pub);
+
+// Encrypts one message for the whole group.
+//
+// Output record: [2] sender len | sender | [4] epoch | [4] iteration
+//                 | [4] ciphertext len | ciphertext
+VEIL_API int veil_encrypt_to_group(void* handle, const char* group_id,
+                                   const uint8_t* plain, size_t plain_size,
+                                   uint8_t* out, size_t out_size);
+
+// Decrypts a group message in that same record shape.
+VEIL_API int veil_decrypt_from_group(void* handle, const char* group_id,
+                                     const uint8_t* data, size_t size,
+                                     uint8_t* out, size_t out_size, size_t* out_len);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

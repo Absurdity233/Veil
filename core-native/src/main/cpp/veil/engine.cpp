@@ -728,4 +728,344 @@ std::vector<Engine::DeviceFrame> Engine::encryptToAccount(const std::string& use
     return out;
 }
 
+// ---- Groups ------------------------------------------------------------
+
+bool Engine::createGroup(const std::string& group_id) {
+    if (group_id.empty() || group_id.size() > 128) return false;
+    if (groups_.find(group_id) != groups_.end()) return false;
+    if (user_id_.empty()) return false;  // a group needs a founder
+
+    GroupState state;
+    state.membership.group_id = group_id;
+    state.membership.founder = user_id_;
+    state.membership.epoch = 1;
+    state.membership.members = {user_id_};
+
+    const Bytes payload = state.membership.signedPayload();
+    crypto::ed25519_sign(state.membership.signature, identity_.sign_priv,
+                         payload.data(), payload.size());
+
+    groups_[group_id] = std::move(state);
+    return true;
+}
+
+bool Engine::rotateGroupChain(const std::string& group_id, GroupState& state) {
+    // A fresh chain key per epoch, derived from the identity secret and the
+    // group/epoch pair so it is reproducible for this device and unforgeable for
+    // anybody else.
+    //
+    // A removed member holds the previous chain key but not this derivation
+    // input, which is what makes rotation actually cut them off.
+    uint8_t seed[32];
+    const std::string material = "Veil/group-epoch/v1|" + group_id + "|" +
+                                 std::to_string(state.membership.epoch);
+    crypto::hkdf(seed, sizeof(seed),
+                 identity_.dh_priv, kKeySize,
+                 reinterpret_cast<const uint8_t*>(material.data()), material.size(),
+                 nullptr, 0);
+
+    state.outgoing.epoch = state.membership.epoch;
+    state.outgoing.iteration = 0;
+    std::memcpy(state.outgoing.chain_key.data(), seed, 32);
+    state.outgoing.skipped.clear();
+    state.has_outgoing = true;
+
+    veil::wipe(seed, sizeof(seed));
+    return true;
+}
+
+uint32_t Engine::setGroupMembers(const std::string& group_id,
+                                 const std::vector<std::string>& members) {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) return 0;
+    if (members.empty()) return 0;
+
+    // Only the founder may change the list, because only the founder can produce
+    // a signature the others will accept.
+    if (it->second.membership.founder != user_id_) return 0;
+
+    GroupState& state = it->second;
+    state.membership.members = members;
+    state.membership.epoch += 1;
+
+    const Bytes payload = state.membership.signedPayload();
+    crypto::ed25519_sign(state.membership.signature, identity_.sign_priv,
+                         payload.data(), payload.size());
+
+    // Every chain is discarded, including our own: the epoch moved, and a chain
+    // from the old epoch is readable by whoever was just removed.
+    state.has_outgoing = false;
+    state.outgoing = GroupChain{};
+    state.incoming.clear();
+
+    rotateGroupChain(group_id, state);
+    return state.membership.epoch;
+}
+
+uint32_t Engine::groupEpoch(const std::string& group_id) const {
+    auto it = groups_.find(group_id);
+    return it == groups_.end() ? 0 : it->second.membership.epoch;
+}
+
+std::vector<std::string> Engine::groupMembers(const std::string& group_id) const {
+    auto it = groups_.find(group_id);
+    return it == groups_.end() ? std::vector<std::string>{}
+                               : it->second.membership.members;
+}
+
+bool Engine::isGroupMember(const std::string& group_id) const {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) return false;
+    const auto& members = it->second.membership.members;
+    return std::find(members.begin(), members.end(), user_id_) != members.end();
+}
+
+Bytes Engine::exportMembership(const std::string& group_id) const {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) return {};
+    return it->second.membership.signedPayload();
+}
+
+Engine::Result Engine::adoptMembership(const uint8_t* data, size_t size,
+                                       const uint8_t founder_sign_pub[32]) {
+    if (data == nullptr || size < 8) return Result::BadBundle;
+
+    // Parse the payload the founder signed.
+    //
+    // The layout mirrors GroupMembership::signedPayload(), and is parsed here
+    // rather than in a free function because the result has to be checked
+    // against state this engine holds.
+    size_t off = 0;
+    const char domain[] = "Veil/group-membership/v1";
+    const size_t domain_len = sizeof(domain) - 1;
+    if (size < domain_len + 8) return Result::BadBundle;
+    if (std::memcmp(data, domain, domain_len) != 0) return Result::BadBundle;
+    off += domain_len;
+
+    auto readString = [&](std::string& out) -> bool {
+        if (size - off < 2) return false;
+        const size_t len = (static_cast<size_t>(data[off]) << 8) | data[off + 1];
+        off += 2;
+        if (size - off < len) return false;
+        out.assign(reinterpret_cast<const char*>(data + off), len);
+        off += len;
+        return true;
+    };
+
+    GroupMembership parsed;
+    if (!readString(parsed.group_id)) return Result::BadBundle;
+    if (!readString(parsed.founder)) return Result::BadBundle;
+    if (size - off < 4) return Result::BadBundle;
+    parsed.epoch = get_u32(data + off); off += 4;
+    if (parsed.epoch == 0) return Result::BadBundle;
+
+    if (size - off < 4) return Result::BadBundle;
+    const uint32_t count = get_u32(data + off); off += 4;
+    if (count == 0 || count > 256) return Result::BadBundle;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string member;
+        if (!readString(member)) return Result::BadBundle;
+        parsed.members.push_back(member);
+    }
+
+    // The founder is the authority on who is in the group. A record claiming a
+    // different founder than one already held is a different group wearing the
+    // same name.
+    auto existing = groups_.find(parsed.group_id);
+    if (existing != groups_.end() && existing->second.has_founder_key) {
+        if (!constant_time_equal(existing->second.founder_sign_pub.data(),
+                                 founder_sign_pub, 32)) {
+            return Result::IdentityChanged;
+        }
+        // Rolling back to an epoch that still contains a removed member is the
+        // one attack a version guard stops cheaply.
+        if (parsed.epoch <= existing->second.membership.epoch) {
+            return Result::Ok;  // stale, not an error
+        }
+    }
+
+    GroupState state;
+    state.membership = parsed;
+    state.has_founder_key = true;
+    std::memcpy(state.founder_sign_pub.data(), founder_sign_pub, 32);
+    groups_[parsed.group_id] = std::move(state);
+    return Result::Ok;
+}
+
+Bytes Engine::exportSenderKey(const std::string& group_id, uint32_t epoch) const {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end() || !it->second.has_outgoing) return {};
+    if (epoch != 0 && epoch != it->second.membership.epoch) return {};
+
+    const GroupChain& chain = it->second.outgoing;
+
+    Bytes out;
+    out.reserve(2 + user_id_.size() + 4 + 4 + 32 + kSigSize);
+
+    out.push_back(static_cast<uint8_t>((user_id_.size() >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>(user_id_.size() & 0xFF));
+    out.insert(out.end(), user_id_.begin(), user_id_.end());
+
+    uint8_t num[4];
+    put_u32(num, chain.epoch);
+    out.insert(out.end(), num, num + 4);
+    put_u32(num, chain.iteration);
+    out.insert(out.end(), num, num + 4);
+    out.insert(out.end(), chain.chain_key.begin(), chain.chain_key.end());
+
+    // Signed with this device's key, so a relay forwarding the chain cannot
+    // substitute one of its own.
+    const uint8_t* sign_key = has_device_keys_ ? device_sign_priv_ : identity_.sign_priv;
+    uint8_t sig[kSigSize];
+    crypto::ed25519_sign(sig, sign_key, out.data(), out.size());
+    out.insert(out.end(), sig, sig + kSigSize);
+    veil::wipe(sig, sizeof(sig));
+    return out;
+}
+
+Engine::Result Engine::adoptSenderKey(const uint8_t* data, size_t size,
+                                      const std::string& expected_sender,
+                                      const uint8_t sender_sign_pub[32]) {
+    if (data == nullptr || size < 2 + 8 + 32 + kSigSize) return Result::BadBundle;
+
+    size_t off = 0;
+    const size_t id_len = (static_cast<size_t>(data[off]) << 8) | data[off + 1];
+    off += 2;
+    if (id_len == 0 || size - off < id_len + 8 + 32 + kSigSize) return Result::BadBundle;
+
+    const std::string sender(reinterpret_cast<const char*>(data + off), id_len);
+    off += id_len;
+
+    if (sender != expected_sender) return Result::IdentityChanged;
+
+    const uint32_t epoch = get_u32(data + off); off += 4;
+    const uint32_t iteration = get_u32(data + off); off += 4;
+
+    std::array<uint8_t, 32> chain_key{};
+    std::memcpy(chain_key.data(), data + off, 32); off += 32;
+
+    // The signature covers everything before it.
+    const size_t signed_len = off;
+    if (!crypto::ed25519_verify(data + off, sender_sign_pub, data, signed_len)) {
+        veil::wipe(chain_key.data(), chain_key.size());
+        return Result::BadSignature;
+    }
+
+    // A chain for an epoch at or below one already held from this sender is a
+    // re-publish of an older chain, which is what a rotated-out member would
+    // try. Refuse it.
+    for (auto& [group_id, state] : groups_) {
+        auto incoming = state.incoming.find(sender);
+        if (incoming == state.incoming.end()) continue;
+        if (incoming->second.epoch >= epoch) return Result::Duplicate;
+    }
+
+    // Install into every group where this sender is a member. A sender key is
+    // per membership, and the caller does not have to name the group because the
+    // epoch and the member list already pin it down.
+    bool installed = false;
+    for (auto& [group_id, state] : groups_) {
+        const auto& members = state.membership.members;
+        if (std::find(members.begin(), members.end(), sender) == members.end()) continue;
+        if (state.membership.epoch != epoch) continue;
+
+        GroupChain chain;
+        chain.epoch = epoch;
+        chain.iteration = iteration;
+        chain.chain_key = chain_key;
+        state.incoming[sender] = chain;
+        installed = true;
+    }
+
+    veil::wipe(chain_key.data(), chain_key.size());
+    return installed ? Result::Ok : Result::NoSession;
+}
+
+bool Engine::encryptToGroup(const std::string& group_id,
+                            const uint8_t* plain, size_t size,
+                            GroupMessage& out) {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end() || !it->second.has_outgoing) return false;
+    if (!isGroupMember(group_id)) return false;
+
+    GroupState& state = it->second;
+    if (state.outgoing.epoch != state.membership.epoch) return false;
+
+    // One key per message, advanced on the sending chain.
+    std::array<uint8_t, 32> message_key{};
+    std::array<uint8_t, 32> next_chain{};
+    groupChainStep(state.outgoing.chain_key, next_chain, message_key);
+
+    const uint32_t iteration = state.outgoing.iteration;
+    state.outgoing.chain_key = next_chain;
+    state.outgoing.iteration += 1;
+
+    uint8_t enc_key[32];
+    uint8_t nonce[kNonceSize];
+    groupMessageMaterial(message_key, enc_key, nonce);
+
+    const Bytes aad = groupAssociatedData(user_id_, state.membership.epoch, iteration);
+
+    out.sender_id = user_id_;
+    out.epoch = state.membership.epoch;
+    out.iteration = iteration;
+    out.ciphertext.assign(size + kMacSize, 0);
+
+    crypto::aead_encrypt(out.ciphertext.data(), out.ciphertext.data() + size,
+                         enc_key, nonce, aad.data(), aad.size(), plain, size);
+
+    veil::wipe(message_key.data(), message_key.size());
+    veil::wipe(enc_key, sizeof(enc_key));
+    veil::wipe(nonce, sizeof(nonce));
+    return true;
+}
+
+Engine::Result Engine::decryptFromGroup(const std::string& group_id,
+                                        const GroupMessage& message,
+                                        Bytes& out) {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) return Result::NoSession;
+
+    GroupState& state = it->second;
+
+    if (message.epoch != state.membership.epoch) {
+        // A message from an epoch we have moved past is unreadable by design:
+        // the sender was rotated out, or we were.
+        return Result::Duplicate;
+    }
+
+    auto chain_it = state.incoming.find(message.sender_id);
+    if (chain_it == state.incoming.end()) return Result::NoSession;
+
+    std::array<uint8_t, 32> message_key{};
+    if (!chain_it->second.keyFor(message.iteration, message_key)) {
+        return Result::Duplicate;
+    }
+
+    uint8_t enc_key[32];
+    uint8_t nonce[kNonceSize];
+    groupMessageMaterial(message_key, enc_key, nonce);
+
+    const Bytes aad = groupAssociatedData(message.sender_id, message.epoch,
+                                          message.iteration);
+
+    const size_t text_size = message.ciphertext.size() - kMacSize;
+    Bytes plain(text_size);
+
+    const bool ok = crypto::aead_decrypt(plain.data(),
+                                         message.ciphertext.data() + text_size,
+                                         enc_key, nonce,
+                                         aad.data(), aad.size(),
+                                         message.ciphertext.data(), text_size);
+
+    veil::wipe(message_key.data(), message_key.size());
+    veil::wipe(enc_key, sizeof(enc_key));
+    veil::wipe(nonce, sizeof(nonce));
+
+    if (!ok) return Result::AuthFailed;
+    out = std::move(plain);
+    return Result::Ok;
+}
+
 }  // namespace veil

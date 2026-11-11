@@ -1,4 +1,4 @@
-﻿// Veil - C ABI implementation.
+// Veil - C ABI implementation.
 //
 // A thin, careful wrapper. Two things in here deserve attention:
 //
@@ -404,8 +404,249 @@ extern "C" void veil_set_random_source(veil_random_fn fn) {
 
 extern "C" void veil_version(int* major, int* minor, int* patch) {
     if (major != nullptr) *major = 0;
-    if (minor != nullptr) *minor = 3;
+    if (minor != nullptr) *minor = 4;
     if (patch != nullptr) *patch = 0;
+}
+
+// ---- Groups ------------------------------------------------------------
+//
+// The wire shape for a group message is one record:
+//   [2] sender len | sender | [4] epoch | [4] iteration
+//   | [4] ciphertext len | ciphertext
+
+namespace {
+
+// Splits a NUL-separated member list.
+std::vector<std::string> splitMembers(const uint8_t* data, size_t size) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (size_t i = 0; i <= size; ++i) {
+        if (i == size || data[i] == 0) {
+            if (i > start) {
+                out.emplace_back(reinterpret_cast<const char*>(data + start), i - start);
+            }
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+std::string joinMembers(const std::vector<std::string>& members) {
+    std::string out;
+    for (size_t i = 0; i < members.size(); ++i) {
+        if (i != 0) out.push_back('\0');
+        out.append(members[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+extern "C" int veil_create_group(void* handle, const char* group_id) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(group_id, id) || id.empty()) return VEIL_ERR_BAD_PARAM;
+    return engine->createGroup(id) ? VEIL_OK : VEIL_ERR_BAD_PARAM;
+}
+
+extern "C" uint32_t veil_set_group_members(void* handle, const char* group_id,
+                                           const uint8_t* members, size_t members_size) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr || members == nullptr) return 0;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return 0;
+
+    const std::vector<std::string> parsed = splitMembers(members, members_size);
+    return engine->setGroupMembers(id, parsed);
+}
+
+extern "C" int veil_export_membership(const void* handle, const char* group_id,
+                                      uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    int written = 0;
+    const veil::Bytes blob = engine->exportMembership(id);
+    if (blob.empty()) return VEIL_NO_SESSION;
+
+    const int status = copyOut(blob, out, out_size, &written);
+    return status == VEIL_OK ? written : status;
+}
+
+extern "C" int veil_adopt_membership(void* handle, const uint8_t* data, size_t size,
+                                     const uint8_t* founder_sign_pub) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (data == nullptr || founder_sign_pub == nullptr) return VEIL_ERR_NULL_ARG;
+
+    return static_cast<int>(engine->adoptMembership(data, size, founder_sign_pub));
+}
+
+extern "C" uint32_t veil_group_epoch(const void* handle, const char* group_id) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return 0;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return 0;
+    return engine->groupEpoch(id);
+}
+
+extern "C" int veil_group_members(const void* handle, const char* group_id,
+                                  char* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    const std::string joined = joinMembers(engine->groupMembers(id));
+
+    if (out == nullptr) return static_cast<int>(joined.size());
+    if (joined.size() > out_size) return VEIL_ERR_BUFFER_TOO_SMALL;
+
+    if (!joined.empty()) std::memcpy(out, joined.data(), joined.size());
+    return static_cast<int>(joined.size());
+}
+
+extern "C" int veil_is_group_member(const void* handle, const char* group_id) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return VEIL_ERR_BAD_PARAM;
+    return engine->isGroupMember(id) ? 1 : 0;
+}
+
+extern "C" int veil_export_sender_key(const void* handle, const char* group_id,
+                                      uint32_t epoch, uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    int written = 0;
+    veil::Bytes key = engine->exportSenderKey(id, epoch);
+    if (key.empty()) return VEIL_NO_SESSION;
+
+    const int status = copyOut(key, out, out_size, &written);
+    veil::wipe(key);
+    return status == VEIL_OK ? written : status;
+}
+
+extern "C" int veil_adopt_sender_key(void* handle, const uint8_t* data, size_t size,
+                                     const char* expected_sender,
+                                     const uint8_t* sender_sign_pub) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (data == nullptr || sender_sign_pub == nullptr) return VEIL_ERR_NULL_ARG;
+
+    std::string sender;
+    if (!readPeer(expected_sender, sender)) return VEIL_ERR_BAD_PARAM;
+
+    return static_cast<int>(engine->adoptSenderKey(data, size, sender, sender_sign_pub));
+}
+
+extern "C" int veil_encrypt_to_group(void* handle, const char* group_id,
+                                     const uint8_t* plain, size_t plain_size,
+                                     uint8_t* out, size_t out_size) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (plain == nullptr && plain_size != 0) return VEIL_ERR_NULL_ARG;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    veil::GroupMessage message;
+    if (!engine->encryptToGroup(id, plain, plain_size, message)) return VEIL_NO_SESSION;
+
+    const size_t total = 2 + message.sender_id.size() + 4 + 4 + 4 +
+                         message.ciphertext.size();
+
+    if (out == nullptr) return static_cast<int>(total);
+    if (total > out_size) return VEIL_ERR_BUFFER_TOO_SMALL;
+
+    size_t off = 0;
+    out[off++] = static_cast<uint8_t>((message.sender_id.size() >> 8) & 0xFF);
+    out[off++] = static_cast<uint8_t>(message.sender_id.size() & 0xFF);
+    std::memcpy(out + off, message.sender_id.data(), message.sender_id.size());
+    off += message.sender_id.size();
+
+    uint8_t num[4];
+    veil::put_u32(num, message.epoch);
+    std::memcpy(out + off, num, 4);
+    off += 4;
+    veil::put_u32(num, message.iteration);
+    std::memcpy(out + off, num, 4);
+    off += 4;
+    veil::put_u32(num, static_cast<uint32_t>(message.ciphertext.size()));
+    std::memcpy(out + off, num, 4);
+    off += 4;
+
+    std::memcpy(out + off, message.ciphertext.data(), message.ciphertext.size());
+    off += message.ciphertext.size();
+
+    return static_cast<int>(total);
+}
+
+extern "C" int veil_decrypt_from_group(void* handle, const char* group_id,
+                                       const uint8_t* data, size_t size,
+                                       uint8_t* out, size_t out_size, size_t* out_len) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (data == nullptr || size < 2 || out_len == nullptr) return VEIL_ERR_NULL_ARG;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    size_t off = 0;
+    const size_t sender_len = (static_cast<size_t>(data[off]) << 8) | data[off + 1];
+    off += 2;
+    if (size - off < sender_len + 12) return VEIL_ERR_BAD_PARAM;
+
+    veil::GroupMessage message;
+    message.sender_id.assign(reinterpret_cast<const char*>(data + off), sender_len);
+    off += sender_len;
+
+    message.epoch = veil::get_u32(data + off); off += 4;
+    message.iteration = veil::get_u32(data + off); off += 4;
+    const uint32_t cipher_len = veil::get_u32(data + off); off += 4;
+    if (size - off < cipher_len) return VEIL_ERR_BAD_PARAM;
+
+    message.ciphertext.assign(data + off, data + off + cipher_len);
+
+    veil::Bytes plain;
+    const veil::Engine::Result result = engine->decryptFromGroup(id, message, plain);
+    if (result != veil::Engine::Result::Ok) {
+        veil::wipe(plain);
+        *out_len = 0;
+        return static_cast<int>(result);
+    }
+
+    // The plaintext is always smaller than the ciphertext, so a caller sizing
+    // from the frame is safe - and asking for a probe must not consume the key,
+    // which is why the bound is reported rather than computed.
+    if (out == nullptr) {
+        *out_len = size;
+        veil::wipe(plain);
+        return VEIL_OK;
+    }
+    if (out_size < plain.size()) {
+        veil::wipe(plain);
+        *out_len = plain.size();
+        return VEIL_ERR_BUFFER_TOO_SMALL;
+    }
+
+    if (!plain.empty()) std::memcpy(out, plain.data(), plain.size());
+    *out_len = plain.size();
+    veil::wipe(plain);
+    return VEIL_OK;
 }
 
 // ---- Multi-device ------------------------------------------------------

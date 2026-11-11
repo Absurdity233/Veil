@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS prekeys (
 CREATE TABLE IF NOT EXISTS outbox (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     recipient   TEXT NOT NULL,
+    -- The device this frame is encrypted to. Empty means "whatever device
+    -- collects it", which is what a single-device account still uses.
+    device_id   TEXT NOT NULL DEFAULT '',
     sender      TEXT NOT NULL,
     seq         INTEGER NOT NULL,
     payload     BLOB NOT NULL,
@@ -149,6 +152,7 @@ func (s *Store) ensureSeqColumn() error {
 		return err
 	}
 	hasSeq := false
+	hasDevice := false
 	for rows.Next() {
 		var (
 			cid     int
@@ -162,14 +166,28 @@ func (s *Store) ensureSeqColumn() error {
 			rows.Close()
 			return err
 		}
-		if name == "seq" {
+		switch name {
+		case "seq":
 			hasSeq = true
+		case "device_id":
+			hasDevice = true
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
+
+	// The device column arrived with device addressing. Existing rows get an
+	// empty value, which means "any device of that recipient" — the behaviour
+	// they had before, so an upgraded relay still delivers an old backlog.
+	if !hasDevice {
+		if _, err := s.db.Exec(
+			`ALTER TABLE outbox ADD COLUMN device_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+
 	if hasSeq {
 		return nil
 	}
@@ -305,20 +323,49 @@ ON CONFLICT(recipient) DO UPDATE SET last_seq = excluded.last_seq`,
 // Enqueue stores a frame for a recipient that is not connected, under an
 // explicit per-recipient sequence number so the id the client sees is the one
 // it will acknowledge.
+//
+// `deviceID` scopes the frame to one device; empty leaves it collectable by any
+// connection of that recipient.
 func (s *Store) Enqueue(recipient, sender string, seq uint64, payload []byte) error {
+	return s.EnqueueDevice(recipient, "", sender, seq, payload)
+}
+
+// EnqueueDevice is Enqueue with an explicit target device.
+func (s *Store) EnqueueDevice(recipient, deviceID, sender string, seq uint64, payload []byte) error {
 	_, err := s.db.Exec(
-		`INSERT INTO outbox(recipient, sender, seq, payload, created_at)
-		 VALUES(?,?,?,?,strftime('%s','now'))`,
-		recipient, sender, int64(seq), payload)
+		`INSERT INTO outbox(recipient, device_id, sender, seq, payload, created_at)
+		 VALUES(?,?,?,?,?,strftime('%s','now'))`,
+		recipient, deviceID, sender, int64(seq), payload)
 	return err
 }
 
 // Drain returns everything queued for recipient with seq greater than afterSeq.
+//
+// `deviceID` restricts the page to frames addressed to that device plus frames
+// addressed to nobody, which is what a single-device account stores. A frame
+// addressed to a different device is *not* returned: it is encrypted to that
+// device's ratchet and would fail to decrypt here.
 func (s *Store) Drain(recipient string, afterSeq uint64, limit int) ([]storedMessage, error) {
-	rows, err := s.db.Query(
-		`SELECT seq, sender, payload FROM outbox
-		 WHERE recipient = ? AND seq > ? ORDER BY seq LIMIT ?`,
-		recipient, int64(afterSeq), limit)
+	return s.DrainForDevice(recipient, "", afterSeq, limit)
+}
+
+// DrainForDevice is Drain with an explicit device filter.
+func (s *Store) DrainForDevice(recipient, deviceID string, afterSeq uint64, limit int) ([]storedMessage, error) {
+	var rows *sql.Rows
+	var err error
+
+	if deviceID == "" {
+		rows, err = s.db.Query(
+			`SELECT seq, sender, payload FROM outbox
+			 WHERE recipient = ? AND seq > ? ORDER BY seq LIMIT ?`,
+			recipient, int64(afterSeq), limit)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT seq, sender, payload FROM outbox
+			 WHERE recipient = ? AND (device_id = ? OR device_id = '')
+			   AND seq > ? ORDER BY seq LIMIT ?`,
+			recipient, deviceID, int64(afterSeq), limit)
+	}
 	if err != nil {
 		return nil, err
 	}

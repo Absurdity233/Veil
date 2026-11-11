@@ -63,7 +63,7 @@ test("the ABI version is reported", async () => {
     mod._veil_version(ptr, ptr + 4, ptr + 8);
     const view = new DataView(mod.HEAPU8.buffer, ptr, 12);
     assert.equal(view.getInt32(0, true), 0);
-    assert.equal(view.getInt32(4, true), 3);
+    assert.equal(view.getInt32(4, true), 4);
     assert.equal(view.getInt32(8, true), 0);
   } finally {
     mod._free(ptr);
@@ -437,6 +437,130 @@ test("multi-device: a fan-out produces one frame per reachable device", async ()
   } finally {
     mod._veil_engine_free(alice);
     mod._veil_engine_free(bob);
+  }
+});
+
+test("groups: one message, one frame, two readers", async () => {
+  const mod = await loadModule();
+  mod._veil_install_web_rng();
+
+  const alice = mod._veil_engine_new();
+  const bob = mod._veil_engine_new();
+  const carol = mod._veil_engine_new();
+
+  try {
+    for (const [h, name] of [[alice, "alice"], [bob, "bob"], [carol, "carol"]]) {
+      const p = writeCString(mod, name);
+      assert.equal(mod._veil_init_device(h, p), 0, `${name} has a device`);
+      mod._free(p);
+    }
+
+    const group = writeCString(mod, "team");
+    try {
+      assert.equal(mod._veil_create_group(alice, group), 0, "alice founds a group");
+
+      // Members travel NUL-separated.
+      const members = new TextEncoder().encode("alice\u0000bob\u0000carol");
+      const mp = mod._malloc(members.length);
+      mod.HEAPU8.set(members, mp);
+      try {
+        assert.equal(mod._veil_set_group_members(alice, group, mp, members.length), 2,
+          "three members lands on epoch 2");
+      } finally {
+        mod._free(mp);
+      }
+
+      assert.equal(mod._veil_group_epoch(alice, group), 2, "the epoch reads back");
+      assert.equal(mod._veil_is_group_member(alice, group), 1, "alice is a member");
+
+      // The member list comes back NUL-separated.
+      const need = mod._veil_group_members(alice, group, 0, 0);
+      assert.equal(need, 15, "three five-letter names joined by NULs");
+    } finally {
+      mod._free(group);
+    }
+  } finally {
+    mod._veil_engine_free(alice);
+    mod._veil_engine_free(bob);
+    mod._veil_engine_free(carol);
+  }
+});
+
+test("groups: a removed member cannot read the next epoch", async () => {
+  const mod = await loadModule();
+  mod._veil_install_web_rng();
+
+  const alice = mod._veil_engine_new();
+  const bob = mod._veil_engine_new();
+  const carol = mod._veil_engine_new();
+
+  try {
+    const names = ["alice", "bob", "carol"];
+    for (const [h, name] of [[alice, names[0]], [bob, names[1]], [carol, names[2]]]) {
+      const p = writeCString(mod, name);
+      mod._veil_init_device(h, p);
+      mod._free(p);
+    }
+
+    const group = writeCString(mod, "team");
+    try {
+      assert.equal(mod._veil_create_group(alice, group), 0);
+
+      const setMembers = (list) => {
+        const bytes = new TextEncoder().encode(list.join("\u0000"));
+        const p = mod._malloc(bytes.length);
+        mod.HEAPU8.set(bytes, p);
+        try {
+          return mod._veil_set_group_members(alice, group, p, bytes.length);
+        } finally {
+          mod._free(p);
+        }
+      };
+
+      assert.equal(setMembers(["alice", "bob", "carol"]), 2);
+
+      // Alice's account key signs the member list.
+      const alicePub = mod._malloc(64);
+      mod._veil_identity_public(alice, alicePub, 64);
+
+      const membershipSize = mod._veil_export_membership(alice, group, 0, 0);
+      const membership = mod._malloc(membershipSize);
+      assert.equal(mod._veil_export_membership(alice, group, membership, membershipSize),
+        membershipSize);
+
+      // Adopt on bob and carol.
+      assert.equal(
+        mod._veil_adopt_membership(bob, membership, membershipSize, alicePub + 32), 0);
+      assert.equal(
+        mod._veil_adopt_membership(carol, membership, membershipSize, alicePub + 32), 0);
+      assert.equal(mod._veil_group_epoch(carol, group), 2, "carol is on epoch 2");
+
+      // Carol is removed. The epoch moves and every chain is discarded.
+      assert.equal(setMembers(["alice", "bob"]), 3, "removal bumps the epoch to 3");
+      assert.equal(mod._veil_group_epoch(alice, group), 3);
+
+      // Carol is still on the old epoch, which is exactly why she cannot read
+      // anything from here on.
+      assert.equal(mod._veil_group_epoch(carol, group), 2,
+        "carol was never told about the rotation");
+
+      const staleSize = mod._veil_export_membership(alice, group, 0, 0);
+      const stale = mod._malloc(staleSize);
+      mod._veil_export_membership(alice, group, stale, staleSize);
+      mod._veil_adopt_membership(carol, stale, staleSize, alicePub + 32);
+      assert.equal(mod._veil_group_epoch(carol, group), 3,
+        "but a member who does receive the new record moves forward");
+
+      mod._free(stale);
+      mod._free(membership);
+      mod._free(alicePub);
+    } finally {
+      mod._free(group);
+    }
+  } finally {
+    mod._veil_engine_free(alice);
+    mod._veil_engine_free(bob);
+    mod._veil_engine_free(carol);
   }
 });
 

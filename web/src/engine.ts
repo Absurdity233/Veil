@@ -3,13 +3,12 @@
  *
  * The module is the same C++ the phone runs. Nothing in this file implements
  * any cryptography: it allocates buffers in the wasm heap, calls the ABI, and
- * copies the result back out. That is the whole design goal — one engine, three
+ * copies the result back out. That is the whole design goal 鈥?one engine, three
  * clients, no second implementation to drift.
  *
  * Entropy deserves a note. A wasm module has no syscall and no /dev/urandom, so
  * before any engine is created this module installs crypto.getRandomValues as
- * the engine's RNG. If the browser refuses it — a non-secure origin disables it —
- * key generation fails rather than proceeding with predictable bytes.
+ * the engine's RNG. If the browser refuses it 鈥?a non-secure origin disables it 鈥? * key generation fails rather than proceeding with predictable bytes.
  */
 
 interface EmscriptenModule {
@@ -78,6 +77,38 @@ interface EmscriptenModule {
     handle: number, userId: number, plain: number, plainSize: number,
     out: number, outSize: number,
   ): number;
+
+  // Groups.
+  _veil_create_group(handle: number, groupId: number): number;
+  _veil_set_group_members(
+    handle: number, groupId: number, members: number, membersSize: number,
+  ): number;
+  _veil_export_membership(
+    handle: number, groupId: number, out: number, outSize: number,
+  ): number;
+  _veil_adopt_membership(
+    handle: number, data: number, size: number, founderSignPub: number,
+  ): number;
+  _veil_group_epoch(handle: number, groupId: number): number;
+  _veil_group_members(
+    handle: number, groupId: number, out: number, outSize: number,
+  ): number;
+  _veil_is_group_member(handle: number, groupId: number): number;
+  _veil_export_sender_key(
+    handle: number, groupId: number, epoch: number, out: number, outSize: number,
+  ): number;
+  _veil_adopt_sender_key(
+    handle: number, data: number, size: number,
+    expectedSender: number, senderSignPub: number,
+  ): number;
+  _veil_encrypt_to_group(
+    handle: number, groupId: number, plain: number, plainSize: number,
+    out: number, outSize: number,
+  ): number;
+  _veil_decrypt_from_group(
+    handle: number, groupId: number, data: number, size: number,
+    out: number, outSize: number, outLen: number,
+  ): number;
 }
 
 declare const createVeilModule: (opts?: unknown) => Promise<EmscriptenModule>;
@@ -125,7 +156,7 @@ export class VeilEngine {
   /**
    * Loads the module.
    *
-   * `wasmUrl` is a URL the page can fetch — in the browser it is a relative
+   * `wasmUrl` is a URL the page can fetch 鈥?in the browser it is a relative
    * path that resolves against the document. `jsUrl` is where the Emscripten
    * glue lives, and is separate because the two play different games: the glue
    * is an ES module import (so it must be a real specifier), while the .wasm is
@@ -402,6 +433,176 @@ export class VeilEngine {
 
   close(): void {
     VeilEngine.require()._veil_engine_free(this.handle);
+  }
+
+  // ---- Groups -----------------------------------------------------------
+  //
+  // Sender Keys. One message, one frame, regardless of group size. See
+  // docs/group.md, including what a group gives up to be cheap.
+
+  createGroup(groupId: string): boolean {
+    const mod = VeilEngine.require();
+    return this.withPeer(groupId, (ptr) =>
+      mod._veil_create_group(this.handle, ptr) === Status.OK);
+  }
+
+  /**
+   * Replaces the member list and bumps the epoch.
+   *
+   * Every live chain is discarded: a removed member holds the old chain key, and
+   * re-keying is the only thing that stops them reading what follows.
+   */
+  setGroupMembers(groupId: string, members: string[]): number {
+    const mod = VeilEngine.require();
+    const joined = members.join("\u0000");
+    const bytes = new TextEncoder().encode(joined);
+
+    return this.withPeer(groupId, (ptr) => {
+      const p = mod._malloc(bytes.length || 1);
+      try {
+        if (bytes.length) mod.HEAPU8.set(bytes, p);
+        return mod._veil_set_group_members(this.handle, ptr, p, bytes.length);
+      } finally {
+        mod._free(p);
+      }
+    });
+  }
+
+  groupEpoch(groupId: string): number {
+    const mod = VeilEngine.require();
+    return this.withPeer(groupId, (ptr) => mod._veil_group_epoch(this.handle, ptr));
+  }
+
+  groupMembers(groupId: string): string[] {
+    const mod = VeilEngine.require();
+    return this.withPeer(groupId, (ptr) => {
+      const need = mod._veil_group_members(this.handle, ptr, 0, 0);
+      if (need <= 0) return [];
+
+      const out = mod._malloc(need);
+      try {
+        if (mod._veil_group_members(this.handle, ptr, out, need) !== need) return [];
+        return new TextDecoder().decode(mod.HEAPU8.slice(out, out + need))
+          .split("\u0000").filter((s) => s.length > 0);
+      } finally {
+        mod._free(out);
+      }
+    });
+  }
+
+  isGroupMember(groupId: string): boolean {
+    const mod = VeilEngine.require();
+    return this.withPeer(groupId, (ptr) =>
+      mod._veil_is_group_member(this.handle, ptr) === 1);
+  }
+
+  /** The signed member list, to hand to members. */
+  exportMembership(groupId: string): Uint8Array | null {
+    return this.withPeer(groupId, (ptr) =>
+      this.produceVariable(2048, (mod, out, size) =>
+        mod._veil_export_membership(this.handle, ptr, out, size)));
+  }
+
+  adoptMembership(data: Uint8Array, founderSignPub: Uint8Array): StatusCode {
+    const mod = VeilEngine.require();
+    if (founderSignPub.length !== 32) return Status.BAD_SIGNATURE;
+
+    const d = mod._malloc(data.length || 1);
+    const key = mod._malloc(32);
+    try {
+      if (data.length) mod.HEAPU8.set(data, d);
+      mod.HEAPU8.set(founderSignPub, key);
+      return mod._veil_adopt_membership(this.handle, d, data.length, key) as StatusCode;
+    } finally {
+      mod._free(d);
+      mod._free(key);
+    }
+  }
+
+  /** This device's chain for the current epoch, signed by its device key. */
+  exportSenderKey(groupId: string, epoch = 0): Uint8Array | null {
+    return this.withPeer(groupId, (ptr) =>
+      this.produceVariable(512, (mod, out, size) =>
+        mod._veil_export_sender_key(this.handle, ptr, epoch, out, size)));
+  }
+
+  adoptSenderKey(
+    data: Uint8Array, expectedSender: string, senderSignPub: Uint8Array,
+  ): StatusCode {
+    const mod = VeilEngine.require();
+    if (senderSignPub.length !== 32) return Status.BAD_SIGNATURE;
+
+    const d = mod._malloc(data.length || 1);
+    const key = mod._malloc(32);
+    try {
+      if (data.length) mod.HEAPU8.set(data, d);
+      mod.HEAPU8.set(senderSignPub, key);
+
+      return this.withPeer(expectedSender, (ptr) =>
+        mod._veil_adopt_sender_key(this.handle, d, data.length, ptr, key) as StatusCode);
+    } finally {
+      mod._free(d);
+      mod._free(key);
+    }
+  }
+
+  /**
+   * Encrypts one message for the whole group.
+   *
+   * The result is the ABI's single record, passed through unchanged: a caller
+   * hands it to the relay as an opaque blob.
+   */
+  encryptToGroup(groupId: string, plain: Uint8Array): Uint8Array | null {
+    const mod = VeilEngine.require();
+    return this.withPeer(groupId, (ptr) => {
+      const p = mod._malloc(plain.length || 1);
+      try {
+        if (plain.length) mod.HEAPU8.set(plain, p);
+
+        const need = mod._veil_encrypt_to_group(this.handle, ptr, p, plain.length, 0, 0);
+        if (need <= 0) return null;
+
+        const out = mod._malloc(need);
+        try {
+          const total = mod._veil_encrypt_to_group(
+            this.handle, ptr, p, plain.length, out, need,
+          );
+          return total === need ? mod.HEAPU8.slice(out, out + total) : null;
+        } finally {
+          mod._free(out);
+        }
+      } finally {
+        mod._free(p);
+      }
+    });
+  }
+
+  decryptFromGroup(groupId: string, record: Uint8Array):
+    { status: StatusCode; plain: Uint8Array | null } {
+    const mod = VeilEngine.require();
+    return this.withPeer(groupId, (ptr) => {
+      const d = mod._malloc(record.length || 1);
+      // The plaintext is always smaller than the record that carries it, so
+      // sizing from the frame needs no probe 鈥?which matters because a probe
+      // must not consume the message key.
+      const out = mod._malloc(record.length || 1);
+      const outLen = mod._malloc(4);
+      try {
+        if (record.length) mod.HEAPU8.set(record, d);
+
+        const status = mod._veil_decrypt_from_group(
+          this.handle, ptr, d, record.length, out, record.length, outLen,
+        ) as StatusCode;
+        if (status !== Status.OK) return { status, plain: null };
+
+        const n = new DataView(mod.HEAPU8.buffer, outLen, 4).getUint32(0, true);
+        return { status, plain: mod.HEAPU8.slice(out, out + n) };
+      } finally {
+        mod._free(d);
+        mod._free(out);
+        mod._free(outLen);
+      }
+    });
   }
 
   // ---- Multi-device -----------------------------------------------------

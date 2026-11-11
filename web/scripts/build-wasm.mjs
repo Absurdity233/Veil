@@ -42,12 +42,17 @@ const EXPORTED = [
   "_veil_adopt_device_credential", "_veil_adopt_device_list",
   "_veil_peer_devices", "_veil_peer_device_version", "_veil_device_fingerprint",
   "_veil_establish_with_devices", "_veil_encrypt_to_account",
+  // Groups.
+  "_veil_create_group", "_veil_set_group_members", "_veil_export_membership",
+  "_veil_adopt_membership", "_veil_group_epoch", "_veil_group_members",
+  "_veil_is_group_member", "_veil_export_sender_key", "_veil_adopt_sender_key",
+  "_veil_encrypt_to_group", "_veil_decrypt_from_group",
   "_malloc", "_free",
 ];
 
 const cxxSources = [
   "veil/veil_c.cpp", "veil/crypto.cpp", "veil/keys.cpp", "veil/random.cpp",
-  "veil/ratchet.cpp", "veil/engine.cpp", "wasm/rng_bridge.cpp",
+  "veil/ratchet.cpp", "veil/group.cpp", "veil/engine.cpp", "wasm/rng_bridge.cpp",
 ].map((p) => join(cpp, p));
 
 const cSources = [

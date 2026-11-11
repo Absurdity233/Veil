@@ -197,12 +197,19 @@ A connection may only publish the list of the account it authenticated as. That
 check is not defensive paranoia — publishing somebody else's list is the entire
 attack.
 
-Still to come, and deliberately held back until the clients can use it:
+Still to come, and it needs the clients rather than more protocol:
 
 | Change | Why it waits |
 |---|---|
-| `SEND` carries a device id | a relay that only delivers to the addressed device is useless until clients address devices |
-| `GET_BUNDLE` gains a device id | same |
+| `GET_BUNDLE` gains a device id | a client can only ask for the bundle of a device it has just discovered, so this lands with the linking UI |
+
+The recipient field in `SEND` becomes `(user id, device id)`. A frame for device
+D of user U is stored against U's outbox but tagged with D, and the relay only
+hands it to a connection that authenticated as D.
+
+That last point matters: authenticating as U is not sufficient, or the wrong
+device would receive frames it cannot decrypt and would report an authentication
+failure on a message meant for its sibling.
 
 ## Migration
 
@@ -225,7 +232,15 @@ yet.
 | Account registry, per-device sessions, fan-out | `core-native/.../engine.{h,cpp}` | done |
 | C ABI for both of the above | `core-native/.../veil_c.{h,cpp}` | done |
 | Relay: device table, `PUBLISH_DEVICES` / `GET_DEVICES` | `server/store.go`, `server/hub.go` | done |
+| Relay: `HELLO` and `SEND` carry a device id, outbox per device | `server/hub.go`, `server/store.go` | done |
 | Client wiring: linking UI, device list refresh, per-device send | `app/`, `desktop/`, `web/` | **not started** |
+
+The relay is now device-aware: a connection announces its device in `HELLO`, a
+`SEND` may name one, and a frame addressed to a device reaches only that device's
+connections. An empty device id still addresses the whole account, which is why
+a single-device account and a not-yet-upgraded client keep working unchanged.
+
+So the whole protocol path is closed. What remains is a client that uses it.
 
 What that means in practice: the engine can hold a multi-device account and
 behave correctly, and a relay can store and serve device lists, but no client
@@ -259,8 +274,3 @@ testable without a relay:
   not been made.
 - **History transfer to a new device.** Out of scope above, and still out of
   scope.
-- **`SEND` carrying a device id.** The relay still addresses frames by user id
-  only, so a fan-out frame for device A would currently reach device B and fail
-  to decrypt there. That is the next wire change, and it has to land with the
-  client wiring rather than before it — a relay that only delivers to the
-  addressed device is useless until clients send device ids.

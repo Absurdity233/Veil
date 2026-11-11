@@ -47,6 +47,7 @@ cl /nologo /std:c++17 /EHsc /O2 /W3 /utf-8 ^
   core-native\src\main\cpp\veil\keys.cpp ^
   core-native\src\main\cpp\veil\random.cpp ^
   core-native\src\main\cpp\veil\ratchet.cpp ^
+  core-native\src\main\cpp\veil\group.cpp ^
   core-native\src\main\cpp\veil\engine.cpp ^
   core-native\src\main\cpp\third_party\monocypher\monocypher.c ^
   core-native\src\main\cpp\third_party\monocypher\monocypher-ed25519.c ^

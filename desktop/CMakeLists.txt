@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+﻿cmake_minimum_required(VERSION 3.22)
 
 # The desktop client's native library.
 #
@@ -29,6 +29,7 @@ add_library(veilc SHARED
         ${VEIL_SRC}/veil/keys.cpp
         ${VEIL_SRC}/veil/random.cpp
         ${VEIL_SRC}/veil/ratchet.cpp
+    ${VEIL_SRC}/veil/group.cpp
         ${VEIL_SRC}/veil/engine.cpp)
 
 target_include_directories(veilc PUBLIC ${VEIL_SRC})

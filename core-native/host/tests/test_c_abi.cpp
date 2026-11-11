@@ -71,7 +71,7 @@ int main() {
     {
         int major = -1, minor = -1, patch = -1;
         veil_version(&major, &minor, &patch);
-        check(major == 0 && minor == 3 && patch == 0, "version reports itself");
+        check(major == 0 && minor == 4 && patch == 0, "version reports itself");
 
         void* engine = veil_engine_new();
         check(engine != nullptr, "engine created");
@@ -509,7 +509,119 @@ int main() {
         veil_engine_free(bob);
     }
 
-    section("safety number is a string across the boundary");
+    section("groups through the C ABI");
+    {
+        void* alice = veil_engine_new();
+        void* bob = veil_engine_new();
+        check(alice && bob, "two engines");
+
+        check(veil_init_device(alice, "alice") == VEIL_OK, "alice has a device");
+        check(veil_init_device(bob, "bob") == VEIL_OK, "bob has a device");
+
+        check(veil_create_group(alice, "team") == VEIL_OK, "alice founds a group");
+
+        // Members travel as a NUL-separated list, which is what a caller can
+        // build from a JSON array without another encoding decision.
+        const char members[] = "alice\0bob";
+        const uint32_t epoch = veil_set_group_members(
+            alice, "team", reinterpret_cast<const uint8_t*>(members), sizeof(members) - 1);
+        check(epoch == 2, "adding members bumps the epoch");
+
+        const int members_size = veil_group_members(alice, "team", nullptr, 0);
+        check(members_size == 9, "two members joined with a NUL is 9 bytes");
+
+        char out_members[32];
+        check(veil_group_members(alice, "team", out_members, sizeof(out_members)) == 9,
+              "the member list fits");
+        check(std::memcmp(out_members, members, 9) == 0, "and matches what went in");
+
+        check(veil_is_group_member(alice, "team") == 1, "alice is a member");
+        check(veil_group_epoch(alice, "team") == 2, "the epoch reads back");
+
+        // ---- Membership is signed by the account, chains by the device ----
+        uint8_t alice_pub[VEIL_IDENTITY_PUBLIC_SIZE];
+        veil_identity_public(alice, alice_pub, sizeof(alice_pub));
+
+        const int membership_size = veil_export_membership(alice, "team", nullptr, 0);
+        check(membership_size > 0, "a membership record is produced");
+
+        uint8_t membership[512];
+        check(veil_export_membership(alice, "team", membership,
+                                     sizeof(membership)) == membership_size,
+              "it fits its own size query");
+
+        check(veil_adopt_membership(bob, membership, static_cast<size_t>(membership_size),
+                                    alice_pub + 32) == VEIL_OK,
+              "bob adopts the membership");
+        check(veil_group_epoch(bob, "team") == 2, "bob knows the epoch");
+
+        // The device key signs a chain; the account key signs the member list.
+        // Getting those the wrong way round is the mistake this pair of calls
+        // makes visible.
+        const int cred_size = veil_device_credential(alice, nullptr, 0);
+        uint8_t cred[VEIL_DEVICE_CRED_MAX];
+        veil_device_credential(alice, cred, sizeof(cred));
+
+        // Fingerprint the credential to extract nothing; the device signing key
+        // is inside it, and the ABI exposes it only through the credential.
+        // The test therefore reads the device sign pub out of the credential
+        // blob with the documented layout: [2] idlen | id | 32 id | 32 dh
+        // | 32 sign | ...
+        uint8_t device_sign_pub[32];
+        {
+            const size_t id_len = (static_cast<size_t>(cred[0]) << 8) | cred[1];
+            const size_t off = 2 + id_len + 32 + 32;
+            check(off + 32 <= static_cast<size_t>(cred_size), "the credential has a sign key");
+            std::memcpy(device_sign_pub, cred + off, 32);
+        }
+
+        const int chain_size = veil_export_sender_key(alice, "team", 0, nullptr, 0);
+        check(chain_size > 0, "alice publishes a chain");
+
+        uint8_t chain[512];
+        check(veil_export_sender_key(alice, "team", 0, chain, sizeof(chain)) == chain_size,
+              "the chain fits its size query");
+
+        check(veil_adopt_sender_key(bob, chain, static_cast<size_t>(chain_size),
+                                    "alice", device_sign_pub) == VEIL_OK,
+              "bob installs alice's chain");
+
+        // ---- One message, one frame ----
+        const char* text = "hello, team";
+        const int message_size = veil_encrypt_to_group(
+            alice, "team", reinterpret_cast<const uint8_t*>(text), std::strlen(text),
+            nullptr, 0);
+        check(message_size > 0, "a group message is framed");
+
+        uint8_t message[512];
+        check(veil_encrypt_to_group(alice, "team", reinterpret_cast<const uint8_t*>(text),
+                                    std::strlen(text), message,
+                                    sizeof(message)) == message_size,
+              "it fits its own size query");
+
+        uint8_t plain[256];
+        size_t plain_len = 0;
+        check(veil_decrypt_from_group(bob, "team", message, static_cast<size_t>(message_size),
+                                      plain, sizeof(plain), &plain_len) == VEIL_OK,
+              "bob decrypts it");
+        check(plain_len == std::strlen(text), "plaintext length matches");
+        check(std::memcmp(plain, text, plain_len) == 0, "content matches");
+
+        // A replay is refused: the key was consumed.
+        check(veil_decrypt_from_group(bob, "team", message, static_cast<size_t>(message_size),
+                                      plain, sizeof(plain), &plain_len) != VEIL_OK,
+              "a replayed group message is refused");
+
+        // A truncated frame is a bad parameter, not a crash.
+        check(veil_decrypt_from_group(bob, "team", message, 4,
+                                      plain, sizeof(plain), &plain_len) == VEIL_ERR_BAD_PARAM,
+              "a truncated group frame is refused");
+
+        veil_engine_free(alice);
+        veil_engine_free(bob);
+    }
+
+section("safety number is a string across the boundary");
     {
         void* engine = veil_engine_new();
         char out[VEIL_SAFETY_NUMBER_MAX];

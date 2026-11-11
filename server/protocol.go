@@ -188,3 +188,7 @@ func (r *reader) str() (string, error) {
 }
 
 func (r *reader) done() bool { return r.pos == len(r.buf) }
+
+// remaining reports how many bytes are unread, which is how an optional
+// trailing field is detected without requiring it.
+func (r *reader) remaining() int { return len(r.buf) - r.pos }

@@ -19,4 +19,5 @@ var (
 	errShuttingDown      = errors.New("relay is shutting down")
 	errBadDevices        = errors.New("malformed device list")
 	errForeignAccount    = errors.New("a connection may only publish its own device list")
+	errBadDeviceID       = errors.New("invalid device id")
 )

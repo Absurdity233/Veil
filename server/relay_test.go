@@ -99,6 +99,36 @@ func (h *harness) dialRaw(t *testing.T) *testClient {
 	return &testClient{t: t, conn: conn}
 }
 
+// dialWithDevice opens a connection, proves the identity, and announces the
+// device it speaks for.
+func (h *harness) dialWithDevice(t *testing.T, userID, deviceID string,
+	id *testIdentity) *testClient {
+	t.Helper()
+
+	c := h.dialRaw(t)
+
+	var w writer
+	w.str(userID)
+	w.blob(id.blob)
+	w.str(deviceID)
+	c.send(typeHello, w.bytes())
+
+	r := reader{buf: c.recvType(typeAuthChallenge)}
+	nonce, err := r.blob()
+	if err != nil {
+		t.Fatalf("challenge: %v", err)
+	}
+
+	var a writer
+	a.blob(ed25519.Sign(id.signer, nonce))
+	c.send(typeAuthResponse, a.bytes())
+
+	if msgType, _ := c.recv(); msgType != typeHelloOK {
+		t.Fatalf("expected hello ok, got %#x", msgType)
+	}
+	return c
+}
+
 // hello runs HELLO plus the challenge response.
 func (c *testClient) hello(t *testing.T, userID string, id *testIdentity) {
 	t.Helper()
@@ -975,6 +1005,202 @@ func TestGetDevicesForUnknownUser(t *testing.T) {
 	w.str("nobody")
 	alice.send(typeGetDevices, w.bytes())
 	alice.expectType(typeError)
+}
+
+// ---- Device addressing ------------------------------------------------
+
+func TestDeliverReachesOnlyTheAddressedDevice(t *testing.T) {
+	// This is the property a fan-out depends on. A frame is encrypted to one
+	// device's ratchet, so delivering it to a sibling would not leak it 鈥?it
+	// would produce an authentication failure on a message that was never meant
+	// for that device.
+	h := newHarness(t)
+
+	alice := h.dial(t, "alice", newTestIdentity(t, 90))
+
+	// Two devices of one account share the account identity: that is what makes
+	// them one account rather than two. Each gets its own *device* key pair in
+	// the full design, but at the relay the account identity is what binds the
+	// user id, so both connections present it.
+	bobID := newTestIdentity(t, 91)
+	phone := h.dialWithDevice(t, "bob", "phone", bobID)
+	laptop := h.dialWithDevice(t, "bob", "laptop", bobID)
+
+	var w writer
+	w.str("bob")
+	w.blob([]byte("for the phone"))
+	w.str("phone")
+	alice.send(typeSend, w.bytes())
+
+	// The phone gets it.
+	payload := phone.recvType(typeDeliver)
+	r := reader{buf: payload}
+	_, _ = r.u64()
+	sender, _ := r.str()
+	body, _ := r.blob()
+	if sender != "alice" || string(body) != "for the phone" {
+		t.Fatalf("phone got %q from %q", body, sender)
+	}
+
+	// The laptop must not. It is given the same opportunity to speak, and the
+	// reply it sends proves the ordering rather than relying on a timeout.
+	_ = laptop
+	var ping writer
+	ping.str("alice")
+	ping.blob([]byte("laptop is here"))
+	laptop.send(typeSend, ping.bytes())
+
+	// Alice receives the laptop's ping. If the laptop had also received the
+	// phone's frame, this read would have returned that frame first.
+	back := alice.recvType(typeDeliver)
+	br := reader{buf: back}
+	_, _ = br.u64()
+	from, _ := br.str()
+	if from != "bob" {
+		t.Fatalf("alice's next delivery was from %q, not the laptop's ping", from)
+	}
+}
+
+func TestUnaddressedDeliveryReachesEveryDevice(t *testing.T) {
+	// A sender that does not know the recipient's devices 鈥?a single-device
+	// account, or a client that has not fetched the list 鈥?addresses the bare
+	// user id, and every connection of that user still gets it. This is the
+	// behaviour that existed before device addressing.
+	h := newHarness(t)
+
+	alice := h.dial(t, "alice", newTestIdentity(t, 92))
+	bobID := newTestIdentity(t, 93)
+	phone := h.dialWithDevice(t, "bob", "phone", bobID)
+	laptop := h.dialWithDevice(t, "bob", "laptop", bobID)
+
+	var w writer
+	w.str("bob")
+	w.blob([]byte("for whoever"))
+	alice.send(typeSend, w.bytes())
+
+	for name, c := range map[string]*testClient{"phone": phone, "laptop": laptop} {
+		payload := c.recvType(typeDeliver)
+		r := reader{buf: payload}
+		_, _ = r.u64()
+		_, _ = r.str()
+		body, _ := r.blob()
+		if string(body) != "for whoever" {
+			t.Fatalf("%s got %q", name, body)
+		}
+	}
+}
+
+func TestDeviceAddressingSurvivesOfflineQueueing(t *testing.T) {
+	// A frame for a device that is not connected is queued against that device,
+	// and the wrong device must not pick it up on reconnect.
+	h := newHarness(t)
+
+	alice := h.dial(t, "alice", newTestIdentity(t, 94))
+
+	var w writer
+	w.str("bob")
+	w.blob([]byte("queued for the phone"))
+	w.str("phone")
+	alice.send(typeSend, w.bytes())
+
+	waitFor(t, 2*time.Second, func() bool {
+		n, err := h.store.PendingCount()
+		return err == nil && n == 1
+	})
+
+	// The laptop connects first. It must see nothing.
+	bobID := newTestIdentity(t, 95)
+	laptop := h.dialWithDevice(t, "bob", "laptop", bobID)
+	time.Sleep(200 * time.Millisecond)
+
+	// Prove the laptop is connected and idle by having it ping alice.
+	var ping writer
+	ping.str("alice")
+	ping.blob([]byte("laptop online"))
+	laptop.send(typeSend, ping.bytes())
+	back := alice.recvType(typeDeliver)
+	br := reader{buf: back}
+	_, _ = br.u64()
+	from, _ := br.str()
+	if from != "bob" {
+		t.Fatalf("unexpected delivery from %q", from)
+	}
+
+	// Now the phone connects and gets the queued frame.
+	phone := h.dialWithDevice(t, "bob", "phone", bobID)
+	payload := phone.recvType(typeDeliver)
+	r := reader{buf: payload}
+	_, _ = r.u64()
+	_, _ = r.str()
+	body, _ := r.blob()
+	if string(body) != "queued for the phone" {
+		t.Fatalf("phone got %q", body)
+	}
+}
+
+func TestHelloEchoesTheBoundDevice(t *testing.T) {
+	// A client should be able to tell what the relay thinks it is, rather than
+	// assuming its device id was accepted.
+	h := newHarness(t)
+
+	conn, _, err := websocket.DefaultDialer.Dial(h.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	c := &testClient{t: t, conn: conn}
+	id := newTestIdentity(t, 96)
+
+	var w writer
+	w.str("dave")
+	w.blob(id.blob)
+	w.str("laptop-7")
+	c.send(typeHello, w.bytes())
+
+	r := reader{buf: c.recvType(typeAuthChallenge)}
+	nonce, _ := r.blob()
+
+	var a writer
+	a.blob(ed25519.Sign(id.signer, nonce))
+	c.send(typeAuthResponse, a.bytes())
+
+	payload := c.expectType(typeHelloOK)
+	ok := reader{buf: payload}
+	user, _ := ok.str()
+	device, _ := ok.str()
+	if user != "dave" {
+		t.Fatalf("user = %q", user)
+	}
+	if device != "laptop-7" {
+		t.Fatalf("device = %q, want laptop-7", device)
+	}
+	ok.done()
+}
+
+func TestEmptyDeviceMeansWholeAccount(t *testing.T) {
+	// A SEND with an empty trailing device field addresses the whole account,
+	// which is what a single-device peer does. It must be delivered, not
+	// refused: an empty string is a valid "no particular device".
+	h := newHarness(t)
+
+	alice := h.dial(t, "alice", newTestIdentity(t, 97))
+	bob := h.dialWithDevice(t, "bob", "phone", newTestIdentity(t, 98))
+
+	var w writer
+	w.str("bob")
+	w.blob([]byte("hello"))
+	w.str("")
+	alice.send(typeSend, w.bytes())
+
+	payload := bob.recvType(typeDeliver)
+	r := reader{buf: payload}
+	_, _ = r.u64()
+	from, _ := r.str()
+	body, _ := r.blob()
+	if from != "alice" || string(body) != "hello" {
+		t.Fatalf("got %q from %q", body, from)
+	}
 }
 
 // ---- Send pacing -------------------------------------------------------

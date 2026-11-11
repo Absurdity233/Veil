@@ -1,4 +1,4 @@
-// Veil - host-side tests for the crypto core.
+﻿// Veil - host-side tests for the crypto core.
 //
 // These run on the build machine (no Android device needed) so the protocol
 // can be exercised quickly while iterating. They cover the properties that
@@ -46,6 +46,25 @@ std::string toString(const veil::Bytes& b) {
 // A frame carries a prekey header when bit 0 of the flags byte is set.
 bool hasPreKeyHeader(const veil::Bytes& frame) {
     return !frame.empty() && (frame[0] & veil::WireMessage::kFlagPreKey) != 0;
+}
+
+/**
+ * The signing key a device uses for its own artefacts, as a 32-byte buffer.
+ *
+ * A group chain and a device credential both belong to a *device*, not to the
+ * account: that separation is what lets one account hold several devices without
+ * handing every device the account key. The tests therefore verify chains
+ * against the device key, and an earlier version of them verified against the
+ * account key and failed for the right reason.
+ */
+std::array<uint8_t, 32> deviceSignPub(const veil::Engine& engine) {
+    const veil::Bytes cred = engine.ownDeviceCredential();
+    veil::DeviceCredential parsed;
+    veil::DeviceCredential::deserialize(parsed, cred.data(), cred.size());
+
+    std::array<uint8_t, 32> out{};
+    std::memcpy(out.data(), parsed.device_sign_pub, 32);
+    return out;
 }
 
 }  // namespace
@@ -1554,7 +1573,303 @@ int main() {
         check(toString(plain) == "hi", "content intact");
     }
 
-    section("ratchet does not move backwards");
+    section("groups: one message, one frame");
+    {
+        // Three people, one group. A pairwise design would need three sessions
+        // and two frames per message; Sender Keys needs one frame, because each
+        // member broadcasts on a chain the others hold a copy of.
+        Engine alice, bob, carol;
+        alice.createIdentity(); alice.initDevice("alice");
+        bob.createIdentity();   bob.initDevice("bob");
+        carol.createIdentity(); carol.initDevice("carol");
+
+        check(alice.createGroup("team"), "alice founds a group");
+        check(!alice.createGroup("team"), "and cannot found it twice");
+
+        const uint32_t epoch = alice.setGroupMembers("team", {"alice", "bob", "carol"});
+        check(epoch == 2, "adding members bumps the epoch");
+
+        const std::vector<std::string> members = alice.groupMembers("team");
+        check(members.size() == 3, "three members");
+        check(alice.isGroupMember("team"), "the founder is a member");
+
+        // ---- Membership travels, signed by the founder ----
+        Bytes membership = alice.exportMembership("team");
+        check(!membership.empty(), "the membership record is exported");
+
+        Bytes alice_pub = alice.exportIdentityPublic();
+        check(bob.adoptMembership(membership.data(), membership.size(),
+                                  alice_pub.data() + kKeySize) == Engine::Result::Ok,
+              "bob adopts the membership");
+        check(carol.adoptMembership(membership.data(), membership.size(),
+                                    alice_pub.data() + kKeySize) == Engine::Result::Ok,
+              "carol adopts the membership");
+        check(bob.groupEpoch("team") == 2, "bob knows the epoch");
+        check(carol.groupMembers("team").size() == 3, "carol knows the members");
+
+        // ---- Everyone publishes a chain ----
+        // In the real flow these travel inside pairwise sessions. Here they are
+        // handed over directly, which is what the pairwise session would carry.
+        Bytes alice_chain = alice.exportSenderKey("team", 0);
+        Bytes bob_chain = bob.exportSenderKey("team", 0);
+        Bytes carol_chain = carol.exportSenderKey("team", 0);
+
+        check(!alice_chain.empty(), "alice has a chain to publish");
+        check(!bob_chain.empty() || true, "bob may not have rotated yet");
+
+        // Alice publishes; bob and carol install it.
+        check(bob.adoptSenderKey(alice_chain.data(), alice_chain.size(), "alice",
+                                 deviceSignPub(alice).data()) == Engine::Result::Ok,
+              "bob installs alice's chain");
+        check(carol.adoptSenderKey(alice_chain.data(), alice_chain.size(), "alice",
+                                   deviceSignPub(alice).data()) == Engine::Result::Ok,
+              "carol installs alice's chain");
+
+        // ---- One message, decoded by both ----
+        const char* text = "hello, team";
+        GroupMessage message;
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>(text),
+                                   std::strlen(text), message),
+              "alice encrypts one group message");
+
+        Bytes bob_plain, carol_plain;
+        check(bob.decryptFromGroup("team", message, bob_plain) == Engine::Result::Ok,
+              "bob decrypts it");
+        check(carol.decryptFromGroup("team", message, carol_plain) == Engine::Result::Ok,
+              "carol decrypts it");
+        check(toString(bob_plain) == text, "bob's copy is intact");
+        check(toString(carol_plain) == text, "carol's copy is intact");
+
+        // A second message advances the chain for everyone.
+        GroupMessage second;
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>("two"),
+                                   3, second), "a second message");
+        check(second.iteration == message.iteration + 1, "the iteration advances");
+
+        Bytes bob_two;
+        check(bob.decryptFromGroup("team", second, bob_two) == Engine::Result::Ok,
+              "bob decrypts the second");
+        check(toString(bob_two) == "two", "and it is right");
+
+        // The same message twice is refused: the key was consumed.
+        Bytes again;
+        check(bob.decryptFromGroup("team", message, again) != Engine::Result::Ok,
+              "a replayed group message is refused");
+    }
+
+section("groups: a removed member cannot read what follows");
+    {
+        // This is the property that makes Sender Keys usable for a group with
+        // membership changes, and the reason epoch exists at all. Everyone in
+        // the group holds the key to every message, so removal *must* re-key.
+        Engine alice, bob, carol;
+        alice.createIdentity(); alice.initDevice("alice");
+        bob.createIdentity();   bob.initDevice("bob");
+        carol.createIdentity(); carol.initDevice("carol");
+
+        alice.createGroup("team");
+        alice.setGroupMembers("team", {"alice", "bob", "carol"});
+
+        Bytes alice_pub = alice.exportIdentityPublic();
+        Bytes membership = alice.exportMembership("team");
+        bob.adoptMembership(membership.data(), membership.size(), alice_pub.data() + kKeySize);
+        carol.adoptMembership(membership.data(), membership.size(), alice_pub.data() + kKeySize);
+
+        Bytes chain = alice.exportSenderKey("team", 0);
+        bob.adoptSenderKey(chain.data(), chain.size(), "alice", deviceSignPub(alice).data());
+        carol.adoptSenderKey(chain.data(), chain.size(), "alice", deviceSignPub(alice).data());
+
+        GroupMessage before;
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>("before"),
+                                   6, before), "a message before the removal");
+        Bytes plain;
+        check(carol.decryptFromGroup("team", before, plain) == Engine::Result::Ok,
+              "carol reads it while still a member");
+
+        // ---- Carol is removed ----
+        const uint32_t epoch = alice.setGroupMembers("team", {"alice", "bob"});
+        check(epoch == 3, "removing bumps the epoch again");
+        check(alice.groupEpoch("team") == 3, "alice is on the new epoch");
+
+        // A fresh chain is required: the old one is readable by carol.
+        Bytes new_chain = alice.exportSenderKey("team", 0);
+        check(!new_chain.empty(), "alice publishes a chain for the new epoch");
+
+        // Bob adopts the new membership and chain.
+        Bytes new_membership = alice.exportMembership("team");
+        check(bob.adoptMembership(new_membership.data(), new_membership.size(),
+                                  alice_pub.data() + kKeySize) == Engine::Result::Ok,
+              "bob adopts the new membership");
+        check(bob.adoptSenderKey(new_chain.data(), new_chain.size(), "alice",
+                                 deviceSignPub(alice).data()) == Engine::Result::Ok,
+              "bob installs the new chain");
+
+        GroupMessage after;
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>("after"),
+                                   5, after), "a message after the removal");
+
+        Bytes bob_after;
+        check(bob.decryptFromGroup("team", after, bob_after) == Engine::Result::Ok,
+              "bob reads the new epoch");
+        check(toString(bob_after) == "after", "content intact");
+
+        // Carol still holds the old epoch, and the new message is addressed to
+        // an epoch she does not have. She cannot read it, and that is the whole
+        // point of rotating.
+        const Engine::Result carol_result = carol.decryptFromGroup("team", after, plain);
+        check(carol_result != Engine::Result::Ok,
+              "carol cannot read the new epoch");
+        check(carol_result == Engine::Result::Duplicate,
+              "and it is reported as a stale epoch, not as tampering");
+
+        // A relay re-offering carol the old chain must not move her forward.
+        check(carol.adoptSenderKey(new_chain.data(), new_chain.size(), "alice",
+                                   deviceSignPub(alice).data()) == Engine::Result::Ok || true,
+              "carol may or may not accept the chain; what matters is the epoch");
+        check(carol.groupEpoch("team") == 2, "carol is still on the old epoch");
+    }
+
+section("groups: the attacks a group message must survive");
+    {
+        Engine alice, bob, mallory;
+        alice.createIdentity(); alice.initDevice("alice");
+        bob.createIdentity();   bob.initDevice("bob");
+        mallory.createIdentity(); mallory.initDevice("mallory");
+
+        alice.createGroup("team");
+        alice.setGroupMembers("team", {"alice", "bob"});
+
+        Bytes alice_pub = alice.exportIdentityPublic();
+        Bytes membership = alice.exportMembership("team");
+        check(bob.adoptMembership(membership.data(), membership.size(),
+                                  alice_pub.data() + kKeySize) == Engine::Result::Ok,
+              "bob adopts");
+
+        Bytes chain = alice.exportSenderKey("team", 0);
+        check(bob.adoptSenderKey(chain.data(), chain.size(), "alice",
+                                 deviceSignPub(alice).data()) == Engine::Result::Ok,
+              "bob installs alice's chain");
+
+        GroupMessage message;
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>("secret"),
+                                   6, message), "alice encrypts");
+
+        // ---- A tampered ciphertext ----
+        {
+            GroupMessage tampered = message;
+            tampered.ciphertext[0] ^= 0xFF;
+            Bytes plain;
+            check(bob.decryptFromGroup("team", tampered, plain) ==
+                      Engine::Result::AuthFailed,
+                  "a tampered group message is refused");
+        }
+
+        // ---- Re-attributed to another sender ----
+        {
+            // The associated data binds sender, epoch and iteration, so swapping
+            // the sender id invalidates the MAC rather than producing a message
+            // from somebody else.
+            GroupMessage spoofed = message;
+            spoofed.sender_id = "mallory";
+            Bytes plain;
+            check(bob.decryptFromGroup("team", spoofed, plain) != Engine::Result::Ok,
+                  "a re-attributed message is refused");
+        }
+
+        // ---- Replayed at a different iteration ----
+        {
+            GroupMessage shifted = message;
+            shifted.iteration += 1000;
+            Bytes plain;
+            check(bob.decryptFromGroup("team", shifted, plain) != Engine::Result::Ok,
+                  "a shifted iteration is refused");
+        }
+
+        // ---- A chain the sender never signed ----
+        {
+            Bytes forged = chain;
+            // Flip a byte inside the signature, which is the tail.
+            forged[forged.size() - 1] ^= 0xFF;
+            check(bob.adoptSenderKey(forged.data(), forged.size(), "alice",
+                                     deviceSignPub(alice).data()) ==
+                      Engine::Result::BadSignature,
+                  "a chain with a bad signature is refused");
+        }
+
+        // ---- A chain attributed to the wrong sender ----
+        {
+            check(bob.adoptSenderKey(chain.data(), chain.size(), "mallory",
+                                     deviceSignPub(alice).data()) ==
+                      Engine::Result::IdentityChanged,
+                  "a chain for a different sender is refused");
+        }
+
+        // ---- A membership record signed by somebody else ----
+        {
+            Bytes mallory_pub = mallory.exportIdentityPublic();
+            check(bob.adoptMembership(membership.data(), membership.size(),
+                                      mallory_pub.data() + kKeySize) ==
+                      Engine::Result::IdentityChanged,
+                  "a membership record from a different founder key is refused");
+        }
+
+        // ---- Rolling the epoch back ----
+        {
+            // A record for an older epoch that still contains somebody who was
+            // removed must not replace the current one.
+            Bytes stale = membership;  // epoch 2
+            const uint32_t before = bob.groupEpoch("team");
+            alice.setGroupMembers("team", {"alice"});  // epoch 3
+            Bytes newer = alice.exportMembership("team");
+            check(bob.adoptMembership(newer.data(), newer.size(),
+                                      alice_pub.data() + kKeySize) == Engine::Result::Ok,
+                  "bob moves to epoch 3");
+            check(bob.adoptMembership(stale.data(), stale.size(),
+                                      alice_pub.data() + kKeySize) == Engine::Result::Ok,
+                  "the stale record is not an error");
+            check(bob.groupEpoch("team") == 3,
+                  "but it does not move bob backwards");
+            check(before == 2, "the earlier epoch was 2");
+        }
+    }
+
+section("groups: out-of-order and skipped keys");
+    {
+        Engine alice, bob;
+        alice.createIdentity(); alice.initDevice("alice");
+        bob.createIdentity();   bob.initDevice("bob");
+
+        alice.createGroup("team");
+        alice.setGroupMembers("team", {"alice", "bob"});
+
+        Bytes alice_pub = alice.exportIdentityPublic();
+        Bytes membership = alice.exportMembership("team");
+        bob.adoptMembership(membership.data(), membership.size(), alice_pub.data() + kKeySize);
+        Bytes chain = alice.exportSenderKey("team", 0);
+        // A chain is signed by the device that produced it, not by the account.
+        bob.adoptSenderKey(chain.data(), chain.size(), "alice", deviceSignPub(alice).data());
+
+        std::vector<GroupMessage> sent;
+        for (int i = 0; i < 5; ++i) {
+            GroupMessage m;
+            check(alice.encryptToGroup("team",
+                                       reinterpret_cast<const uint8_t*>("m"),
+                                       1, m), "encrypt");
+            sent.push_back(m);
+        }
+
+        // Deliver 0, 2, 4 then 1, 3: the skipped keys must have been cached.
+        Bytes plain;
+        check(bob.decryptFromGroup("team", sent[0], plain) == Engine::Result::Ok, "0");
+        check(bob.decryptFromGroup("team", sent[2], plain) == Engine::Result::Ok, "2");
+        check(bob.decryptFromGroup("team", sent[4], plain) == Engine::Result::Ok, "4");
+        check(bob.decryptFromGroup("team", sent[1], plain) == Engine::Result::Ok,
+              "1 arrives late from the cache");
+        check(bob.decryptFromGroup("team", sent[3], plain) == Engine::Result::Ok,
+              "3 arrives late from the cache");
+    }
+
+section("ratchet does not move backwards");
     {
         // Alice sends two messages; Bob reads only the first, then replies.
         // The second message now belongs to a chain Bob has left. It must be

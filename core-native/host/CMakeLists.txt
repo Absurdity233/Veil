@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+﻿cmake_minimum_required(VERSION 3.22)
 project(veil_host_tests C CXX)
 
 # Host build of the protocol engine.
@@ -31,6 +31,7 @@ add_executable(veil_host_tests
         ${VEIL_SRC}/veil/keys.cpp
         ${VEIL_SRC}/veil/random.cpp
         ${VEIL_SRC}/veil/ratchet.cpp
+        ${VEIL_SRC}/veil/group.cpp
         ${VEIL_SRC}/veil/engine.cpp)
 
 target_include_directories(veil_host_tests PRIVATE ${VEIL_SRC})
@@ -57,10 +58,12 @@ add_test(NAME veil_host_tests COMMAND veil_host_tests)
 add_executable(veil_c_abi_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_c_abi.cpp
         ${VEIL_SRC}/veil/veil_c.cpp
+        ${VEIL_SRC}/veil/group.cpp
         ${VEIL_SRC}/veil/crypto.cpp
         ${VEIL_SRC}/veil/keys.cpp
         ${VEIL_SRC}/veil/random.cpp
         ${VEIL_SRC}/veil/ratchet.cpp
+        ${VEIL_SRC}/veil/group.cpp
         ${VEIL_SRC}/veil/engine.cpp)
 
 target_include_directories(veil_c_abi_tests PRIVATE ${VEIL_SRC})

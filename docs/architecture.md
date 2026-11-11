@@ -115,6 +115,18 @@ the ratchet, the persistence and the wire format are untouched by any of this.
 The account layer adds a device registry on top and a fan-out that produces one
 frame per device. [Multi-device](multi-device.md) has the design and the costs.
 
+### Groups live in sibling modules
+
+`group.{h,cpp}` holds the Sender Keys chain and the signed membership record;
+`engine.cpp` holds the group registry on top. Same reasoning as the account
+layer: it is cryptographic state, and three clients implementing it three times
+would be three chances to get it wrong.
+
+A group message is one frame regardless of group size, which is the whole point
+of Sender Keys. The cost — every member holds the key to every message, so a
+removal must re-key everyone — is what the epoch is for.
+[Groups](group.md) states the trade in full.
+
 ### Entropy, and why wasm needs help
 
 A wasm module has no syscall, no `/dev/urandom` and no `BCrypt`. The engine

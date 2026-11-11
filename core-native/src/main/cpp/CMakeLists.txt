@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22.1)
+﻿cmake_minimum_required(VERSION 3.22.1)
 project(veil C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -22,6 +22,7 @@ add_library(veil-core STATIC
         ${VEIL_ROOT}/veil/keys.cpp
         ${VEIL_ROOT}/veil/random.cpp
         ${VEIL_ROOT}/veil/ratchet.cpp
+        ${VEIL_ROOT}/veil/group.cpp
         ${VEIL_ROOT}/veil/engine.cpp)
 target_include_directories(veil-core PUBLIC ${VEIL_ROOT})
 target_link_libraries(veil-core PUBLIC monocypher)
