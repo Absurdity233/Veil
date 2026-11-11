@@ -614,9 +614,150 @@ func (c *client) handle(data []byte) error {
 		return c.handleSend(payload)
 	case typeAck:
 		return c.handleAck(payload)
+	case typePublishDevices:
+		return c.handlePublishDevices(payload)
+	case typeGetDevices:
+		return c.handleGetDevices(payload)
 	default:
 		return errUnknownType
 	}
+}
+
+// handlePublishDevices stores an account's device list.
+//
+// The relay cannot verify any signature in here — it has no account key — and
+// does not try. What it enforces is that the list is *whole*: a device id that
+// does not appear in the new set is removed, and the version moves forward so a
+// peer holding an older copy can tell it is stale.
+//
+// Payload: [str] user id | [4] count | per entry: [str] device id | [blob] credential
+func (c *client) handlePublishDevices(payload []byte) error {
+	if c.userID == "" {
+		return errHelloFirst
+	}
+
+	r := reader{buf: payload}
+	userID, err := r.str()
+	if err != nil {
+		return err
+	}
+	if userID != c.userID {
+		// A connection speaks only for the id it authenticated as. Publishing a
+		// list for somebody else would be the whole attack this design exists
+		// to prevent, and there is no legitimate client that needs it.
+		c.hub.log.Warn("device list for another account refused",
+			"authenticated", c.userID, "claimed", userID)
+		c.hub.statRejected.Add(1)
+		return errForeignAccount
+	}
+
+	count, err := r.u32()
+	if err != nil {
+		return err
+	}
+	if count == 0 || count > 64 {
+		return errBadDevices
+	}
+
+	credentials := make([][]byte, 0, count)
+	deviceIDs := make([]string, 0, count)
+	for i := uint32(0); i < count; i++ {
+		deviceID, err := r.str()
+		if err != nil {
+			return err
+		}
+		credential, err := r.blob()
+		if err != nil {
+			return err
+		}
+		if deviceID == "" || len(deviceID) > 128 {
+			return errBadDevices
+		}
+		if len(credential) == 0 || len(credential) > 1024 {
+			return errBadDevices
+		}
+
+		// The credential's own encoding starts with a two-byte user id length
+		// and the user id. Checking that it names the same account is cheap and
+		// catches a client that assembled the list from the wrong peer's data;
+		// the signature check the client does would catch it too, but failing
+		// early keeps a broken list off the relay entirely.
+		if !credentialNamesUser(credential, userID) {
+			return errBadDevices
+		}
+
+		credentials = append(credentials, credential)
+		deviceIDs = append(deviceIDs, deviceID)
+	}
+	if !r.done() {
+		return errTruncated
+	}
+
+	version, err := c.hub.store.PublishDevices(userID, credentials, deviceIDs)
+	if err != nil {
+		return err
+	}
+	c.hub.log.Info("device list published", "user", userID, "version", version, "devices", count)
+	return nil
+}
+
+// handleGetDevices serves an account's list to anybody who asks.
+//
+// A device list is public in the same sense a prekey bundle is: it has to be,
+// or nobody could start a session with a stranger. The credentials inside it are
+// signed, so a relay that tampered with them would be caught by the client.
+//
+// Payload: [str] user id
+// Reply:   [4] version | [4] count | per entry: [str] device id | [blob] credential
+func (c *client) handleGetDevices(payload []byte) error {
+	if c.userID == "" {
+		return errHelloFirst
+	}
+
+	r := reader{buf: payload}
+	target, err := r.str()
+	if err != nil {
+		return err
+	}
+	if !r.done() {
+		return errTruncated
+	}
+
+	devices, version, err := c.hub.store.Devices(target)
+	if err != nil {
+		return err
+	}
+	if len(devices) == 0 {
+		return errNoBundle
+	}
+
+	var w writer
+	w.u32(version)
+	w.u32(uint32(len(devices)))
+	for _, d := range devices {
+		w.str(d.DeviceID)
+		w.blob(d.Credential)
+	}
+
+	env, err := frame(typeDevices, w.bytes())
+	if err != nil {
+		return err
+	}
+	c.enqueue(env)
+	return nil
+}
+
+// credentialNamesUser reads the account a credential claims, without parsing
+// anything else. Layout: [2] length | user id | ...
+func credentialNamesUser(credential []byte, userID string) bool {
+	if len(credential) < 2 {
+		return false
+	}
+	n := int(credential[0])<<8 | int(credential[1])
+	if n <= 0 || len(credential) < 2+n {
+		return false
+	}
+	return string(credential[2:2+n]) == userID
 }
 
 // handleHello issues a challenge instead of binding the user id outright.

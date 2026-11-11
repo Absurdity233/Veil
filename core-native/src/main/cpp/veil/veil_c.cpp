@@ -1,4 +1,4 @@
-// Veil - C ABI implementation.
+﻿// Veil - C ABI implementation.
 //
 // A thin, careful wrapper. Two things in here deserve attention:
 //
@@ -13,6 +13,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <vector>
 
 #include "veil/engine.h"
 #include "veil/random.h"
@@ -401,10 +402,235 @@ extern "C" void veil_set_random_source(veil_random_fn fn) {
     veil::set_platform_random_source(fn);
 }
 
-// ---- Version -----------------------------------------------------------
-
 extern "C" void veil_version(int* major, int* minor, int* patch) {
     if (major != nullptr) *major = 0;
-    if (minor != nullptr) *minor = 2;
+    if (minor != nullptr) *minor = 3;
     if (patch != nullptr) *patch = 0;
+}
+
+// ---- Multi-device ------------------------------------------------------
+
+extern "C" int veil_init_device(void* handle, const char* user_id) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(user_id, id) || id.empty()) return VEIL_ERR_BAD_PARAM;
+
+    return engine->initDevice(id) ? VEIL_OK : VEIL_ERR_BAD_PARAM;
+}
+
+extern "C" int veil_device_id(const void* handle, uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (out == nullptr) return VEIL_DEVICE_ID_SIZE;
+    if (out_size < VEIL_DEVICE_ID_SIZE) return VEIL_ERR_BUFFER_TOO_SMALL;
+
+    const veil::Bytes id = engine->ownDeviceId();
+    if (id.empty()) return VEIL_NO_SESSION;
+    std::memcpy(out, id.data(), VEIL_DEVICE_ID_SIZE);
+    return VEIL_DEVICE_ID_SIZE;
+}
+
+extern "C" int veil_device_credential(const void* handle, uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    int written = 0;
+    const veil::Bytes cred = engine->ownDeviceCredential();
+    if (cred.empty()) return VEIL_NO_SESSION;
+
+    const int status = copyOut(cred, out, out_size, &written);
+    return status == VEIL_OK ? written : status;
+}
+
+extern "C" int veil_adopt_device_credential(void* handle,
+                                            const uint8_t* credential, size_t size,
+                                            const uint8_t* account_dh_pub,
+                                            const uint8_t* account_sign_pub) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (credential == nullptr || account_dh_pub == nullptr || account_sign_pub == nullptr) {
+        return VEIL_ERR_NULL_ARG;
+    }
+
+    return engine->adoptDeviceCredential(credential, size, account_dh_pub, account_sign_pub)
+               ? VEIL_OK
+               : VEIL_BAD_SIGNATURE;
+}
+
+extern "C" int veil_adopt_device_list(void* handle, const char* user_id,
+                                      uint32_t version,
+                                      const uint8_t* data, size_t size,
+                                      const uint8_t* account_dh_pub,
+                                      const uint8_t* account_sign_pub) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (data == nullptr || account_dh_pub == nullptr || account_sign_pub == nullptr) {
+        return VEIL_ERR_NULL_ARG;
+    }
+
+    std::string id;
+    if (!readPeer(user_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    return static_cast<int>(engine->adoptDeviceList(id, version, data, size,
+                                                    account_dh_pub, account_sign_pub));
+}
+
+namespace {
+
+// Builds the NUL-separated hex list used by the device-list accessors.
+std::string joinDevices(const std::vector<std::string>& ids) {
+    std::string out;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i != 0) out.push_back('\0');
+        out.append(ids[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+extern "C" int veil_peer_devices(const void* handle, const char* user_id,
+                                 char* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(user_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    const std::string joined = joinDevices(engine->peerDevices(id));
+
+    if (out == nullptr) return static_cast<int>(joined.size());
+    if (joined.size() > out_size) return VEIL_ERR_BUFFER_TOO_SMALL;
+
+    if (!joined.empty()) std::memcpy(out, joined.data(), joined.size());
+    return static_cast<int>(joined.size());
+}
+
+extern "C" uint32_t veil_peer_device_version(const void* handle, const char* user_id) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return 0;
+
+    std::string id;
+    if (!readPeer(user_id, id)) return 0;
+    return engine->peerDeviceVersion(id);
+}
+
+extern "C" int veil_device_fingerprint(const uint8_t* credential, size_t size,
+                                       char* out, size_t out_size) {
+    if (credential == nullptr) return VEIL_ERR_NULL_ARG;
+
+    veil::DeviceCredential cred;
+    if (!veil::DeviceCredential::deserialize(cred, credential, size)) return VEIL_BAD_BUNDLE;
+
+    const std::string fp = cred.fingerprint();
+    if (out == nullptr) return static_cast<int>(fp.size() + 1);
+    if (fp.size() + 1 > out_size) return VEIL_ERR_BUFFER_TOO_SMALL;
+
+    std::memcpy(out, fp.c_str(), fp.size() + 1);
+    return VEIL_OK;
+}
+
+extern "C" int veil_establish_with_devices(void* handle, const char* user_id,
+                                           const uint8_t* device_ids, size_t device_ids_size,
+                                           const uint8_t* bundles, size_t bundles_size,
+                                           char* failed, size_t failed_size) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (device_ids == nullptr || bundles == nullptr) return VEIL_ERR_NULL_ARG;
+
+    std::string id;
+    if (!readPeer(user_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    // [4] count | per entry [2] len | hex
+    if (device_ids_size < 4) return VEIL_ERR_BAD_PARAM;
+    const uint32_t count = (uint32_t(device_ids[0]) << 24) | (uint32_t(device_ids[1]) << 16) |
+                           (uint32_t(device_ids[2]) << 8) | uint32_t(device_ids[3]);
+
+    std::vector<std::string> ids;
+    ids.reserve(count);
+    size_t off = 4;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (device_ids_size - off < 2) return VEIL_ERR_BAD_PARAM;
+        const size_t len = (static_cast<size_t>(device_ids[off]) << 8) | device_ids[off + 1];
+        off += 2;
+        if (device_ids_size - off < len) return VEIL_ERR_BAD_PARAM;
+        ids.emplace_back(reinterpret_cast<const char*>(device_ids + off), len);
+        off += len;
+    }
+
+    std::vector<veil::Engine::DeviceBundle> parsed;
+    parsed.reserve(count);
+    off = 0;
+    for (uint32_t i = 0; i < count && i < ids.size(); ++i) {
+        if (bundles_size - off < 4) return VEIL_ERR_BAD_PARAM;
+        const uint32_t len = (uint32_t(bundles[off]) << 24) | (uint32_t(bundles[off + 1]) << 16) |
+                             (uint32_t(bundles[off + 2]) << 8) | uint32_t(bundles[off + 3]);
+        off += 4;
+        if (bundles_size - off < len) return VEIL_ERR_BAD_PARAM;
+
+        veil::Engine::DeviceBundle item;
+        item.device_id = ids[i];
+        item.bundle.assign(bundles + off, bundles + off + len);
+        parsed.push_back(std::move(item));
+        off += len;
+    }
+
+    std::vector<std::string> failures;
+    const size_t established = engine->establishWithDevices(id, parsed, failures);
+
+    if (failed != nullptr && failed_size > 0) {
+        const std::string joined = joinDevices(failures);
+        const size_t n = joined.size() < failed_size ? joined.size() : failed_size - 1;
+        if (n > 0) std::memcpy(failed, joined.data(), n);
+        failed[n] = 0;
+    }
+    return static_cast<int>(established);
+}
+
+extern "C" int veil_encrypt_to_account(void* handle, const char* user_id,
+                                       const uint8_t* plain, size_t plain_size,
+                                       uint8_t* out, size_t out_size) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (plain == nullptr && plain_size != 0) return VEIL_ERR_NULL_ARG;
+
+    std::string id;
+    if (!readPeer(user_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    const auto frames = engine->encryptToAccount(id, plain, plain_size);
+
+    // [4] payload length | [1] id length | id (hex) | [4] frame length | frame
+    size_t total = 0;
+    for (const auto& item : frames) {
+        total += 4 + 1 + item.device_id.size() + 4 + item.frame.size();
+    }
+
+    if (out == nullptr) return static_cast<int>(total);
+    if (total > out_size) return VEIL_ERR_BUFFER_TOO_SMALL;
+
+    size_t off = 0;
+    for (const auto& item : frames) {
+        const size_t record = 4 + 1 + item.device_id.size() + 4 + item.frame.size();
+
+        uint8_t num[4];
+        veil::put_u32(num, static_cast<uint32_t>(record - 4));
+        std::memcpy(out + off, num, 4);
+        off += 4;
+
+        out[off++] = static_cast<uint8_t>(item.device_id.size());
+        if (!item.device_id.empty()) {
+            std::memcpy(out + off, item.device_id.data(), item.device_id.size());
+            off += item.device_id.size();
+        }
+
+        veil::put_u32(num, static_cast<uint32_t>(item.frame.size()));
+        std::memcpy(out + off, num, 4);
+        off += 4;
+
+        std::memcpy(out + off, item.frame.data(), item.frame.size());
+        off += item.frame.size();
+    }
+    return static_cast<int>(total);
 }

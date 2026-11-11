@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include "veil/crypto.h"
 
@@ -472,6 +473,257 @@ std::string Engine::safetyNumber(const std::string& peer) const {
         std::snprintf(group, sizeof(group), "%05u", v);
         if (i != 0) out.push_back(' ');
         out.append(group, 5);
+    }
+    return out;
+}
+
+// ---- Multi-device ------------------------------------------------------
+//
+// The account layer over the per-device sessions below it. Nothing in the
+// ratchet changed: a device session is an ordinary session whose label happens
+// to be "<user>#<device>".
+
+namespace {
+
+std::string hex(const uint8_t* data, size_t size) {
+    static const char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(size * 2);
+    for (size_t i = 0; i < size; ++i) {
+        out.push_back(kHex[data[i] >> 4]);
+        out.push_back(kHex[data[i] & 0x0F]);
+    }
+    return out;
+}
+
+bool fromHex(const std::string& text, uint8_t* out, size_t size) {
+    if (text.size() != size * 2) return false;
+    for (size_t i = 0; i < size; ++i) {
+        const char hi = text[i * 2];
+        const char lo = text[i * 2 + 1];
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        const int h = nibble(hi);
+        const int l = nibble(lo);
+        if (h < 0 || l < 0) return false;
+        out[i] = static_cast<uint8_t>((h << 4) | l);
+    }
+    return true;
+}
+
+}  // namespace
+
+std::string Engine::deviceLabel(const std::string& user_id,
+                                const std::string& device_id_hex) {
+    // '#' cannot appear in a user id (the relay rejects it) and is not a hex
+    // digit, so the label splits unambiguously.
+    return user_id + "#" + device_id_hex;
+}
+
+std::string Engine::accountLabel(const std::string& user_id) const {
+    // A peer with no published device list is addressed by its bare user id,
+    // which is exactly the single-device behaviour that existed before. A relay
+    // that has not been upgraded, and a peer that never linked a second device,
+    // both keep working without a migration.
+    return user_id;
+}
+
+bool Engine::initDevice(const std::string& user_id) {
+    if (user_id.empty() || user_id.size() > 128) return false;
+    // '#' is the label separator, so it cannot appear in a user id.
+    if (user_id.find('#') != std::string::npos) return false;
+
+    user_id_ = user_id;
+    has_device_ = true;
+
+    // The device gets its own key pair. On the first device of an account these
+    // are the account keys, so the account is its own device and no linking
+    // flow is needed to get started.
+    //
+    // A *linked* device calls adoptDeviceCredential instead and keeps the key
+    // pair it generated for itself.
+    if (!has_device_keys_) {
+        if (!generateDeviceId(device_id_)) return false;
+
+        if (!crypto::x25519_generate(device_dh_pub_, device_dh_priv_)) return false;
+
+        uint8_t seed[32];
+        crypto::blake2b(seed, sizeof(seed), device_id_, kDeviceIdSize);
+        crypto::ed25519_keypair(device_sign_pub_, device_sign_priv_, seed);
+        veil::wipe(seed, sizeof(seed));
+        has_device_keys_ = true;
+    }
+
+    DeviceCredential cred;
+    if (!DeviceCredential::create(cred, user_id_, device_id_,
+                                  device_dh_pub_, device_dh_priv_,
+                                  device_sign_pub_, device_sign_priv_,
+                                  static_cast<uint64_t>(std::time(nullptr)))) {
+        return false;
+    }
+    if (!cred.signBy(identity_)) return false;
+    own_credential_ = cred;
+    has_own_credential_ = true;
+    return true;
+}
+
+Bytes Engine::ownDeviceId() const {
+    if (!has_device_) return {};
+    return Bytes(device_id_, device_id_ + kDeviceIdSize);
+}
+
+Bytes Engine::ownDeviceCredential() const {
+    if (!has_own_credential_) return {};
+    return own_credential_.serialize();
+}
+
+bool Engine::adoptDeviceCredential(const uint8_t* data, size_t size,
+                                   const uint8_t account_dh_pub[kKeySize],
+                                   const uint8_t account_sign_pub[32]) {
+    DeviceCredential cred;
+    if (!DeviceCredential::deserialize(cred, data, size)) return false;
+
+    // The endorsement must be this account's, and the credential must describe
+    // *this* device's keys: adopting somebody else's credential would be a
+    // different kind of failure entirely.
+    if (!cred.verify(account_dh_pub, account_sign_pub)) return false;
+    if (!has_device_keys_) return false;
+    if (!constant_time_equal(cred.device_dh_pub, device_dh_pub_, kKeySize)) return false;
+    if (!constant_time_equal(cred.device_sign_pub, device_sign_pub_, 32)) return false;
+
+    user_id_ = cred.user_id;
+    std::memcpy(device_id_, cred.device_id, kDeviceIdSize);
+    has_device_ = true;
+    own_credential_ = cred;
+    has_own_credential_ = true;
+    return true;
+}
+
+Engine::Result Engine::adoptDeviceList(const std::string& user_id,
+                                       uint32_t version,
+                                       const uint8_t* data, size_t size,
+                                       const uint8_t account_dh_pub[kKeySize],
+                                       const uint8_t account_sign_pub[32]) {
+    if (user_id.empty()) return Result::BadBundle;
+    if (data == nullptr || size < 4) return Result::BadBundle;
+
+    // Rolling back to a list that still contains a removed device is the one
+    // attack a version guard stops cheaply.
+    auto existing = peer_devices_.find(user_id);
+    if (existing != peer_devices_.end() && version <= existing->second.version) {
+        // Not an error: a relay echoing an older list is stale, and the caller
+        // already has something at least as new.
+        return Result::Ok;
+    }
+
+    size_t off = 0;
+    const uint32_t count = get_u32(data + off);
+    off += 4;
+
+    // Validate everything before mutating anything: a list in which one entry
+    // fails is refused whole, because a partially trusted list is worse than a
+    // stale one.
+    PeerDevices parsed;
+    parsed.version = version;
+    parsed.devices.reserve(count);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        DeviceCredential cred;
+        if (!DeviceCredential::deserialize(cred, data + off, size - off)) {
+            return Result::BadBundle;
+        }
+        const Bytes entry = cred.serialize();
+        off += entry.size();
+
+        if (cred.user_id != user_id) return Result::BadSignature;
+        if (!cred.verify(account_dh_pub, account_sign_pub)) return Result::BadSignature;
+
+        parsed.devices.push_back(cred);
+    }
+
+    // The account identity this list belongs to is now known, so the safety
+    // number can be computed before any session exists.
+    std::memcpy(peer_identity_[user_id].data(), account_dh_pub, kKeySize);
+    std::memcpy(peer_identity_[user_id].data() + kKeySize, account_sign_pub, 32);
+
+    peer_devices_[user_id] = std::move(parsed);
+    return Result::Ok;
+}
+
+std::vector<std::string> Engine::peerDevices(const std::string& user_id) const {
+    std::vector<std::string> out;
+    auto it = peer_devices_.find(user_id);
+    if (it == peer_devices_.end()) return out;
+
+    out.reserve(it->second.devices.size());
+    for (const auto& cred : it->second.devices) {
+        out.push_back(hex(cred.device_id, kDeviceIdSize));
+    }
+    return out;
+}
+
+uint32_t Engine::peerDeviceVersion(const std::string& user_id) const {
+    auto it = peer_devices_.find(user_id);
+    return it == peer_devices_.end() ? 0 : it->second.version;
+}
+
+size_t Engine::establishWithDevices(const std::string& user_id,
+                                    const std::vector<DeviceBundle>& bundles,
+                                    std::vector<std::string>& out_failed) {
+    out_failed.clear();
+    if (bundles.empty()) return 0;
+
+    // A caller that has not adopted a device list is talking to a peer that has
+    // not published one. Address it by its bare label, and every bundle is for
+    // that single peer.
+    const bool multi = peer_devices_.find(user_id) != peer_devices_.end();
+
+    size_t established = 0;
+    for (const auto& item : bundles) {
+        const std::string label = multi ? deviceLabel(user_id, item.device_id) : user_id;
+
+        if (findSession(label) == nullptr) {
+            const Result r = establishOutboundStatus(label, item.bundle.data(),
+                                                     item.bundle.size());
+            if (r != Result::Ok) {
+                out_failed.push_back(item.device_id);
+                continue;
+            }
+        }
+        ++established;
+    }
+    return established;
+}
+
+std::vector<Engine::DeviceFrame> Engine::encryptToAccount(const std::string& user_id,
+                                                          const uint8_t* plain,
+                                                          size_t size) {
+    std::vector<DeviceFrame> out;
+
+    auto list = peer_devices_.find(user_id);
+    if (list == peer_devices_.end()) {
+        // Single-device peer, or a peer whose list has not been fetched. One
+        // frame, exactly as before.
+        Bytes frame = encrypt(user_id, plain, size);
+        if (!frame.empty()) out.push_back({std::string(), std::move(frame)});
+        return out;
+    }
+
+    for (const auto& cred : list->second.devices) {
+        const std::string device_hex = hex(cred.device_id, kDeviceIdSize);
+        const std::string label = deviceLabel(user_id, device_hex);
+
+        // A device with no session is skipped rather than treated as an error:
+        // a peer's laptop may not have been online since the last handshake, and
+        // failing the whole send would make one stale device block the account.
+        if (findSession(label) == nullptr) continue;
+
+        Bytes frame = encrypt(label, plain, size);
+        if (!frame.empty()) out.push_back({device_hex, std::move(frame)});
     }
     return out;
 }

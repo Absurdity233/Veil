@@ -42,6 +42,14 @@ const (
 	// backlog keeps pulling until the queue is empty instead of stopping at
 	// whatever the first page happened to hold.
 	typeMorePending = 0x0C
+
+	// Device lists. See docs/multi-device.md.
+	//
+	// PUBLISH_DEVICES replaces the whole set, which is what makes revocation
+	// expressible as omission rather than a separate operation.
+	typePublishDevices = 0x0D
+	typeGetDevices     = 0x0E
+	typeDevices        = 0x0F
 )
 
 const (

@@ -391,4 +391,194 @@ bool PreKeys::deserialize(const uint8_t* data, size_t size) {
     return true;
 }
 
+// ---- Device credentials -----------------------------------------------
+
+size_t deviceCredentialMessage(uint8_t* out, size_t capacity,
+                               const std::string& user_id,
+                               const uint8_t device_id[kDeviceIdSize],
+                               const uint8_t device_dh_pub[kKeySize],
+                               const uint8_t device_sign_pub[32],
+                               uint64_t issued_at) {
+    const size_t domain_len = sizeof(kDeviceCredentialDomain) - 1;
+
+    // A user id longer than 128 bytes is not a real user id, and accepting one
+    // here would let a caller build a credential whose encoding overflows the
+    // documented buffer bound.
+    if (user_id.size() > 128) return 0;
+
+    const size_t total = domain_len + 2 + user_id.size() + kDeviceIdSize +
+                         kKeySize + 32 + 8;
+    if (out == nullptr || capacity < total) return 0;
+
+    size_t off = 0;
+    std::memcpy(out + off, kDeviceCredentialDomain, domain_len);
+    off += domain_len;
+
+    // Big endian, two bytes. The user id is compared as bytes, so the length
+    // prefix is what keeps "bo" from colliding with "bob".
+    out[off++] = static_cast<uint8_t>((user_id.size() >> 8) & 0xFF);
+    out[off++] = static_cast<uint8_t>(user_id.size() & 0xFF);
+    std::memcpy(out + off, user_id.data(), user_id.size());
+    off += user_id.size();
+
+    std::memcpy(out + off, device_id, kDeviceIdSize); off += kDeviceIdSize;
+    std::memcpy(out + off, device_dh_pub, kKeySize); off += kKeySize;
+    std::memcpy(out + off, device_sign_pub, 32); off += 32;
+    put_u64(out + off, issued_at); off += 8;
+
+    return off;
+}
+
+bool generateDeviceId(uint8_t out[kDeviceIdSize]) {
+    return secure_random(out, kDeviceIdSize);
+}
+
+bool DeviceCredential::create(DeviceCredential& out,
+                              const std::string& user_id,
+                              const uint8_t device_id[kDeviceIdSize],
+                              const uint8_t device_dh_pub[kKeySize],
+                              const uint8_t device_dh_priv[kKeySize],
+                              const uint8_t device_sign_pub[32],
+                              const uint8_t device_sign_priv[64],
+                              uint64_t issued_at) {
+    if (user_id.empty() || user_id.size() > 128) return false;
+
+    out.user_id = user_id;
+    std::memcpy(out.device_id, device_id, kDeviceIdSize);
+    std::memcpy(out.device_dh_pub, device_dh_pub, kKeySize);
+    std::memcpy(out.device_sign_pub, device_sign_pub, 32);
+    out.issued_at = issued_at;
+
+    // The device signs its own DH key, exactly as the account identity does.
+    crypto::ed25519_sign(out.device_binding, device_sign_priv, device_dh_pub, kKeySize);
+
+    std::memset(out.account_signature, 0, kSigSize);
+    return true;
+}
+
+size_t DeviceCredential::signedMessage(uint8_t* out, size_t capacity) const {
+    return deviceCredentialMessage(out, capacity, user_id, device_id,
+                                   device_dh_pub, device_sign_pub, issued_at);
+}
+
+bool DeviceCredential::signBy(const Identity& account_identity) {
+    uint8_t message[kDeviceCredentialMessageMax];
+    const size_t len = signedMessage(message, sizeof(message));
+    if (len == 0) return false;
+
+    crypto::ed25519_sign(account_signature, account_identity.sign_priv, message, len);
+    veil::wipe(message, sizeof(message));
+    return true;
+}
+
+bool DeviceCredential::verifyDeviceBinding() const {
+    return crypto::ed25519_verify(device_binding, device_sign_pub,
+                                  device_dh_pub, kKeySize);
+}
+
+bool DeviceCredential::verify(const uint8_t account_dh_pub[kKeySize],
+                              const uint8_t account_sign_pub[32]) const {
+    (void)account_dh_pub;  // not covered by the signature; see below
+
+    if (!verifyDeviceBinding()) return false;
+
+    uint8_t message[kDeviceCredentialMessageMax];
+    const size_t len = signedMessage(message, sizeof(message));
+    if (len == 0) return false;
+
+    // The account *signing* key is what endorses a device. The account DH key
+    // is deliberately not part of the signed bytes: it is bound to the signing
+    // key by the identity binding that every bundle already carries, so
+    // repeating it here would add a field without adding a guarantee.
+    const bool ok = crypto::ed25519_verify(account_signature, account_sign_pub,
+                                           message, len);
+    veil::wipe(message, sizeof(message));
+    return ok;
+}
+
+Bytes DeviceCredential::serialize() const {
+    Bytes out;
+    out.reserve(2 + user_id.size() + kDeviceIdSize + kKeySize + 32 + 8 + kBindingSize + kSigSize);
+
+    out.push_back(static_cast<uint8_t>((user_id.size() >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>(user_id.size() & 0xFF));
+    out.insert(out.end(), user_id.begin(), user_id.end());
+    out.insert(out.end(), device_id, device_id + kDeviceIdSize);
+    out.insert(out.end(), device_dh_pub, device_dh_pub + kKeySize);
+    out.insert(out.end(), device_sign_pub, device_sign_pub + 32);
+
+    uint8_t num[8];
+    put_u64(num, issued_at);
+    out.insert(out.end(), num, num + 8);
+
+    out.insert(out.end(), device_binding, device_binding + kBindingSize);
+    out.insert(out.end(), account_signature, account_signature + kSigSize);
+    return out;
+}
+
+bool DeviceCredential::deserialize(DeviceCredential& out, const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 2) return false;
+
+    size_t off = 0;
+    const size_t id_len = (static_cast<size_t>(data[off]) << 8) | data[off + 1];
+    off += 2;
+
+    if (id_len == 0 || id_len > 128) return false;
+
+    const size_t fixed = kDeviceIdSize + kKeySize + 32 + 8 + kBindingSize + kSigSize;
+    // The arithmetic must not overflow before the comparison, so the check is
+    // done by subtraction rather than by addition.
+    if (size - off < id_len + fixed) return false;
+
+    out.user_id.assign(reinterpret_cast<const char*>(data + off), id_len);
+    off += id_len;
+
+    std::memcpy(out.device_id, data + off, kDeviceIdSize); off += kDeviceIdSize;
+    std::memcpy(out.device_dh_pub, data + off, kKeySize); off += kKeySize;
+    std::memcpy(out.device_sign_pub, data + off, 32); off += 32;
+
+    out.issued_at = get_u64(data + off); off += 8;
+
+    std::memcpy(out.device_binding, data + off, kBindingSize); off += kBindingSize;
+    std::memcpy(out.account_signature, data + off, kSigSize);
+    return true;
+}
+
+std::string DeviceCredential::fingerprint() const {
+    // Both public halves, domain-separated so a fingerprint of a device cannot
+    // be confused with one of an account identity.
+    //
+    // The buffer is sized from the domain string itself rather than from a
+    // guessed constant: the first version of this used `uint8_t buf[16 + ...]`
+    // and overflowed by ten bytes, which the compiler caught and a test would
+    // not have.
+    static const char kDomain[] = "Veil/device-fingerprint/v1";
+    constexpr size_t kDomainLen = sizeof(kDomain) - 1;
+
+    uint8_t buffer[kDomainLen + kKeySize + 32];
+    std::memcpy(buffer, kDomain, kDomainLen);
+    std::memcpy(buffer + kDomainLen, device_dh_pub, kKeySize);
+    std::memcpy(buffer + kDomainLen + kKeySize, device_sign_pub, 32);
+
+    uint8_t digest[32];
+    crypto::blake2b(digest, sizeof(digest), buffer, sizeof(buffer));
+
+    // Four groups of four hex characters. Long enough that guessing is not a
+    // thing, short enough that a person can read it aloud on a call.
+    static const char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(19);
+    for (int group = 0; group < 4; ++group) {
+        if (group != 0) out.push_back('-');
+        for (int byte = 0; byte < 2; ++byte) {
+            const uint8_t b = digest[group * 2 + byte];
+            out.push_back(kHex[b >> 4]);
+            out.push_back(kHex[b & 0x0F]);
+        }
+    }
+    veil::wipe(buffer, sizeof(buffer));
+    veil::wipe(digest, sizeof(digest));
+    return out;
+}
+
 }  // namespace veil

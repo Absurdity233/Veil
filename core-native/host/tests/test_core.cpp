@@ -27,7 +27,13 @@ void check(bool cond, const char* what) {
     }
 }
 
-void section(const char* name) { std::printf("\n== %s ==\n", name); }
+void section(const char* name) {
+    // Flushed immediately: a crash inside a section otherwise produces an empty
+    // log, because stdout is block-buffered when it is not a terminal and the
+    // buffer never gets written.
+    std::printf("\n== %s ==\n", name);
+    std::fflush(stdout);
+}
 
 veil::Bytes toBytes(const std::string& s) {
     return veil::Bytes(s.begin(), s.end());
@@ -1007,6 +1013,545 @@ int main() {
         a2.importPeerRegistry(registry.data(), registry.size());
         check(a2.sessionState("bob") == Engine::SessionState::PinnedOnly,
               "the pin reports itself after a restart");
+    }
+
+    section("device credentials: the endorsement chain");
+    {
+        // One account, many devices. The identity signs an endorsement of each
+        // device's key pair, and that is the only thing that lets a device
+        // speak for the account.
+        Identity account;
+        check(account.generate(), "account identity");
+
+        // ---- A device mints its own credential ----
+        uint8_t device_id[kDeviceIdSize];
+        check(generateDeviceId(device_id), "device id");
+
+        uint8_t dh_pub[kKeySize], dh_priv[kKeySize];
+        uint8_t sign_pub[32], sign_priv[64];
+        uint8_t sign_seed[32];
+        check(crypto::x25519_generate(dh_pub, dh_priv), "device dh key");
+        crypto::blake2b(sign_seed, sizeof(sign_seed), device_id, kDeviceIdSize);
+        crypto::ed25519_keypair(sign_pub, sign_priv, sign_seed);
+        veil::wipe(sign_seed, sizeof(sign_seed));
+
+        DeviceCredential cred;
+        check(DeviceCredential::create(cred, "alice", device_id, dh_pub, dh_priv,
+                                       sign_pub, sign_priv, 1700000000),
+              "credential created");
+
+        // Before the account signs it, it is just a key pair claiming a name.
+        check(cred.verifyDeviceBinding(), "the device endorses its own DH key");
+        check(!cred.verify(account.dh_pub, account.sign_pub),
+              "an unsigned credential does not verify");
+
+        // ---- The account signs it ----
+        check(cred.signBy(account), "account signs the credential");
+        check(cred.verify(account.dh_pub, account.sign_pub),
+              "the signed credential verifies");
+
+        // ---- The attacks the two signatures exist to stop ----
+
+        // A relay swaps the device's DH key for one it controls, keeping the
+        // rest. The device's self-binding no longer matches.
+        {
+            DeviceCredential spliced = cred;
+            spliced.device_dh_pub[0] ^= 0xFF;
+            check(!spliced.verify(account.dh_pub, account.sign_pub),
+                  "a spliced device DH key is refused");
+        }
+
+        // A relay swaps the device's *signing* key, which is the half that
+        // would let it vouch for prekeys. Same story.
+        {
+            DeviceCredential spliced = cred;
+            spliced.device_sign_pub[1] ^= 0xFF;
+            check(!spliced.verify(account.dh_pub, account.sign_pub),
+                  "a spliced device signing key is refused");
+        }
+
+        // A relay re-labels the credential for a different account, hoping the
+        // account it names will accept it.
+        {
+            DeviceCredential relabelled = cred;
+            relabelled.user_id = "mallory";
+            check(!relabelled.verify(account.dh_pub, account.sign_pub),
+                  "a relabelled credential is refused");
+        }
+
+        // A relay moves the device to a different device id.
+        {
+            DeviceCredential moved = cred;
+            moved.device_id[0] ^= 0x01;
+            check(!moved.verify(account.dh_pub, account.sign_pub),
+                  "a credential with a changed device id is refused");
+        }
+
+        // A relay post-dates a credential to outlive a revocation.
+        {
+            DeviceCredential redated = cred;
+            redated.issued_at += 1;
+            check(!redated.verify(account.dh_pub, account.sign_pub),
+                  "a credential with a changed issue time is refused");
+        }
+
+        // A different account's signature is not this account's.
+        {
+            Identity other;
+            other.generate();
+            DeviceCredential foreign = cred;
+            check(foreign.signBy(other), "a foreign account signs it");
+            check(!foreign.verify(account.dh_pub, account.sign_pub),
+                  "another account's endorsement is refused");
+        }
+
+        // An attacker with their own key pair cannot self-issue a credential
+        // for somebody else's account, because they do not have the account
+        // signing key. This is the whole point of Model B.
+        {
+            uint8_t evil_dh_pub[kKeySize], evil_dh_priv[kKeySize];
+            uint8_t evil_sign_pub[32], evil_sign_priv[64];
+            uint8_t evil_seed[32];
+            crypto::x25519_generate(evil_dh_pub, evil_dh_priv);
+            crypto::blake2b(evil_seed, sizeof(evil_seed),
+                            reinterpret_cast<const uint8_t*>("evil"), 4);
+            crypto::ed25519_keypair(evil_sign_pub, evil_sign_priv, evil_seed);
+
+            DeviceCredential forged;
+            check(DeviceCredential::create(forged, "alice", device_id,
+                                           evil_dh_pub, evil_dh_priv,
+                                           evil_sign_pub, evil_sign_priv, 1700000000),
+                  "an attacker builds a credential for alice");
+            check(forged.verifyDeviceBinding(), "it is internally consistent");
+            check(!forged.verify(account.dh_pub, account.sign_pub),
+                  "but the account never signed it, so it is refused");
+
+            veil::wipe(evil_dh_priv, sizeof(evil_dh_priv));
+            veil::wipe(evil_sign_priv, sizeof(evil_sign_priv));
+        }
+
+        veil::wipe(dh_priv, sizeof(dh_priv));
+        veil::wipe(sign_priv, sizeof(sign_priv));
+    }
+
+    section("device credentials survive the wire");
+    {
+        Identity account;
+        account.generate();
+
+        uint8_t device_id[kDeviceIdSize];
+        generateDeviceId(device_id);
+        uint8_t dh_pub[kKeySize], dh_priv[kKeySize];
+        uint8_t sign_pub[32], sign_priv[64];
+        uint8_t seed[32];
+        crypto::x25519_generate(dh_pub, dh_priv);
+        crypto::blake2b(seed, sizeof(seed), device_id, kDeviceIdSize);
+        crypto::ed25519_keypair(sign_pub, sign_priv, seed);
+
+        DeviceCredential cred;
+        DeviceCredential::create(cred, "alice-with-a-long-id", device_id,
+                                 dh_pub, dh_priv, sign_pub, sign_priv, 1234567890);
+        cred.signBy(account);
+
+        Bytes wire = cred.serialize();
+        DeviceCredential parsed;
+        check(DeviceCredential::deserialize(parsed, wire.data(), wire.size()),
+              "credential deserialises");
+        check(parsed.user_id == "alice-with-a-long-id", "user id preserved");
+        check(parsed.issued_at == 1234567890, "issue time preserved");
+        check(constant_time_equal(parsed.device_id, device_id, kDeviceIdSize),
+              "device id preserved");
+        check(parsed.verify(account.dh_pub, account.sign_pub),
+              "the parsed credential still verifies");
+
+        // A blob cut short by one byte must be refused, not read past.
+        check(!DeviceCredential::deserialize(parsed, wire.data(), wire.size() - 1),
+              "a truncated credential is refused");
+
+        // An empty user id is not a credential.
+        {
+            Bytes empty;
+            empty.push_back(0); empty.push_back(0);
+            empty.resize(2 + kDeviceIdSize + kKeySize + 32 + 8 + kBindingSize + kSigSize);
+            DeviceCredential bad;
+            check(!DeviceCredential::deserialize(bad, empty.data(), empty.size()),
+                  "an empty user id is refused");
+        }
+
+        // The fingerprint is stable and distinguishes devices.
+        const std::string fp = cred.fingerprint();
+        check(fp.size() == 19, "fingerprint is four groups of four plus separators");
+        check(fp == cred.fingerprint(), "fingerprint is deterministic");
+        check(fp[4] == '-' && fp[9] == '-' && fp[14] == '-', "fingerprint is grouped");
+
+        // A different device *key pair* must give a different fingerprint. The id is
+        // deliberately not in the digest: the fingerprint identifies the keys a
+        // user is being asked to trust, and an id the relay assigned carries no
+        // security meaning.
+        uint8_t other_dh_pub[kKeySize], other_dh_priv[kKeySize];
+        uint8_t other_sign_pub[32], other_sign_priv[64];
+        uint8_t other_seed[32];
+        crypto::x25519_generate(other_dh_pub, other_dh_priv);
+        crypto::blake2b(other_seed, sizeof(other_seed), device_id, kDeviceIdSize);
+        crypto::ed25519_keypair(other_sign_pub, other_sign_priv, other_seed);
+
+        DeviceCredential other;
+        DeviceCredential::create(other, "alice-with-a-long-id", device_id,
+                                 other_dh_pub, other_dh_priv,
+                                 other_sign_pub, other_sign_priv, 1234567890);
+        check(other.fingerprint() != fp, "a different key pair yields a different fingerprint");
+
+        // And the same key pair under a different id is the same device as far
+        // as a person comparing fingerprints is concerned.
+        {
+            uint8_t reused_id[kDeviceIdSize];
+            generateDeviceId(reused_id);
+            DeviceCredential same_keys;
+            DeviceCredential::create(same_keys, "alice-with-a-long-id", reused_id,
+                                     dh_pub, dh_priv, sign_pub, sign_priv, 1234567890);
+            check(same_keys.fingerprint() == fp,
+                  "the fingerprint follows the keys, not the id");
+        }
+
+        veil::wipe(other_dh_priv, sizeof(other_dh_priv));
+        veil::wipe(other_sign_priv, sizeof(other_sign_priv));
+        veil::wipe(other_seed, sizeof(other_seed));
+
+        veil::wipe(dh_priv, sizeof(dh_priv));
+        veil::wipe(sign_priv, sizeof(sign_priv));
+        veil::wipe(seed, sizeof(seed));
+    }
+
+    section("multi-device: one account, two devices");
+    {
+        // Alice has a phone and a laptop. They are one account with two devices,
+        // not two accounts. Bob talks to both without knowing which one is
+        // answering.
+        Engine phone;
+        check(phone.createIdentity(), "phone identity");
+        check(phone.initDevice("alice"), "phone claims its device");
+
+        // The laptop generates its own key pair and asks the phone to endorse
+        // it. Nothing about the account secret moves: a compromised laptop does
+        // not become the account.
+        Engine laptop;
+        check(laptop.createIdentity(), "laptop has its own engine identity");
+        check(laptop.initDevice("alice"), "laptop claims a device id");
+
+        // The linking flow, end to end: the laptop's credential is signed by the
+        // account and handed back. In a real flow those two steps happen on
+        // different machines.
+        Bytes laptop_cred = laptop.ownDeviceCredential();
+        check(!laptop_cred.empty(), "laptop has a credential");
+
+        DeviceCredential signable;
+        check(DeviceCredential::deserialize(signable, laptop_cred.data(), laptop_cred.size()),
+              "the credential round-trips before signing");
+
+        phone.rotatePreKeys();
+        laptop.rotatePreKeys();
+
+        // ---- The phone publishes its list of one ----
+        Bytes phone_pub = phone.exportIdentityPublic();
+        Bytes phone_cred = phone.ownDeviceCredential();
+        DeviceCredential phone_entry;
+        check(DeviceCredential::deserialize(phone_entry, phone_cred.data(), phone_cred.size()),
+              "the phone's credential parses");
+
+        // A relay stores the list; here it is assembled by hand, in the same
+        // shape the relay will use.
+        // Entries only: the version travels as an argument, because it is the
+        // relay's bookkeeping rather than part of the account's statement.
+        auto makeList = [](uint32_t, const std::vector<Bytes>& entries) {
+            Bytes out;
+            uint8_t num[4];
+            put_u32(num, static_cast<uint32_t>(entries.size()));
+            out.insert(out.end(), num, num + 4);
+            for (const auto& e : entries) out.insert(out.end(), e.begin(), e.end());
+            return out;
+        };
+        // A peer that has published no device list is addressed by its bare
+        // account label, which is exactly the single-device behaviour that
+        // predates all of this.
+        check(phone.peerDevices("bob").empty(), "a peer with no published list has no devices");
+
+        // ---- Bob's side: two devices of alice ----
+        Engine bob;
+        check(bob.createIdentity(), "bob identity");
+        check(bob.initDevice("bob"), "bob is his own device");
+
+        // Alice's account key must be known to bob before he can verify a list.
+        Bytes alice_pub = phone.exportIdentityPublic();
+
+        // Build alice's list: phone + laptop, both signed by alice's identity.
+        // The laptop's credential was created by the laptop, so it needs the
+        // account signature before it belongs in the list; phone does that.
+        DeviceCredential laptop_entry;
+        DeviceCredential::deserialize(laptop_entry, laptop_cred.data(), laptop_cred.size());
+        {
+            // In the real flow the phone holds the account key. Here the test
+            // plays that role so the signed result is what a relay would store.
+            Identity account;
+            uint8_t secrets[96];
+            Bytes exported = phone.exportIdentitySecrets();
+            std::memcpy(secrets, exported.data(), 96);
+            check(Identity::fromSecrets(account, secrets, secrets + kKeySize),
+                  "account identity recovered for signing");
+            check(laptop_entry.signBy(account), "account endorses the laptop");
+            veil::wipe(secrets, sizeof(secrets));
+        }
+
+        Bytes laptop_signed = laptop_entry.serialize();
+        check(laptop.adoptDeviceCredential(laptop_signed.data(), laptop_signed.size(),
+                                           alice_pub.data(), alice_pub.data() + 32),
+              "the laptop adopts its endorsed credential");
+
+        Bytes alice_list = makeList(1, {phone_cred, laptop_signed});
+        check(bob.adoptDeviceList("alice", 1, alice_list.data(), alice_list.size(),
+                                  alice_pub.data(), alice_pub.data() + 32) == Engine::Result::Ok,
+              "bob accepts alice's two-device list");
+
+        const std::vector<std::string> devices = bob.peerDevices("alice");
+        check(devices.size() == 2, "bob sees two devices for alice");
+        check(bob.peerDeviceVersion("alice") == 1, "the list carries its version");
+
+        // ---- Bob establishes with both devices ----
+        // Each device's bundle is fetched separately, keyed by device id.
+        Bytes phone_bundle = phone.publishBundle(0);
+        Bytes laptop_bundle = laptop.publishBundle(0);
+
+        std::vector<Engine::DeviceBundle> bundles = {
+            {devices[0], phone_bundle},
+            {devices[1], laptop_bundle},
+        };
+        std::vector<std::string> failed;
+        const size_t established = bob.establishWithDevices("alice", bundles, failed);
+        check(established == 2, "bob established with both of alice's devices");
+        check(failed.empty(), "no device was unreachable");
+
+        // ---- One message, two frames ----
+        const char* text = "hello, both of you";
+        auto frames = bob.encryptToAccount("alice",
+                                           reinterpret_cast<const uint8_t*>(text),
+                                           std::strlen(text));
+        check(frames.size() == 2, "one plaintext became two frames");
+
+        // Each frame decrypts on exactly one device, which is the property that
+        // makes per-device ratchets worth the bandwidth.
+        bool phone_got_it = false, laptop_got_it = false;
+        for (const auto& item : frames) {
+            Bytes plain;
+            if (phone.decrypt(item.device_id, item.frame.data(), item.frame.size(), plain)) {
+                phone_got_it = toString(plain) == text;
+            }
+            if (laptop.decrypt(item.device_id, item.frame.data(), item.frame.size(), plain)) {
+                laptop_got_it = toString(plain) == text;
+            }
+        }
+        check(phone_got_it, "the phone decrypted its own frame");
+        check(laptop_got_it, "the laptop decrypted its own frame");
+
+        // ---- The account safety number does not move ----
+        // This is the point of signing devices rather than copying the identity:
+        // whether a peer has one device, two, or two with live sessions, the
+        // number the user compares for that account is the same.
+        //
+        // The comparison is per observer: a safety number folds in *my* identity
+        // too, so two different observers necessarily disagree. What must hold is
+        // that one observer sees a stable value across the device list changing.
+        const std::string bob_view = bob.safetyNumber("alice");
+        check(!bob_view.empty(), "bob has a safety number for alice");
+
+        // A fresh observer, given the same list, computes a number that folds in
+        // its own identity - so it differs. That is correct, and it is the
+        // reason the check below is about *stability*, not equality across
+        // observers.
+        Engine observer;
+        observer.createIdentity();
+        observer.initDevice("observer");
+        check(observer.adoptDeviceList("alice", 1, alice_list.data(), alice_list.size(),
+                                       alice_pub.data(), alice_pub.data() + 32) ==
+                  Engine::Result::Ok,
+              "another observer accepts the same list");
+
+        // Re-offering the same list must not move bob's view.
+        check(bob.adoptDeviceList("alice", 1, alice_list.data(), alice_list.size(),
+                                  alice_pub.data(), alice_pub.data() + 32) == Engine::Result::Ok,
+              "re-offering the list is accepted");
+        check(bob.safetyNumber("alice") == bob_view,
+              "the safety number is over the account, and does not move when the list is re-read");
+
+        // The list the observer holds names the same two devices, which is what
+        // a user comparing fingerprints would confirm.
+        check(observer.peerDevices("alice") == bob.peerDevices("alice"),
+              "both observers see the same device set for alice");
+    }
+
+    section("multi-device: the attacks the list must survive");
+    {
+        Engine alice_phone;
+        alice_phone.createIdentity();
+        alice_phone.initDevice("alice");
+        alice_phone.rotatePreKeys();
+        Bytes alice_pub = alice_phone.exportIdentityPublic();
+        Bytes phone_cred = alice_phone.ownDeviceCredential();
+
+        auto makeList = [](uint32_t, const std::vector<Bytes>& entries) {
+            Bytes out;
+            uint8_t num[4];
+            put_u32(num, static_cast<uint32_t>(entries.size()));
+            out.insert(out.end(), num, num + 4);
+            for (const auto& e : entries) out.insert(out.end(), e.begin(), e.end());
+            return out;
+        };
+
+        // ---- A relay rolls the list back to a state that still has a removed
+        // device ----
+        Engine bob;
+        bob.createIdentity();
+        bob.initDevice("bob");
+
+        Bytes v2 = makeList(2, {phone_cred});
+        check(bob.adoptDeviceList("alice", 2, v2.data(), v2.size(),
+                                  alice_pub.data(), alice_pub.data() + 32) == Engine::Result::Ok,
+              "version 2 accepted");
+
+        // A list that omits a device and bumps the version is a revocation.
+        // Re-offering version 1, which still had the device, must not take.
+        Bytes v1 = makeList(1, {phone_cred});
+        check(bob.adoptDeviceList("alice", 1, v1.data(), v1.size(),
+                                  alice_pub.data(), alice_pub.data() + 32) == Engine::Result::Ok,
+              "an older list is not an error");
+        check(bob.peerDeviceVersion("alice") == 2,
+              "but it does not replace what is already held");
+
+        // ---- A relay invents a device it controls ----
+        {
+            // The attacker builds a perfect credential for alice's account and
+            // signs the device binding itself. What it cannot do is make alice's
+            // identity endorse it.
+            uint8_t evil_dh_pub[kKeySize], evil_dh_priv[kKeySize];
+            uint8_t evil_sign_pub[32], evil_sign_priv[64];
+            uint8_t seed[32];
+            crypto::x25519_generate(evil_dh_pub, evil_dh_priv);
+            crypto::blake2b(seed, sizeof(seed),
+                            reinterpret_cast<const uint8_t*>("evil"), 4);
+            crypto::ed25519_keypair(evil_sign_pub, evil_sign_priv, seed);
+
+            uint8_t evil_id[kDeviceIdSize];
+            generateDeviceId(evil_id);
+
+            DeviceCredential forged;
+            DeviceCredential::create(forged, "alice", evil_id, evil_dh_pub, evil_dh_priv,
+                                     evil_sign_pub, evil_sign_priv, 1700000000);
+            Bytes forged_entry = forged.serialize();
+
+            Bytes list = makeList(3, {phone_cred, forged_entry});
+            check(bob.adoptDeviceList("alice", 3, list.data(), list.size(),
+                                      alice_pub.data(), alice_pub.data() + 32) ==
+                      Engine::Result::BadSignature,
+                  "a device the account never endorsed is refused");
+            check(bob.peerDeviceVersion("alice") == 2,
+                  "and the refusal leaves the previous list in place");
+
+            veil::wipe(evil_dh_priv, sizeof(evil_dh_priv));
+            veil::wipe(evil_sign_priv, sizeof(evil_sign_priv));
+            veil::wipe(seed, sizeof(seed));
+        }
+
+        // ---- A relay re-labels a device to a different account ----
+        {
+            Bytes list = makeList(4, {phone_cred});
+            // The credential says "alice"; the caller asks bob to accept it as a
+            // list for "carol".
+            check(bob.adoptDeviceList("carol", 4, list.data(), list.size(),
+                                      alice_pub.data(), alice_pub.data() + 32) ==
+                      Engine::Result::BadSignature,
+                  "a list whose entries name another account is refused");
+        }
+
+        // ---- One bad entry poisons the whole list ----
+        {
+            Bytes list = makeList(5, {phone_cred, Bytes(10, 0xAA)});
+            check(bob.adoptDeviceList("alice", 5, list.data(), list.size(),
+                                      alice_pub.data(), alice_pub.data() + 32) ==
+                      Engine::Result::BadBundle,
+                  "a malformed entry refuses the whole list");
+            check(bob.peerDeviceVersion("alice") == 2,
+                  "and nothing was applied");
+        }
+    }
+
+    section("multi-device: a send skips a device with no session");
+    {
+        // A laptop that has been offline since the last handshake must not make
+        // the whole account unreachable. Its frame is simply not produced.
+        Engine alice_phone, alice_laptop, bob;
+        alice_phone.createIdentity();
+        alice_phone.initDevice("alice");
+        alice_phone.rotatePreKeys();
+
+        alice_laptop.createIdentity();
+        alice_laptop.initDevice("alice");
+        alice_laptop.rotatePreKeys();
+
+        bob.createIdentity();
+        bob.initDevice("bob");
+
+        Bytes alice_pub = alice_phone.exportIdentityPublic();
+        Bytes phone_cred = alice_phone.ownDeviceCredential();
+
+        Bytes laptop_cred = alice_laptop.ownDeviceCredential();
+        DeviceCredential laptop_entry;
+        DeviceCredential::deserialize(laptop_entry, laptop_cred.data(), laptop_cred.size());
+        {
+            Identity account;
+            uint8_t secrets[96];
+            Bytes exported = alice_phone.exportIdentitySecrets();
+            std::memcpy(secrets, exported.data(), 96);
+            Identity::fromSecrets(account, secrets, secrets + kKeySize);
+            laptop_entry.signBy(account);
+            veil::wipe(secrets, sizeof(secrets));
+        }
+        Bytes laptop_signed = laptop_entry.serialize();
+
+        Bytes list;
+        {
+            uint8_t num[4];
+            put_u32(num, 2);
+            list.insert(list.end(), num, num + 4);
+            for (const auto& e : {phone_cred, laptop_signed}) {
+                list.insert(list.end(), e.begin(), e.end());
+            }
+        }
+
+        check(bob.adoptDeviceList("alice", 1, list.data(), list.size(),
+                                  alice_pub.data(), alice_pub.data() + 32) == Engine::Result::Ok,
+              "bob has alice's list");
+
+        // Only the phone's bundle is fetched: the laptop is unreachable.
+        const std::vector<std::string> devices = bob.peerDevices("alice");
+        check(devices.size() == 2, "two devices known");
+
+        std::vector<Engine::DeviceBundle> bundles = {
+            {devices[0], alice_phone.publishBundle(0)},
+        };
+        std::vector<std::string> failed;
+        check(bob.establishWithDevices("alice", bundles, failed) == 1,
+              "one device established");
+        check(failed.empty(), "the unreachable device was not even attempted");
+
+        auto frames = bob.encryptToAccount("alice",
+                                           reinterpret_cast<const uint8_t*>("hi"), 2);
+        check(frames.size() == 1, "only the reachable device gets a frame");
+        check(frames[0].device_id == devices[0], "and it is the right device");
+
+        // The phone can read it.
+        Bytes plain;
+        check(alice_phone.decrypt(frames[0].device_id, frames[0].frame.data(),
+                                  frames[0].frame.size(), plain),
+              "the reachable device decrypts");
+        check(toString(plain) == "hi", "content intact");
     }
 
     section("ratchet does not move backwards");

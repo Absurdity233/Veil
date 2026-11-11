@@ -183,6 +183,109 @@ bool verifySignedPreKey(const uint8_t identity_dh_pub[kKeySize],
                         const uint8_t signed_pub[kKeySize],
                         const uint8_t signature[kSigSize]);
 
+// ---- Device credentials -----------------------------------------------
+//
+// One account, many devices. The account identity signs an endorsement of each
+// device's key pair, and that endorsement is the only thing that makes a device
+// able to speak for the account.
+//
+// This is deliberately a certificate and not a shared secret. Copying the
+// identity to every device would multiply the places a private key can leak and
+// make revoking one device require rotating the identity - which changes the
+// safety number for every peer, which is exactly the event the verification
+// story exists to make visible. A per-device key pair means compromising one
+// device does not compromise the account.
+//
+// See docs/multi-device.md for the full argument, including what revocation
+// does not do.
+
+constexpr size_t kDeviceIdSize = 32;
+
+// The signed bytes, in order. Fixed width, so there is exactly one encoding and
+// no parser to disagree with.
+//
+//   "Veil/device-credential/v1" || user_id_len(2) || user_id
+//   || device_id(32) || device_dh_pub(32) || device_sign_pub(32) || issued_at(8)
+//
+// The user id is length-prefixed rather than NUL-terminated because a credential
+// for "bo" and one for "bob\0" must not collide, and because the relay stores
+// user ids as arbitrary byte strings.
+constexpr char kDeviceCredentialDomain[] = "Veil/device-credential/v1";
+
+struct DeviceCredential {
+    std::string user_id;
+    uint8_t  device_id[kDeviceIdSize]{};
+    uint8_t  device_dh_pub[kKeySize]{};
+    uint8_t  device_sign_pub[32]{};
+    uint64_t issued_at = 0;  // seconds since the epoch; display only
+
+    // The device's signing key endorses its own DH key. Without this, a relay
+    // could pair this device's DH key with its own signing key and sign prekeys
+    // of its choosing - the same attack the account-level binding closes, one
+    // level down.
+    uint8_t  device_binding[kBindingSize]{};
+
+    // The account identity's endorsement of the whole record above.
+    uint8_t  account_signature[kSigSize]{};
+
+    // Builds the credential a device publishes about itself, including the
+    // self-binding. Does not fill account_signature.
+    static bool create(DeviceCredential& out,
+                       const std::string& user_id,
+                       const uint8_t device_id[kDeviceIdSize],
+                       const uint8_t device_dh_pub[kKeySize],
+                       const uint8_t device_dh_priv[kKeySize],
+                       const uint8_t device_sign_pub[32],
+                       const uint8_t device_sign_priv[64],
+                       uint64_t issued_at);
+
+    // Signs a fully populated credential with the account identity.
+    bool signBy(const Identity& account_identity);
+
+    // Checks the device's self-binding and the account's endorsement.
+    //
+    // Both halves matter and neither is sufficient: the binding stops a relay
+    // splicing keys, the account signature stops a relay adding a device.
+    bool verify(const uint8_t account_dh_pub[kKeySize],
+                const uint8_t account_sign_pub[32]) const;
+
+    // Just the device's own binding, for the case where the account signature
+    // has been verified separately (the relay does this: it checks the account
+    // signature once when the list is published).
+    bool verifyDeviceBinding() const;
+
+    // The exact bytes an account signature covers.
+    size_t signedMessage(uint8_t* out, size_t capacity) const;
+
+    // Wire form, fixed width except for the user id:
+    //   [2] user id length | user id | [32] device id | [32] dh | [32] sign
+    //   | [8] issued_at | [64] device binding | [64] account signature
+    Bytes serialize() const;
+    static bool deserialize(DeviceCredential& out, const uint8_t* data, size_t size);
+
+    // A short human-comparable fingerprint of the device's two public keys, so
+    // a linking flow can show *what* is being approved rather than just asking
+    // "allow?". Eight groups of four hex digits would be unreadable; this is
+    // four groups from a BLAKE2b digest.
+    std::string fingerprint() const;
+};
+
+// The signed-message encoding, exposed so a test can pin the exact bytes.
+size_t deviceCredentialMessage(uint8_t* out, size_t capacity,
+                               const std::string& user_id,
+                               const uint8_t device_id[kDeviceIdSize],
+                               const uint8_t device_dh_pub[kKeySize],
+                               const uint8_t device_sign_pub[32],
+                               uint64_t issued_at);
+
+// The largest encoding the function above can produce, for buffer sizing.
+constexpr size_t kDeviceCredentialMessageMax =
+    sizeof(kDeviceCredentialDomain) - 1 + 2 + 128 + kDeviceIdSize +
+    kKeySize + 32 + 8;
+
+// Generates a device id from the platform CSPRNG.
+bool generateDeviceId(uint8_t out[kDeviceIdSize]);
+
 }  // namespace veil
 
 #endif  // VEIL_KEYS_H

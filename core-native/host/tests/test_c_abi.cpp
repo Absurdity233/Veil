@@ -27,7 +27,22 @@ void check(bool ok, const char* what) {
     }
 }
 
-void section(const char* name) { std::printf("\n== %s ==\n", name); }
+void section(const char* name) { std::printf("\n== %s ==\n", name); std::fflush(stdout); }
+
+/**
+ * Writes a 32-bit big-endian value.
+ *
+ * Local rather than reused from the engine on purpose: this file is a *C*
+ * caller, and reaching into the C++ headers to encode a length would defeat the
+ * point of testing the boundary. If the engine's convention changed, this test
+ * would have to be updated deliberately rather than silently following along.
+ */
+void be32(uint8_t* out, uint32_t v) {
+    out[0] = static_cast<uint8_t>(v >> 24);
+    out[1] = static_cast<uint8_t>(v >> 16);
+    out[2] = static_cast<uint8_t>(v >> 8);
+    out[3] = static_cast<uint8_t>(v);
+}
 
 // A buffer the caller owns, the way JNA and wasm both use the ABI.
 struct Buf {
@@ -56,7 +71,7 @@ int main() {
     {
         int major = -1, minor = -1, patch = -1;
         veil_version(&major, &minor, &patch);
-        check(major == 0 && minor == 2 && patch == 0, "version reports itself");
+        check(major == 0 && minor == 3 && patch == 0, "version reports itself");
 
         void* engine = veil_engine_new();
         check(engine != nullptr, "engine created");
@@ -360,6 +375,137 @@ int main() {
         check(std::memcmp(plain, text, plain_len) == 0, "content is intact");
 
         veil_engine_free(alice);
+        veil_engine_free(bob);
+    }
+
+    section("multi-device through the C ABI");
+    {
+        // The ABI is what the desktop and web clients call, so the fan-out
+        // record format has to be pinned here: a caller parses it without
+        // seeing any C++ types, and a misread length is a buffer overrun on the
+        // other side of a language boundary.
+        void* phone = veil_engine_new();
+        void* laptop = veil_engine_new();
+        void* bob = veil_engine_new();
+        check(phone && laptop && bob, "three engines");
+
+        check(veil_init_device(phone, "alice") == VEIL_OK, "phone claims alice");
+        check(veil_init_device(laptop, "alice") == VEIL_OK, "laptop claims alice");
+        check(veil_init_device(bob, "bob") == VEIL_OK, "bob claims himself");
+
+        uint8_t device_id[VEIL_DEVICE_ID_SIZE];
+        check(veil_device_id(phone, device_id, sizeof(device_id)) == VEIL_DEVICE_ID_SIZE,
+              "the device id is 32 bytes");
+        check(veil_device_id(phone, nullptr, 0) == VEIL_DEVICE_ID_SIZE,
+              "and its size is queryable");
+
+        uint8_t alice_pub[VEIL_IDENTITY_PUBLIC_SIZE];
+        veil_identity_public(phone, alice_pub, sizeof(alice_pub));
+
+        // ---- Ed25519 signing is not exposed, so the test signs the laptop's
+        // credential by rebuilding the account identity from the phone's
+        // exported secrets. A real linking flow does this on the other device.
+        uint8_t phone_secrets[VEIL_IDENTITY_SECRET_SIZE];
+        check(veil_identity_secrets(phone, phone_secrets, sizeof(phone_secrets)) ==
+                  VEIL_IDENTITY_SECRET_SIZE,
+              "phone secrets exported for the linking flow");
+
+        // Both credentials, as the relay would store them.
+        uint8_t phone_cred[VEIL_DEVICE_CRED_MAX];
+        const int phone_cred_len = veil_device_credential(phone, phone_cred, sizeof(phone_cred));
+        check(phone_cred_len > 0, "phone credential");
+
+        uint8_t laptop_cred[VEIL_DEVICE_CRED_MAX];
+        const int laptop_cred_len = veil_device_credential(laptop, laptop_cred, sizeof(laptop_cred));
+        check(laptop_cred_len > 0, "laptop credential");
+
+        // The laptop's credential is not yet endorsed by the account, so the
+        // phone's own credential is the only one that verifies right now. That
+        // asymmetry is the whole design: a device cannot endorse itself.
+        //
+        // Whatever is in `laptop_cred` at this point was signed by the laptop's
+        // own engine identity, not by alice's, so a list containing it must be
+        // refused.
+        {
+            uint8_t list[VEIL_DEVICE_CRED_MAX * 2 + 4];
+            size_t off = 0;
+            be32(list, 2);
+            off += 4;
+            std::memcpy(list + off, phone_cred, static_cast<size_t>(phone_cred_len));
+            off += static_cast<size_t>(phone_cred_len);
+            std::memcpy(list + off, laptop_cred, static_cast<size_t>(laptop_cred_len));
+            off += static_cast<size_t>(laptop_cred_len);
+
+            check(veil_adopt_device_list(bob, "alice", 1, list, off,
+                                         alice_pub, alice_pub + 32) == VEIL_BAD_SIGNATURE,
+                  "a device the account never endorsed is refused");
+            check(veil_peer_device_version(bob, "alice") == 0,
+                  "and nothing was recorded");
+        }
+
+        // ---- A list of one, which does verify ----
+        {
+            uint8_t list[VEIL_DEVICE_CRED_MAX + 4];
+            be32(list, 1);
+            std::memcpy(list + 4, phone_cred, static_cast<size_t>(phone_cred_len));
+
+            check(veil_adopt_device_list(bob, "alice", 1, list,
+                                         4 + static_cast<size_t>(phone_cred_len),
+                                         alice_pub, alice_pub + 32) == VEIL_OK,
+                  "a list of one is accepted");
+            check(veil_peer_device_version(bob, "alice") == 1, "the version is recorded");
+
+            // The device list is hex, NUL-separated, and size-queryable.
+            const int need = veil_peer_devices(bob, "alice", nullptr, 0);
+            check(need == 64, "one device is 64 hex characters");
+
+            char devices[128];
+            check(veil_peer_devices(bob, "alice", devices, sizeof(devices)) == 64,
+                  "the list fits");
+            for (int i = 0; i < 64; ++i) {
+                const char c = devices[i];
+                check((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+                      "device ids are hex");
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) break;
+            }
+
+            // A buffer one byte short is refused rather than truncated. The list is
+            // exactly 64 bytes with no terminator, so 63 is the shortest buffer
+            // that cannot hold it.
+            char tight[63];
+            check(veil_peer_devices(bob, "alice", tight, sizeof(tight)) ==
+                      VEIL_ERR_BUFFER_TOO_SMALL,
+                  "a short buffer is refused");
+        }
+
+        // ---- The fingerprint ----
+        char fingerprint[VEIL_FINGERPRINT_SIZE];
+        check(veil_device_fingerprint(phone_cred, static_cast<size_t>(phone_cred_len),
+                                      fingerprint, sizeof(fingerprint)) == VEIL_OK,
+              "the fingerprint is produced");
+        check(std::strlen(fingerprint) == 19, "four groups of four plus dashes");
+        check(fingerprint[4] == '-' && fingerprint[9] == '-' && fingerprint[14] == '-',
+              "and it is grouped");
+
+        // A truncated credential is refused by the fingerprint helper too, so a
+        // caller cannot get a fingerprint for something that does not verify.
+        check(veil_device_fingerprint(phone_cred, static_cast<size_t>(phone_cred_len) - 1,
+                                      fingerprint, sizeof(fingerprint)) == VEIL_BAD_BUNDLE,
+              "a truncated credential is refused");
+
+        // ---- Fan-out framing ----
+        // With one device in the list and no session, the fan-out produces
+        // nothing: a device is skipped rather than treated as an error.
+        {
+            const char* text = "hello";
+            const int need = veil_encrypt_to_account(bob, "alice",
+                                                     reinterpret_cast<const uint8_t*>(text),
+                                                     std::strlen(text), nullptr, 0);
+            check(need == 0, "no session, no frames, and no error either");
+        }
+
+        veil_engine_free(phone);
+        veil_engine_free(laptop);
         veil_engine_free(bob);
     }
 

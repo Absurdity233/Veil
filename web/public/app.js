@@ -286,6 +286,165 @@ var init_engine = __esm({
       close() {
         _VeilEngine.require()._veil_engine_free(this.handle);
       }
+      // ---- Multi-device -----------------------------------------------------
+      //
+      // The same account layer the Kotlin clients call. See docs/multi-device.md.
+      /** Claims a user id and creates this device. */
+      initDevice(userId2) {
+        const mod = _VeilEngine.require();
+        return this.withPeer(userId2, (ptr) => mod._veil_init_device(this.handle, ptr) === Status.OK);
+      }
+      /** 32 bytes, or null when no device is initialised. */
+      deviceId() {
+        const mod = _VeilEngine.require();
+        const out = mod._malloc(32);
+        try {
+          const n = mod._veil_device_id(this.handle, out, 32);
+          return n === 32 ? mod.HEAPU8.slice(out, out + n) : null;
+        } finally {
+          mod._free(out);
+        }
+      }
+      /** This device's credential, ready to publish. */
+      deviceCredential() {
+        return this.produceVariable(512, (mod, out, size) => mod._veil_device_credential(this.handle, out, size));
+      }
+      /**
+       * Adopts a credential the existing device signed for this one.
+       *
+       * The endorsement is verified against the account keys passed in, so a relay
+       * cannot hand over a credential that was never issued.
+       */
+      adoptDeviceCredential(credential, accountDhPub, accountSignPub) {
+        const mod = _VeilEngine.require();
+        if (accountDhPub.length !== 32 || accountSignPub.length !== 32) return false;
+        const c = mod._malloc(credential.length || 1);
+        const dh = mod._malloc(32);
+        const sign = mod._malloc(32);
+        try {
+          if (credential.length) mod.HEAPU8.set(credential, c);
+          mod.HEAPU8.set(accountDhPub, dh);
+          mod.HEAPU8.set(accountSignPub, sign);
+          return mod._veil_adopt_device_credential(this.handle, c, credential.length, dh, sign) === Status.OK;
+        } finally {
+          mod._free(c);
+          mod._free(dh);
+          mod._free(sign);
+        }
+      }
+      /**
+       * Records a peer's device list.
+       *
+       * A version at or below the one already held is ignored, so a relay cannot
+       * roll an account back to a list that still contains a device the user
+       * removed. A list in which any entry fails is refused whole.
+       */
+      adoptDeviceList(userId2, version, entries, accountDhPub, accountSignPub) {
+        const mod = _VeilEngine.require();
+        if (accountDhPub.length !== 32 || accountSignPub.length !== 32) return Status.BAD_BUNDLE;
+        return this.withPeer(userId2, (ptr) => {
+          const d = mod._malloc(entries.length || 1);
+          const dh = mod._malloc(32);
+          const sign = mod._malloc(32);
+          try {
+            if (entries.length) mod.HEAPU8.set(entries, d);
+            mod.HEAPU8.set(accountDhPub, dh);
+            mod.HEAPU8.set(accountSignPub, sign);
+            return mod._veil_adopt_device_list(
+              this.handle,
+              ptr,
+              version,
+              d,
+              entries.length,
+              dh,
+              sign
+            );
+          } finally {
+            mod._free(d);
+            mod._free(dh);
+            mod._free(sign);
+          }
+        });
+      }
+      /** The hex device ids known for a peer. */
+      peerDevices(userId2) {
+        const mod = _VeilEngine.require();
+        return this.withPeer(userId2, (ptr) => {
+          const need = mod._veil_peer_devices(this.handle, ptr, 0, 0);
+          if (need <= 0) return [];
+          const out = mod._malloc(need);
+          try {
+            if (mod._veil_peer_devices(this.handle, ptr, out, need) !== need) return [];
+            const text = new TextDecoder().decode(mod.HEAPU8.slice(out, out + need));
+            return text.split("\0").filter((s) => s.length > 0);
+          } finally {
+            mod._free(out);
+          }
+        });
+      }
+      /** The version of the list held for a peer; 0 when none. */
+      peerDeviceVersion(userId2) {
+        const mod = _VeilEngine.require();
+        return this.withPeer(userId2, (ptr) => mod._veil_peer_device_version(this.handle, ptr));
+      }
+      /**
+       * Fills `out` with one frame per device of a peer.
+       *
+       * The ABI's size query needs a valid plaintext pointer, so this allocates the
+       * plaintext first and asks with it, rather than passing NULL. Two calls, no
+       * guessing at a bound that would have to be kept in sync with the C side.
+       */
+      encryptToAccount(userId2, plain) {
+        const mod = _VeilEngine.require();
+        return this.withPeer(userId2, (ptr) => {
+          const p = mod._malloc(plain.length || 1);
+          try {
+            if (plain.length) mod.HEAPU8.set(plain, p);
+            const need = mod._veil_encrypt_to_account(
+              this.handle,
+              ptr,
+              p,
+              plain.length,
+              0,
+              0
+            );
+            if (need <= 0) return [];
+            const out = mod._malloc(need);
+            try {
+              const total = mod._veil_encrypt_to_account(
+                this.handle,
+                ptr,
+                p,
+                plain.length,
+                out,
+                need
+              );
+              if (total <= 0) return [];
+              const view = new DataView(mod.HEAPU8.buffer, out, total);
+              const frames = [];
+              let off = 0;
+              while (off + 5 <= total) {
+                off += 4;
+                const idLen = view.getUint8(off);
+                off += 1;
+                const deviceId = new TextDecoder().decode(
+                  mod.HEAPU8.slice(out + off, out + off + idLen)
+                );
+                off += idLen;
+                const frameLen = view.getUint32(off, false);
+                off += 4;
+                frames.push({ deviceId, frame: mod.HEAPU8.slice(out + off, out + off + frameLen) });
+                off += frameLen;
+              }
+              return frames;
+            } finally {
+              mod._free(out);
+            }
+          } finally {
+            mod._free(p);
+          }
+        });
+      }
       // ---- Plumbing ---------------------------------------------------------
       produceFixed(size, call) {
         const mod = _VeilEngine.require();

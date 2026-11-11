@@ -50,6 +50,34 @@ interface EmscriptenModule {
   _veil_version(major: number, minor: number, patch: number): void;
   _veil_install_web_rng(): number;
   _veil_web_rng_ready(): number;
+
+  // Multi-device.
+  _veil_init_device(handle: number, userId: number): number;
+  _veil_device_id(handle: number, out: number, size: number): number;
+  _veil_device_credential(handle: number, out: number, size: number): number;
+  _veil_adopt_device_credential(
+    handle: number, credential: number, size: number,
+    accountDhPub: number, accountSignPub: number,
+  ): number;
+  _veil_adopt_device_list(
+    handle: number, userId: number, version: number,
+    data: number, size: number, accountDhPub: number, accountSignPub: number,
+  ): number;
+  _veil_peer_devices(handle: number, userId: number, out: number, size: number): number;
+  _veil_peer_device_version(handle: number, userId: number): number;
+  _veil_device_fingerprint(
+    credential: number, size: number, out: number, outSize: number,
+  ): number;
+  _veil_establish_with_devices(
+    handle: number, userId: number,
+    deviceIds: number, deviceIdsSize: number,
+    bundles: number, bundlesSize: number,
+    failed: number, failedSize: number,
+  ): number;
+  _veil_encrypt_to_account(
+    handle: number, userId: number, plain: number, plainSize: number,
+    out: number, outSize: number,
+  ): number;
 }
 
 declare const createVeilModule: (opts?: unknown) => Promise<EmscriptenModule>;
@@ -374,6 +402,177 @@ export class VeilEngine {
 
   close(): void {
     VeilEngine.require()._veil_engine_free(this.handle);
+  }
+
+  // ---- Multi-device -----------------------------------------------------
+  //
+  // The same account layer the Kotlin clients call. See docs/multi-device.md.
+
+  /** Claims a user id and creates this device. */
+  initDevice(userId: string): boolean {
+    const mod = VeilEngine.require();
+    return this.withPeer(userId, (ptr) =>
+      mod._veil_init_device(this.handle, ptr) === Status.OK);
+  }
+
+  /** 32 bytes, or null when no device is initialised. */
+  deviceId(): Uint8Array | null {
+    const mod = VeilEngine.require();
+    const out = mod._malloc(32);
+    try {
+      const n = mod._veil_device_id(this.handle, out, 32);
+      return n === 32 ? mod.HEAPU8.slice(out, out + n) : null;
+    } finally {
+      mod._free(out);
+    }
+  }
+
+  /** This device's credential, ready to publish. */
+  deviceCredential(): Uint8Array | null {
+    return this.produceVariable(512, (mod, out, size) =>
+      mod._veil_device_credential(this.handle, out, size));
+  }
+
+  /**
+   * Adopts a credential the existing device signed for this one.
+   *
+   * The endorsement is verified against the account keys passed in, so a relay
+   * cannot hand over a credential that was never issued.
+   */
+  adoptDeviceCredential(
+    credential: Uint8Array,
+    accountDhPub: Uint8Array,
+    accountSignPub: Uint8Array,
+  ): boolean {
+    const mod = VeilEngine.require();
+    if (accountDhPub.length !== 32 || accountSignPub.length !== 32) return false;
+
+    const c = mod._malloc(credential.length || 1);
+    const dh = mod._malloc(32);
+    const sign = mod._malloc(32);
+    try {
+      if (credential.length) mod.HEAPU8.set(credential, c);
+      mod.HEAPU8.set(accountDhPub, dh);
+      mod.HEAPU8.set(accountSignPub, sign);
+      return mod._veil_adopt_device_credential(this.handle, c, credential.length, dh, sign) ===
+        Status.OK;
+    } finally {
+      mod._free(c);
+      mod._free(dh);
+      mod._free(sign);
+    }
+  }
+
+  /**
+   * Records a peer's device list.
+   *
+   * A version at or below the one already held is ignored, so a relay cannot
+   * roll an account back to a list that still contains a device the user
+   * removed. A list in which any entry fails is refused whole.
+   */
+  adoptDeviceList(
+    userId: string,
+    version: number,
+    entries: Uint8Array,
+    accountDhPub: Uint8Array,
+    accountSignPub: Uint8Array,
+  ): StatusCode {
+    const mod = VeilEngine.require();
+    if (accountDhPub.length !== 32 || accountSignPub.length !== 32) return Status.BAD_BUNDLE;
+
+    return this.withPeer(userId, (ptr) => {
+      const d = mod._malloc(entries.length || 1);
+      const dh = mod._malloc(32);
+      const sign = mod._malloc(32);
+      try {
+        if (entries.length) mod.HEAPU8.set(entries, d);
+        mod.HEAPU8.set(accountDhPub, dh);
+        mod.HEAPU8.set(accountSignPub, sign);
+        return mod._veil_adopt_device_list(
+          this.handle, ptr, version, d, entries.length, dh, sign,
+        ) as StatusCode;
+      } finally {
+        mod._free(d);
+        mod._free(dh);
+        mod._free(sign);
+      }
+    });
+  }
+
+  /** The hex device ids known for a peer. */
+  peerDevices(userId: string): string[] {
+    const mod = VeilEngine.require();
+    return this.withPeer(userId, (ptr) => {
+      const need = mod._veil_peer_devices(this.handle, ptr, 0, 0);
+      if (need <= 0) return [];
+
+      const out = mod._malloc(need);
+      try {
+        if (mod._veil_peer_devices(this.handle, ptr, out, need) !== need) return [];
+        const text = new TextDecoder().decode(mod.HEAPU8.slice(out, out + need));
+        return text.split("\u0000").filter((s) => s.length > 0);
+      } finally {
+        mod._free(out);
+      }
+    });
+  }
+
+  /** The version of the list held for a peer; 0 when none. */
+  peerDeviceVersion(userId: string): number {
+    const mod = VeilEngine.require();
+    return this.withPeer(userId, (ptr) => mod._veil_peer_device_version(this.handle, ptr));
+  }
+
+  /**
+   * Fills `out` with one frame per device of a peer.
+   *
+   * The ABI's size query needs a valid plaintext pointer, so this allocates the
+   * plaintext first and asks with it, rather than passing NULL. Two calls, no
+   * guessing at a bound that would have to be kept in sync with the C side.
+   */
+  encryptToAccount(userId: string, plain: Uint8Array):
+    Array<{ deviceId: string; frame: Uint8Array }> {
+    const mod = VeilEngine.require();
+    return this.withPeer(userId, (ptr) => {
+      const p = mod._malloc(plain.length || 1);
+      try {
+        if (plain.length) mod.HEAPU8.set(plain, p);
+
+        const need = mod._veil_encrypt_to_account(
+          this.handle, ptr, p, plain.length, 0, 0,
+        );
+        if (need <= 0) return [];
+
+        const out = mod._malloc(need);
+        try {
+          const total = mod._veil_encrypt_to_account(
+            this.handle, ptr, p, plain.length, out, need,
+          );
+          if (total <= 0) return [];
+
+          const view = new DataView(mod.HEAPU8.buffer, out, total);
+          const frames: Array<{ deviceId: string; frame: Uint8Array }> = [];
+          let off = 0;
+          while (off + 5 <= total) {
+            off += 4;  // record length; the loop is bounded by `total`
+            const idLen = view.getUint8(off);
+            off += 1;
+            const deviceId = new TextDecoder().decode(
+              mod.HEAPU8.slice(out + off, out + off + idLen));
+            off += idLen;
+            const frameLen = view.getUint32(off, false);
+            off += 4;
+            frames.push({ deviceId, frame: mod.HEAPU8.slice(out + off, out + off + frameLen) });
+            off += frameLen;
+          }
+          return frames;
+        } finally {
+          mod._free(out);
+        }
+      } finally {
+        mod._free(p);
+      }
+    });
   }
 
   // ---- Plumbing ---------------------------------------------------------

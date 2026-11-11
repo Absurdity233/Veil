@@ -205,6 +205,106 @@ VEIL_API void veil_set_random_source(veil_random_fn fn);
 // Three numbers, so a native build and a web build can refuse each other.
 VEIL_API void veil_version(int* major, int* minor, int* patch);
 
+// ---- Multi-device ------------------------------------------------------
+//
+// One account, many devices. See docs/multi-device.md for the design and what
+// it costs.
+//
+// The shape of this section mirrors the engine: a device has an identity (its
+// own key pair plus the account's endorsement), a peer has a device list, and
+// sending is a fan-out. Sessions remain addressable by a composite label, so
+// everything above this line keeps working unchanged.
+
+#define VEIL_DEVICE_ID_SIZE   32
+#define VEIL_DEVICE_CRED_MAX  512
+#define VEIL_FINGERPRINT_SIZE 20   // 4 groups of 4 hex + 3 dashes + NUL
+
+// Claims a user id for this engine and creates its device.
+//
+// The first device of an account is the account: it signs its own endorsement,
+// so no linking flow is needed to get started, and a single-device account is
+// just a list of one.
+//
+// Returns VEIL_OK, or VEIL_ERR_BAD_PARAM for an empty or over-long id.
+VEIL_API int veil_init_device(void* handle, const char* user_id);
+
+// Writes the 32-byte device id. VEIL_NO_SESSION when no device is initialised.
+VEIL_API int veil_device_id(const void* handle, uint8_t* out, size_t out_size);
+
+// Writes this device's credential, ready to publish. `out` may be NULL to get
+// the size, following the same contract as the rest of this header.
+VEIL_API int veil_device_credential(const void* handle, uint8_t* out, size_t out_size);
+
+// Adopts a credential an existing device signed for this one.
+//
+// The endorsement is verified against the account keys passed in, so a relay
+// cannot hand over a credential that was never issued. The credential must also
+// describe *this* device's public keys.
+VEIL_API int veil_adopt_device_credential(void* handle,
+                                          const uint8_t* credential, size_t size,
+                                          const uint8_t* account_dh_pub,
+                                          const uint8_t* account_sign_pub);
+
+// Records a peer's device list.
+//
+// `data` carries the entries only:
+//   [4] count | per entry: a serialized DeviceCredential
+// `version` travels beside it because it is the relay's bookkeeping, not the
+// account's statement.
+//
+// A version at or below the one already held is ignored, so a relay cannot roll
+// an account back to a list that still contains a device the user removed. A
+// list in which any entry fails verification is refused whole.
+VEIL_API int veil_adopt_device_list(void* handle, const char* user_id,
+                                    uint32_t version,
+                                    const uint8_t* data, size_t size,
+                                    const uint8_t* account_dh_pub,
+                                    const uint8_t* account_sign_pub);
+
+// Fills `out` with the hex device ids known for a peer, NUL-separated.
+//
+// Hex rather than raw bytes so the result is a string a caller can log, compare
+// and put in a JSON field without another encoding decision. Returns the number
+// of bytes written, or a negative error; `out` may be NULL to get the size.
+VEIL_API int veil_peer_devices(const void* handle, const char* user_id,
+                               char* out, size_t out_size);
+
+// The version of the list held for a peer, or 0 when none.
+VEIL_API uint32_t veil_peer_device_version(const void* handle, const char* user_id);
+
+// A device's short fingerprint: four groups of four hex characters.
+//
+// This is what a linking flow shows the user. It identifies the device's *keys*,
+// not the id the relay assigned, because the id carries no security meaning.
+VEIL_API int veil_device_fingerprint(const uint8_t* credential, size_t size,
+                                     char* out, size_t out_size);
+
+// Starts sessions with a list of a peer's devices.
+//
+// `device_ids` is [4] count | per entry [2] length | hex id, and `bundles`
+// carries one bundle per device, length-prefixed in the same order. Devices that
+// fail are reported in `failed` the same way, so a caller can say "3 of 4
+// reachable" rather than a bare failure.
+//
+// Returns the number of sessions established (>= 0), or a negative error.
+VEIL_API int veil_establish_with_devices(void* handle, const char* user_id,
+                                         const uint8_t* device_ids, size_t device_ids_size,
+                                         const uint8_t* bundles, size_t bundles_size,
+                                         char* failed, size_t failed_size);
+
+// Encrypts one plaintext to every device of a peer that has a session.
+//
+// One message becomes N frames. That is the real cost of per-device sessions,
+// and it is why the relay learns how many devices a recipient has.
+//
+// Output is a sequence of records the caller walks:
+//   [4] payload length | [1] id length | id (hex, may be empty)
+//   | [4] frame length | frame
+// Repeated until the buffer is exhausted. `out` may be NULL to get the size.
+VEIL_API int veil_encrypt_to_account(void* handle, const char* user_id,
+                                     const uint8_t* plain, size_t plain_size,
+                                     uint8_t* out, size_t out_size);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -186,9 +186,117 @@ public:
     // what the user verifies.
     std::string safetyNumber(const std::string& peer) const;
 
+    // ---- Multi-device ---------------------------------------------------
+    //
+    // One account, many devices. A session is per *device*, not per account,
+    // because a ratchet is a two-party object: sharing one between three devices
+    // would mean sharing chain keys, which is the "copy the identity everywhere"
+    // model with extra steps.
+    //
+    // Sessions therefore live under a composite label, and this section is the
+    // account layer on top: which devices belong to a peer, and how to send one
+    // message to all of them.
+    //
+    // See docs/multi-device.md.
+
+    // This device's own credential, as the account signed it. The first device
+    // of an account is the account, so it signs its own.
+    bool initDevice(const std::string& user_id);
+
+    // 32 bytes, or empty when initDevice() has not run.
+    Bytes ownDeviceId() const;
+
+    // The credential this device publishes. Empty when initialised without an
+    // account identity to sign it.
+    Bytes ownDeviceCredential() const;
+
+    // Adopts a credential that the existing device signed for this one.
+    //
+    // This is the second half of a linking flow: the new device generates its
+    // key pair, the existing device returns a signed credential, and the new
+    // device installs it here. The account signature is verified against the
+    // account key carried in the credential's list, so a relay cannot hand over
+    // an endorsement that was never issued.
+    bool adoptDeviceCredential(const uint8_t* data, size_t size,
+                               const uint8_t account_dh_pub[kKeySize],
+                               const uint8_t account_sign_pub[32]);
+
+    // Records a peer's device list.
+    //
+    // `version` is monotonic: a list with a version at or below the one already
+    // held is ignored, so a relay cannot roll an account back to a state that
+    // still contains a device the user removed.
+    //
+    // `data` is the entries only, without the version:
+    //   [4] count | per entry: DeviceCredential::serialize()
+    // The version travels beside it rather than inside it because the version is
+    // the relay's bookkeeping and the entries are the account's statement; a
+    // single signed blob would have to carry both, and the relay is the one that
+    // increments it.
+    //
+    // The signature on every entry is checked here, against `account_sign_pub`.
+    // A list in which any entry fails is refused whole: a partially trusted list
+    // is worse than a stale one.
+    Result adoptDeviceList(const std::string& user_id,
+                           uint32_t version,
+                           const uint8_t* data, size_t size,
+                           const uint8_t account_dh_pub[kKeySize],
+                           const uint8_t account_sign_pub[32]);
+
+    // The device ids currently known for a peer, in list order.
+    std::vector<std::string> peerDevices(const std::string& user_id) const;
+
+    // The version of the list held for a peer; 0 when none.
+    uint32_t peerDeviceVersion(const std::string& user_id) const;
+
+    // Starts a session with every device in a peer's list that does not have one.
+    // `bundles` supplies one bundle per device id, in any order.
+    struct DeviceBundle {
+        std::string device_id;   // hex, as it appears in peerDevices()
+        Bytes bundle;            // the fixed-width bundle the engine parses
+    };
+    // Returns the number of sessions established; out_failed lists the device
+    // ids that could not be, so a caller can report "3 of 4 devices reachable"
+    // rather than a bare failure.
+    size_t establishWithDevices(const std::string& user_id,
+                                const std::vector<DeviceBundle>& bundles,
+                                std::vector<std::string>& out_failed);
+
+    // A frame destined for one device of a peer.
+    struct DeviceFrame {
+        std::string device_id;
+        Bytes frame;
+    };
+
+    // Encrypts one plaintext to every device of a peer that has a session.
+    //
+    // One message becomes N frames. That is the real cost of per-device
+    // sessions, and it is stated in the threat model: the relay now learns how
+    // many devices the recipient has, on top of what it already learned.
+    std::vector<DeviceFrame> encryptToAccount(const std::string& user_id,
+                                              const uint8_t* plain, size_t size);
+
+    // The account-level safety number is unchanged: it is over the account
+    // identity, so adding a device to either side does not move it. This returns
+    // the same value safetyNumber() would for the account label, which is why
+    // the two are not separate functions - a per-device safety number would be
+    // a different, and less useful, thing to ask a user to compare.
+
 private:
+    // Session keys are "<user id>#<device id hex>". A composite label rather
+    // than a struct keeps the existing session registry, persistence and
+    // serialisation unchanged: a device session is a session whose label
+    // happens to contain a separator.
+    static std::string deviceLabel(const std::string& user_id,
+                                   const std::string& device_id_hex);
+
     Session* findSession(const std::string& peer);
     const Session* findSession(const std::string& peer) const;
+
+    // The account-level session label, used when a peer has published no device
+    // list. A relay that has not been upgraded keeps working, and so does a peer
+    // that has never linked a second device.
+    std::string accountLabel(const std::string& user_id) const;
 
     Identity identity_;
     PreKeys prekeys_;
@@ -197,6 +305,29 @@ private:
     // The peer's identity key, learned during the handshake. Needed for the
     // safety number, and to keep a peer label bound to one identity.
     std::map<std::string, std::array<uint8_t, kIdentitySize>> peer_identity_;
+
+    // ---- Multi-device state ----
+    std::string user_id_;
+    uint8_t     device_id_[kDeviceIdSize]{};
+    bool        has_device_ = false;
+
+    // This device's key pair, for its own credential. Separate from the account
+    // identity on purpose: compromising a linked device must not hand over the
+    // account.
+    bool    has_device_keys_ = false;
+    uint8_t device_dh_pub_[kKeySize]{};
+    uint8_t device_dh_priv_[kKeySize]{};
+    uint8_t device_sign_pub_[32]{};
+    uint8_t device_sign_priv_[64]{};
+
+    DeviceCredential own_credential_;
+    bool             has_own_credential_ = false;
+
+    struct PeerDevices {
+        uint32_t version = 0;
+        std::vector<DeviceCredential> devices;
+    };
+    std::map<std::string, PeerDevices> peer_devices_;
 };
 
 }  // namespace veil

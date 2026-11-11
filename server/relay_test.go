@@ -802,6 +802,181 @@ func TestOutboxSweepDropsExpiredAndTrims(t *testing.T) {
 	}
 }
 
+// ---- Device lists ------------------------------------------------------
+
+// fakeCredential builds the bytes the relay stores verbatim: a two-byte user id
+// length, the id, and filler. The relay never parses past the id, so the rest
+// only has to be non-empty.
+func fakeCredential(userID string, deviceByte byte) []byte {
+	out := []byte{byte(len(userID) >> 8), byte(len(userID))}
+	out = append(out, []byte(userID)...)
+	out = append(out, deviceByte)
+	out = append(out, bytes.Repeat([]byte{0xAB}, 64)...)
+	return out
+}
+
+func publishDevices(t *testing.T, c *testClient, userID string, ids []string, creds [][]byte) {
+	t.Helper()
+
+	var w writer
+	w.str(userID)
+	w.u32(uint32(len(ids)))
+	for i, id := range ids {
+		w.str(id)
+		w.blob(creds[i])
+	}
+	c.send(typePublishDevices, w.bytes())
+}
+
+func TestPublishAndGetDevices(t *testing.T) {
+	h := newHarness(t)
+	alice := h.dial(t, "alice", newTestIdentity(t, 80))
+	bob := h.dial(t, "bob", newTestIdentity(t, 81))
+
+	publishDevices(t, alice, "alice",
+		[]string{"phone", "laptop"},
+		[][]byte{fakeCredential("alice", 1), fakeCredential("alice", 2)})
+
+	// The publish is processed on the reader goroutine, so poll for it.
+	waitFor(t, 2*time.Second, func() bool {
+		devices, _, err := h.store.Devices("alice")
+		return err == nil && len(devices) == 2
+	})
+
+	var w writer
+	w.str("alice")
+	bob.send(typeGetDevices, w.bytes())
+
+	payload := bob.recvType(typeDevices)
+	r := reader{buf: payload}
+
+	version, err := r.u32()
+	if err != nil || version != 1 {
+		t.Fatalf("version = %d, %v (want 1)", version, err)
+	}
+	count, _ := r.u32()
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+
+	var seen []string
+	for i := uint32(0); i < count; i++ {
+		id, _ := r.str()
+		cred, _ := r.blob()
+		if len(cred) == 0 {
+			t.Fatalf("device %s came back without a credential", id)
+		}
+		seen = append(seen, id)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("saw %d devices, want 2", len(seen))
+	}
+}
+
+func TestRevocationIsOmission(t *testing.T) {
+	// Replacing the whole set is what makes revocation expressible: a device
+	// that is not in the new list is gone. There is no separate "remove" call
+	// for a client to forget.
+	h := newHarness(t)
+	alice := h.dial(t, "alice", newTestIdentity(t, 82))
+	bob := h.dial(t, "bob", newTestIdentity(t, 83))
+	_ = bob // connected only so the relay has a second party; the test reads the store
+
+	publishDevices(t, alice, "alice",
+		[]string{"phone", "laptop"},
+		[][]byte{fakeCredential("alice", 1), fakeCredential("alice", 2)})
+	waitFor(t, 2*time.Second, func() bool {
+		d, _, err := h.store.Devices("alice")
+		return err == nil && len(d) == 2
+	})
+
+	// The laptop is stolen; alice publishes a list without it.
+	publishDevices(t, alice, "alice",
+		[]string{"phone"},
+		[][]byte{fakeCredential("alice", 1)})
+	waitFor(t, 2*time.Second, func() bool {
+		d, _, err := h.store.Devices("alice")
+		return err == nil && len(d) == 1
+	})
+
+	devices, version, err := h.store.Devices("alice")
+	if err != nil {
+		t.Fatalf("devices: %v", err)
+	}
+	if version != 2 {
+		t.Fatalf("version = %d, want 2 (a revocation bumps it)", version)
+	}
+	if len(devices) != 1 || devices[0].DeviceID != "phone" {
+		t.Fatalf("devices = %v, want only phone", devices)
+	}
+}
+
+func TestDeviceListRejectsAnotherAccount(t *testing.T) {
+	// A connection authenticated as alice must not be able to publish a list
+	// for bob: that is the whole attack a device list has to survive.
+	h := newHarness(t)
+	alice := h.dial(t, "alice", newTestIdentity(t, 84))
+
+	publishDevices(t, alice, "bob",
+		[]string{"phone"}, [][]byte{fakeCredential("bob", 1)})
+
+	payload := alice.expectType(typeError)
+	if !strings.Contains(string(payload), "own device list") {
+		t.Fatalf("unexpected error: %q", payload)
+	}
+
+	if devices, _, _ := h.store.Devices("bob"); len(devices) != 0 {
+		t.Fatalf("bob gained %d devices from alice's publish", len(devices))
+	}
+}
+
+func TestDeviceListRejectsMismatchedCredential(t *testing.T) {
+	// The credential's own encoding names an account; a list whose entries name
+	// somebody else is malformed, not merely unverifiable, and must not reach
+	// the store.
+	h := newHarness(t)
+	alice := h.dial(t, "alice", newTestIdentity(t, 85))
+
+	publishDevices(t, alice, "alice",
+		[]string{"phone"}, [][]byte{fakeCredential("mallory", 1)})
+
+	payload := alice.expectType(typeError)
+	if !strings.Contains(string(payload), "malformed device list") {
+		t.Fatalf("unexpected error: %q", payload)
+	}
+}
+
+func TestDeviceListSizeBounds(t *testing.T) {
+	h := newHarness(t)
+	alice := h.dial(t, "alice", newTestIdentity(t, 86))
+
+	// Zero devices is not a list. Revocation is expressed by publishing a
+	// smaller list, not an empty one, so that an account can never end up with
+	// no devices and no way back in.
+	var w writer
+	w.str("alice")
+	w.u32(0)
+	alice.send(typePublishDevices, w.bytes())
+	alice.expectType(typeError)
+
+	// More than the cap is refused rather than stored.
+	var big writer
+	big.str("alice")
+	big.u32(1000)
+	alice.send(typePublishDevices, big.bytes())
+	alice.expectType(typeError)
+}
+
+func TestGetDevicesForUnknownUser(t *testing.T) {
+	h := newHarness(t)
+	alice := h.dial(t, "alice", newTestIdentity(t, 87))
+
+	var w writer
+	w.str("nobody")
+	alice.send(typeGetDevices, w.bytes())
+	alice.expectType(typeError)
+}
+
 // ---- Send pacing -------------------------------------------------------
 
 func TestSendRateLimit(t *testing.T) {

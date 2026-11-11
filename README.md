@@ -12,6 +12,7 @@ ciphertext it holds no key for.
 [Architecture](docs/architecture.md) ·
 [Protocol](docs/protocol.md) ·
 [Threat model](docs/threat-model.md) ·
+[Multi-device](docs/multi-device.md) ·
 [Building](docs/building.md)
 
 [![ci](https://github.com/Absurdity233/Veil/actions/workflows/ci.yml/badge.svg)](https://github.com/Absurdity233/Veil/actions/workflows/ci.yml)
@@ -152,13 +153,20 @@ techniques that address them and none of them are here.
 ## Status
 
 Working, tested, and honest about its limits: one-to-one only, no group
-messaging, no multi-device, no push notifications, no account recovery. Sessions
-persist, so a restart keeps the ability to talk; conversation history does not,
-so a restart loses the transcript.
+messaging, no push notifications, no account recovery. Sessions persist, so a
+restart keeps the ability to talk; conversation history does not, so a restart
+loses the transcript.
 
-The three clients are three separate identities, not three devices of one
-account. That is the real gap between this and a finished product, and it is a
-design question rather than an implementation one.
+**Multi-device exists at the protocol layer and nowhere else.** An account is
+one identity plus a list of account-signed device credentials; sessions are per
+device and sending is a fan-out. That is implemented and tested in the engine,
+the C ABI and the relay. No client surfaces it yet — there is no linking UI, and
+the relay still addresses frames by user id rather than by device — so today the
+three clients remain three separate identities. The design and the honest
+account of what is missing are in [Multi-device](docs/multi-device.md).
+
+Fixing exactly that — one person, several devices — is the next piece of work,
+and it is a protocol problem rather than a client one.
 
 ## Licence
 

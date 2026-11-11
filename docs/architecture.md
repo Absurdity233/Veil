@@ -52,7 +52,7 @@ at-least-once and a replay is routine while a failed MAC is not.
 
 | Layer | Owns | Never sees |
 |---|---|---|
-| `core-native/` (C++17) | identity, prekeys, X3DH, Double Ratchet, wire framing, the C ABI | network, disk |
+| `core-native/` (C++17) | identity, prekeys, X3DH, Double Ratchet, wire framing, device credentials, the C ABI | network, disk |
 | `app/` (Kotlin, Android) | UI, relay connection, Keystore-backed storage | private keys |
 | `desktop/` (Kotlin, JVM) | UI, relay connection, file-backed storage | private keys |
 | `web/` (TypeScript) | DOM, relay connection, IndexedDB-backed storage | private keys |
@@ -73,8 +73,7 @@ src/main/cpp/veil/
   keys.{h,cpp}      identity, signed prekey, one-time prekeys, bundle codec
   ratchet.{h,cpp}   X3DH handshake and the Double Ratchet
   engine.{h,cpp}    session registry, wire framing, safety number, pinning
-  veil_c.{h,cpp}    the C ABI every non-Android client goes through
-src/main/cpp/jni/veil_jni.cpp    the JNI surface (Android)
+  veil_c.{h,cpp}    the C ABI every non-Android client goes throughsrc/main/cpp/jni/veil_jni.cpp    the JNI surface (Android)
 src/main/cpp/wasm/rng_bridge.cpp entropy bridge for WebAssembly
 third_party/monocypher/          vendored primitives, pinned by hash
 host/tests/                      host suite + C ABI suite
@@ -103,6 +102,18 @@ and are therefore explicit:
 
 All of it is exported for encrypted storage and restored before any frame is
 decrypted.
+
+### Multi-device lives here too
+
+The account layer — which devices belong to a peer, and how to send one message
+to all of them — sits in `engine.{h,cpp}` rather than in a client, for the same
+reason the prekey lifecycle does: it is cryptographic state, and three clients
+implementing it three times would be three chances to get it wrong.
+
+A device session is an ordinary session whose label is `<user>#<device hex>`, so
+the ratchet, the persistence and the wire format are untouched by any of this.
+The account layer adds a device registry on top and a fan-out that produces one
+frame per device. [Multi-device](multi-device.md) has the design and the costs.
 
 ### Entropy, and why wasm needs help
 

@@ -107,6 +107,30 @@ CREATE TABLE IF NOT EXISTS outbox_seq (
     recipient   TEXT PRIMARY KEY,
     last_seq    INTEGER NOT NULL
 );
+
+-- Device lists.
+--
+-- The relay stores each credential blob verbatim and does not parse it. The
+-- signatures inside are checked by the client that downloads the list, against
+-- the account key it already pins. Storing an opaque blob is what keeps "the
+-- relay cannot invent a device" true rather than aspirational: it has nothing
+-- to sign with.
+--
+-- The version is monotonic per user and deliberately lives outside the signed
+-- credentials. The account signs which devices exist; the relay only counts.
+CREATE TABLE IF NOT EXISTS devices (
+    user_id     TEXT NOT NULL,
+    device_id   TEXT NOT NULL,
+    credential  BLOB NOT NULL,
+    added_at    INTEGER NOT NULL,
+    PRIMARY KEY (user_id, device_id)
+);
+
+CREATE TABLE IF NOT EXISTS device_lists (
+    user_id     TEXT PRIMARY KEY,
+    version     INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
@@ -311,6 +335,126 @@ func (s *Store) Drain(recipient string, afterSeq uint64, limit int) ([]storedMes
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// ---- Device lists ------------------------------------------------------
+//
+// A device list is a set of opaque, account-signed credential blobs plus a
+// version counter the relay owns. The relay never parses a credential: it
+// cannot verify the signature (it has no account key) and it has no reason to,
+// because the client verifies every entry against the key it already pins.
+//
+// What the relay *does* enforce is monotonicity. Without it, a relay that had
+// been compromised, or one that simply replayed an old response, could hand a
+// peer a list from before a device was removed - and the peer would start a
+// session with a device the user had disowned.
+
+// PublishDevices replaces a user's device set and bumps the version.
+//
+// Returns the new version. Replacing the whole set rather than diffing is what
+// makes revocation expressible as omission: a device that is not in the new list
+// is gone, and there is no separate "remove" operation to forget to call.
+func (s *Store) PublishDevices(userID string, credentials [][]byte, deviceIDs []string) (uint32, error) {
+	if len(credentials) != len(deviceIDs) {
+		return 0, fmt.Errorf("devices: %d credentials for %d ids", len(credentials), len(deviceIDs))
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var current uint32
+	err = tx.QueryRow(`SELECT version FROM device_lists WHERE user_id = ?`, userID).Scan(&current)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
+	}
+	next := current + 1
+
+	if _, err := tx.Exec(`
+INSERT INTO device_lists(user_id, version, updated_at)
+VALUES(?,?,strftime('%s','now'))
+ON CONFLICT(user_id) DO UPDATE SET
+    version    = excluded.version,
+    updated_at = excluded.updated_at`, userID, next); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.Exec(`DELETE FROM devices WHERE user_id = ?`, userID); err != nil {
+		return 0, err
+	}
+
+	for i, credential := range credentials {
+		if _, err := tx.Exec(
+			`INSERT INTO devices(user_id, device_id, credential, added_at)
+			 VALUES(?,?,?,strftime('%s','now'))`,
+			userID, deviceIDs[i], credential); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+type deviceRow struct {
+	DeviceID   string
+	Credential []byte
+}
+
+// Devices returns a user's current device list and its version.
+func (s *Store) Devices(userID string) ([]deviceRow, uint32, error) {
+	var version uint32
+	err := s.db.QueryRow(`SELECT version FROM device_lists WHERE user_id = ?`, userID).
+		Scan(&version)
+	if err == sql.ErrNoRows {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := s.db.Query(
+		`SELECT device_id, credential FROM devices WHERE user_id = ? ORDER BY device_id`,
+		userID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var out []deviceRow
+	for rows.Next() {
+		var d deviceRow
+		if err := rows.Scan(&d.DeviceID, &d.Credential); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, d)
+	}
+	return out, version, rows.Err()
+}
+
+// SeedDefaultDevice gives an account that predates device lists a list of one.
+//
+// The credential is the account identity vouching for itself, which is exactly
+// what a first device produces. That is why this migration needs no special
+// case in the client: an upgraded relay serves an upgraded account in the shape
+// the new code already understands.
+func (s *Store) SeedDefaultDevice(userID string, deviceID string, credential []byte) error {
+	var exists int
+	if err := s.db.QueryRow(`SELECT 1 FROM device_lists WHERE user_id = ?`, userID).
+		Scan(&exists); err != nil {
+		if err != sql.ErrNoRows {
+			return err
+		}
+	} else {
+		return nil
+	}
+
+	_, err := s.PublishDevices(userID, [][]byte{credential}, []string{deviceID})
+	return err
 }
 
 // Acknowledge drops everything this recipient has up to and including upTo.

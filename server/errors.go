@@ -17,4 +17,6 @@ var (
 	errBadSignature      = errors.New("identity proof did not verify")
 	errRateLimited       = errors.New("too many sends on this connection; back off")
 	errShuttingDown      = errors.New("relay is shutting down")
+	errBadDevices        = errors.New("malformed device list")
+	errForeignAccount    = errors.New("a connection may only publish its own device list")
 )

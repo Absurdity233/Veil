@@ -33,7 +33,7 @@ class DesktopInteropTest {
     @Test
     fun `the native library loads and reports its version`() {
         val version = VeilEngine.version()
-        assertEquals("0.2.0", version)
+        assertEquals("0.3.0", version)
     }
 
     @Test
