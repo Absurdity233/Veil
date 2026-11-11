@@ -606,6 +606,97 @@ int main() {
         check(bs.decrypt(late, nullptr, 0, p2), "current chain still works");
     }
 
+    section("late frame from an abandoned chain");
+    {
+        // A frame that arrives after the sender has already ratcheted away
+        // must be dropped, not treated as a new ratchet key. Otherwise the
+        // session silently rolls backwards and every later message fails.
+        Identity alice, bob;
+        alice.generate();
+        bob.generate();
+        PreKeys bp;
+        bp.generate(bob, 81, 3);
+        PreKeyBundle bundle = publishBundle(bob, bp, &bp.one_time[0]);
+
+        Session as, bs;
+        as.establishOutbound(alice, bundle);
+
+        RatchetMessage first;
+        as.encrypt(reinterpret_cast<const uint8_t*>("hi"), 2, nullptr, 0, first);
+        bs.establishInbound(bob, bp, as.pendingPreKeyHeader());
+
+        Bytes p;
+        check(bs.decrypt(first, nullptr, 0, p), "first message");
+
+        // Bob replies; both sides ratchet.
+        RatchetMessage reply;
+        bs.encrypt(reinterpret_cast<const uint8_t*>("yo"), 2, nullptr, 0, reply);
+        Bytes pr;
+        check(as.decrypt(reply, nullptr, 0, pr), "reply");
+
+        // Alice sends on the new chain.
+        RatchetMessage after;
+        as.encrypt(reinterpret_cast<const uint8_t*>("new"), 3, nullptr, 0, after);
+
+        // Now the very first frame shows up again. It is a replay from a
+        // chain Bob has left, so it must be refused.
+        Bytes ignored;
+        check(!bs.decrypt(first, nullptr, 0, ignored), "replay from old chain refused");
+
+        // And the session must still be usable afterwards.
+        Bytes pa;
+        check(bs.decrypt(after, nullptr, 0, pa), "session still works");
+        check(toString(pa) == "new", "content after refused replay");
+
+        RatchetMessage back;
+        bs.encrypt(reinterpret_cast<const uint8_t*>("ok"), 2, nullptr, 0, back);
+        Bytes pb;
+        check(as.decrypt(back, nullptr, 0, pb), "reply after refused replay");
+    }
+
+    section("skipped keys survive a ratchet step");
+    {
+        // Messages can cross a ratchet boundary in either order. A frame from
+        // the old chain that arrives after the ratchet must still decrypt,
+        // because its key was cached when the chain was retired.
+        Identity alice, bob;
+        alice.generate();
+        bob.generate();
+        PreKeys bp;
+        bp.generate(bob, 91, 3);
+        PreKeyBundle bundle = publishBundle(bob, bp, &bp.one_time[0]);
+
+        Session as, bs;
+        as.establishOutbound(alice, bundle);
+
+        RatchetMessage a1, a2, a3;
+        as.encrypt(reinterpret_cast<const uint8_t*>("1"), 1, nullptr, 0, a1);
+        as.encrypt(reinterpret_cast<const uint8_t*>("2"), 1, nullptr, 0, a2);
+        as.encrypt(reinterpret_cast<const uint8_t*>("3"), 1, nullptr, 0, a3);
+        bs.establishInbound(bob, bp, as.pendingPreKeyHeader());
+
+        Bytes p;
+        check(bs.decrypt(a1, nullptr, 0, p), "first of the chain");
+
+        // Bob answers before seeing a2 and a3, which retires the chain.
+        RatchetMessage reply;
+        bs.encrypt(reinterpret_cast<const uint8_t*>("r"), 1, nullptr, 0, reply);
+        Bytes pr;
+        check(as.decrypt(reply, nullptr, 0, pr), "reply");
+
+        // a2 and a3 arrive late. Their keys were cached during the ratchet.
+        check(bs.decrypt(a2, nullptr, 0, p), "late a2 decrypts from cache");
+        check(toString(p) == "2", "late a2 content");
+        check(bs.decrypt(a3, nullptr, 0, p), "late a3 decrypts from cache");
+        check(toString(p) == "3", "late a3 content");
+
+        // Alice keeps talking on the new chain.
+        RatchetMessage a4;
+        as.encrypt(reinterpret_cast<const uint8_t*>("4"), 1, nullptr, 0, a4);
+        check(bs.decrypt(a4, nullptr, 0, p), "new chain continues");
+        check(toString(p) == "4", "new chain content");
+    }
+
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
