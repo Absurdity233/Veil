@@ -1991,6 +1991,189 @@ section("group state rejects a malformed blob");
         check(!target.importGroupState(nullptr, 100), "a null pointer is refused");
     }
 
+section("group invitations arrive over a pairwise session");
+    {
+        // An invitation is the *content* of an ordinary message, not a new wire
+        // type. The relay never learns the group id, the member list or who was
+        // invited; it sees "alice sent bob a message", which it already knew.
+        Engine alice, bob;
+        alice.createIdentity(); alice.initDevice("alice");
+        bob.createIdentity();   bob.initDevice("bob");
+        alice.rotatePreKeys();
+
+        alice.createGroup("team");
+        check(alice.setGroupMembers("team", {"alice", "bob"}) == 2, "two members");
+
+        // The invitee needs a pairwise session with the inviter first, because that is
+        // the channel the invitation travels in. The session itself is covered by
+        // its own tests; what matters here is what the invitation does once it
+        // arrives, so the payload is handed over directly.
+
+        // ---- The invitation payload ----
+        Bytes invite = alice.encodeInvite("team");
+        check(!invite.empty(), "an invitation is produced");
+        check(Engine::looksLikeInvite(invite.data(), invite.size()),
+              "it is recognisable as an invitation");
+        check(!Engine::looksLikeInvite(
+                  reinterpret_cast<const uint8_t*>("hello"), 5),
+              "ordinary text is not");
+
+        // It travels as a normal message, so what bob receives is the invitation
+        // bytes. In the real flow they were encrypted by the session; here the
+        // session is exercised separately, and this covers what happens after.
+        std::string group_id;
+        const Engine::Result accepted = bob.acceptInvite(
+            invite.data(), invite.size(), "alice", deviceSignPub(alice).data(), group_id);
+
+        check(accepted == Engine::Result::Ok, "bob accepts the invitation");
+        check(group_id == "team", "and learns the group id");
+        check(bob.groupEpoch("team") == 2, "with the right epoch");
+        check(bob.groupMembers("team").size() == 2, "and the member list");
+        check(bob.isGroupMember("team"), "bob is a member");
+
+        // ---- And can immediately read ----
+        // The chain travelled with the invitation, so there is no second round
+        // trip before the first message can be read.
+        GroupMessage hello;
+        check(alice.encryptToGroup("team", reinterpret_cast<const uint8_t*>("welcome"),
+                                   7, hello), "alice sends");
+        Bytes plain;
+        check(bob.decryptFromGroup("team", hello, plain) == Engine::Result::Ok,
+              "bob reads it with no further exchange");
+        check(toString(plain) == "welcome", "content intact");
+
+        // ---- An invitation from the wrong founder is refused ----
+        {
+            Engine mallory;
+            mallory.createIdentity();
+            mallory.initDevice("mallory");
+            mallory.createGroup("evil");
+            mallory.setGroupMembers("evil", {"mallory", "bob"});
+
+            Bytes forged = mallory.encodeInvite("evil");
+            std::string got;
+            const Engine::Result r = bob.acceptInvite(
+                forged.data(), forged.size(), "alice", deviceSignPub(alice).data(), got);
+            check(r != Engine::Result::Ok,
+                  "an invitation whose member list alice never signed is refused");
+            check(got.empty(), "and no group id is reported");
+        }
+
+        // ---- A truncated invitation is refused ----
+        {
+            std::string got;
+            check(bob.acceptInvite(invite.data(), invite.size() - 5, "alice",
+                                   deviceSignPub(alice).data(), got) != Engine::Result::Ok,
+                  "a truncated invitation is refused");
+            check(bob.acceptInvite(invite.data(), 4, "alice",
+                                   deviceSignPub(alice).data(), got) ==
+                      Engine::Result::BadBundle,
+                  "and so is a stub");
+        }
+
+        // ---- Inviting an existing member is not an error ----
+        {
+            std::string got;
+            const Engine::Result again = bob.acceptInvite(
+                invite.data(), invite.size(), "alice", deviceSignPub(alice).data(), got);
+            check(again == Engine::Result::Ok || again == Engine::Result::Duplicate,
+                  "re-accepting an invitation is tolerated");
+            check(bob.groupEpoch("team") == 2, "and does not move the epoch");
+        }
+    }
+
+section("device linking: a second device joins an account");
+    {
+        // The flow, end to end:
+        //
+        //   new device generates a request  ->  the existing device reads its
+        //   fingerprints, a person compares them, and only then does it sign.
+        //
+        // The signed credential travels back over a channel that already
+        // authenticates the account. A relay cannot issue one, which is what
+        // makes linking an act of the account rather than of the server.
+        Engine phone;
+        phone.createIdentity();
+        check(phone.initDevice("alice"), "the phone is the first device");
+
+        // The new device has its own identity, because it is a different engine.
+        Engine laptop;
+        laptop.createIdentity();
+        check(laptop.initDevice("alice"), "the laptop has its own device");
+
+        Bytes request = laptop.generateLinkingRequest();
+        check(!request.empty(), "the laptop produces a linking request");
+
+        Engine::LinkingRequest parsed;
+        check(Engine::parseLinkingRequest(parsed, request.data(), request.size()),
+              "the phone parses it");
+        check(parsed.user_id == "alice", "it names the account");
+        check(!parsed.fingerprint().empty(), "and has a fingerprint to compare");
+
+        // The fingerprint is over the keys and the nonce, so a second request from
+        // the same laptop reads differently - approving one cannot silently
+        // approve the other.
+        Bytes second = laptop.generateLinkingRequest();
+        check(second != request, "a fresh request differs");
+        Engine::LinkingRequest parsed2;
+        Engine::parseLinkingRequest(parsed2, second.data(), second.size());
+        check(parsed2.fingerprint() != parsed.fingerprint(),
+              "so does its fingerprint");
+
+        // ---- The phone approves ----
+        Bytes signed_cred = phone.approveLinking(parsed, 1700000000);
+        check(!signed_cred.empty(), "the phone signs the endorsement");
+
+        // ---- The laptop adopts it ----
+        Bytes account_pub = phone.exportIdentityPublic();
+        check(laptop.adoptDeviceCredential(signed_cred.data(), signed_cred.size(),
+                                           account_pub.data(),
+                                           account_pub.data() + kKeySize),
+              "the laptop adopts the endorsed credential");
+
+        // The credential is the account's, so a peer verifying it gets the same
+        // answer for both devices.
+        DeviceCredential adopted;
+        check(DeviceCredential::deserialize(adopted, signed_cred.data(), signed_cred.size()),
+              "the credential parses");
+        check(adopted.verify(account_pub.data(), account_pub.data() + kKeySize),
+              "and verifies against the account key");
+        check(adopted.user_id == "alice", "it names the account");
+
+        // ---- A device that is not the account cannot endorse ----
+        {
+            Engine stranger;
+            stranger.createIdentity();
+            stranger.initDevice("alice");
+
+            // It signs with its *own* identity, not alice's.
+            Bytes wrong = stranger.approveLinking(parsed, 1700000000);
+            check(!wrong.empty(), "a stranger can produce a well-formed credential");
+
+            Bytes wrong_pub = stranger.exportIdentityPublic();
+            DeviceCredential wrong_cred;
+            DeviceCredential::deserialize(wrong_cred, wrong.data(), wrong.size());
+            check(!wrong_cred.verify(account_pub.data(), account_pub.data() + kKeySize),
+                  "but alice's account key does not vouch for it");
+            check(wrong_cred.verify(wrong_pub.data(), wrong_pub.data() + kKeySize),
+                  "only the stranger's own key does - which is exactly the attack");
+        }
+
+        // ---- A malformed request is refused ----
+        {
+            Engine::LinkingRequest bad;
+            check(!Engine::parseLinkingRequest(bad, request.data(), request.size() - 1),
+                  "a truncated request is refused");
+            check(!Engine::parseLinkingRequest(bad, request.data(), 4),
+                  "and so is a stub");
+
+            const char* text = "hello there, this is not a request";
+            check(!Engine::parseLinkingRequest(
+                      bad, reinterpret_cast<const uint8_t*>(text), std::strlen(text)),
+                  "and ordinary text");
+        }
+    }
+
 section("ratchet does not move backwards");
     {
         // Alice sends two messages; Bob reads only the first, then replies.

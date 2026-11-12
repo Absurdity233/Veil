@@ -111,12 +111,32 @@ accepted.
   the chains is what stops that; there is no cryptographic erasure beyond it.
 - **Group history for a new member.** A newly added member sees nothing from
   before they joined, because they were never given a chain for it.
-- **Distribution over the wire.** A chain and a member list travel inside a
-  pairwise session, and the clients expose them as export/adopt pairs rather than
-  sending them automatically. A caller has to hand them over; there is no
-  "invite" message yet.
-- **Android group UI.** The controller has the full surface; there are no screens
-  for it.
+- **Distribution over the wire.** Chains and member lists travel through
+  export/adopt pairs and an explicit invitation payload; there is no
+  server-mediated invite, by design.
+
+## Invitations
+
+An invitation is the *content* of an ordinary pairwise message, not a new wire
+type. That choice is the whole design:
+
+- the relay needs no changes, and a relay that added a dedicated frame would
+  learn the group id, the member list and who was invited — this way it learns
+  only "alice sent bob a message", which it already knew;
+- the invitation inherits the encryption and authentication the session already
+  has, so there is nothing new to get wrong;
+- the invitee verifies it against the founder's **device signing key**, taken from
+  the credential this client already pins for them. "Alice invited me" is checked
+  against the alice this client verified during the handshake, not against whoever
+  sent the bytes.
+
+The payload carries the founder's signed member list *and* the founder's chain
+for that epoch, so accepting it leaves the invitee able to read immediately. An
+invitation that needed a second round trip would be an invitation nobody accepts.
+
+A fixed 8-byte prefix marks it, so a client that predates invitations sees the
+prefix as ordinary text rather than as a corrupt frame. Nothing decodes it: it is
+a marker, not a format version.
 
 ## What the clients show
 

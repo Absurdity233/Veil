@@ -234,7 +234,8 @@ yet.
 | Relay: device table, `PUBLISH_DEVICES` / `GET_DEVICES` | `server/store.go`, `server/hub.go` | done |
 | Relay: `HELLO` and `SEND` carry a device id, outbox per device | `server/hub.go`, `server/store.go` | done |
 | Clients: device id claimed, persisted, announced; fan-out send | `app/`, `desktop/`, `web/` | done |
-| Client UI: linking flow, device list refresh | `app/`, `desktop/`, `web/` | **not started** |
+| Linking: request, approval, credential adoption | `core-native/.../engine.{h,cpp}`, `veil_c` | done |
+| Client UI: linking flow, device list refresh | `app/`, `desktop/`, `web/` | linking done for Android; refresh not started |
 
 The relay is device-aware: a connection announces its device in `HELLO`, a
 `SEND` may name one, and a frame addressed to a device reaches only that device's
@@ -271,14 +272,39 @@ testable without a relay:
   account unreachable
 - the account safety number does not move when devices are added
 
-### What is deliberately still missing
+### Linking, as implemented
 
-- **Linking UI.** The protocol supports it (`adoptDeviceCredential`) and all
-  three clients can call it; none of them draws the QR code or the fingerprint
-  comparison yet.
+```
+new device                          existing device (holds the account key)
+    |  generateLinkingRequest()                |
+    |  ---------------- request ------------->  |  read it: account + fingerprint
+    |                                           |  a person compares the fingerprints
+    |  <--------------- credential ------------  |  approveLinking()
+    |  adoptDeviceCredential()                  |
+```
+
+The request carries public halves only, plus the requesting device's own binding
+of its DH key. That binding travels in the request because only that device can
+produce it, and the credential is not valid without it — an earlier version of
+this tried to derive it on the approving side and quietly produced credentials
+that could never verify.
+
+The fingerprint is over the keys *and* the request nonce, so two requests from the
+same device read differently: approving "this one" cannot be answered by approving
+the previous one. It is shown large and monospaced in the client, because it is the
+one thing the user has to actually compare.
+
+Linking is not server-mediated. The relay cannot issue a credential (it has no
+account key), and the credential travels over a channel that already authenticates
+the account.
+
+### What is still missing
+
+- **QR / camera transfer.** The flow is text: a base64 request and a base64
+  credential, copied between devices. That works and is honest; a QR code would be
+  faster and is a client-side addition.
 - **Device list refresh strategy.** When a client re-fetches, and how it behaves
-  when a send fails because a device list moved, is a client decision that has
-  not been made. The web client has `refreshPeerDevices` and
-  `connectPeerDevices`; the other two do not surface them yet.
+  when a send fails because a device list moved, is a client decision that has not
+  been made. The web client has `refreshPeerDevices` and `connectPeerDevices`.
 - **History transfer to a new device.** Out of scope above, and still out of
   scope.

@@ -6,6 +6,7 @@
 #include <ctime>
 
 #include "veil/crypto.h"
+#include "veil/random.h"
 
 namespace veil {
 
@@ -1094,6 +1095,273 @@ Engine::Result Engine::decryptFromGroup(const std::string& group_id,
 
     if (!ok) return Result::AuthFailed;
     out = std::move(plain);
+    return Result::Ok;
+}
+
+// ---- Device linking ----------------------------------------------------
+//
+// The request carries public halves only. Its nonce is what makes a captured
+// request useless later: an endorsement is for one request, and a replay of an
+// old request would produce a credential the new device cannot use, because the
+// keys in it are the ones the request named.
+
+namespace {
+
+constexpr char kLinkingDomain[] = "Veil/linking-request/v1";
+
+}  // namespace
+
+Bytes Engine::accountSignPublic() const {
+    return Bytes(identity_.sign_pub, identity_.sign_pub + 32);
+}
+
+bool Engine::peerDeviceSignPublic(const std::string& peer, uint8_t out[32]) const {
+    if (out == nullptr) return false;
+
+    // Talking to yourself: the key is this device's own.
+    if (has_device_keys_ && peer == user_id_) {
+        std::memcpy(out, device_sign_pub_, 32);
+        return true;
+    }
+
+    // A device-scoped label ("bob#<hex>") names a credential directly.
+    const auto hash = peer.find('#');
+    if (hash != std::string::npos) {
+        const std::string account = peer.substr(0, hash);
+        const std::string device_hex = peer.substr(hash + 1);
+
+        auto devices = peer_devices_.find(account);
+        if (devices == peer_devices_.end()) return false;
+
+        for (const auto& cred : devices->second.devices) {
+            if (hex(cred.device_id, kDeviceIdSize) != device_hex) continue;
+            std::memcpy(out, cred.device_sign_pub, 32);
+            return true;
+        }
+        return false;
+    }
+
+    // An account-scoped label: only unambiguous when that account has exactly one
+    // device. With two, "which one invited me" is a real question and answering it
+    // by picking the first would verify the invitation against the wrong key.
+    auto devices = peer_devices_.find(peer);
+    if (devices == peer_devices_.end() || devices->second.devices.size() != 1) {
+        return false;
+    }
+
+    std::memcpy(out, devices->second.devices[0].device_sign_pub, 32);
+    return true;
+}
+
+Bytes Engine::generateLinkingRequest() const {
+    if (!has_device_keys_) return {};
+    if (user_id_.empty()) return {};
+
+    uint8_t nonce[32];
+    if (!secure_random(nonce, sizeof(nonce))) return {};
+
+    // The device's own endorsement of its DH key, which only it can produce.
+    uint8_t binding[kBindingSize];
+    crypto::ed25519_sign(binding, device_sign_priv_, device_dh_pub_, kKeySize);
+
+    Bytes out;
+    out.reserve(sizeof(kLinkingDomain) - 1 + 2 + user_id_.size() +
+                kDeviceIdSize + kKeySize + 32 + kBindingSize + 32);
+
+    out.insert(out.end(), kLinkingDomain, kLinkingDomain + sizeof(kLinkingDomain) - 1);
+
+    out.push_back(static_cast<uint8_t>((user_id_.size() >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>(user_id_.size() & 0xFF));
+    out.insert(out.end(), user_id_.begin(), user_id_.end());
+
+    out.insert(out.end(), device_id_, device_id_ + kDeviceIdSize);
+    out.insert(out.end(), device_dh_pub_, device_dh_pub_ + kKeySize);
+    out.insert(out.end(), device_sign_pub_, device_sign_pub_ + 32);
+    out.insert(out.end(), binding, binding + kBindingSize);
+    out.insert(out.end(), nonce, nonce + 32);
+
+    veil::wipe(binding, sizeof(binding));
+    return out;
+}
+
+std::string Engine::LinkingRequest::fingerprint() const {
+    // The keys and the nonce, not the device id: the id is relay bookkeeping, and
+    // including the nonce is what makes two requests from the same keys read
+    // differently - so "approve this one" cannot be answered by approving the
+    // previous one.
+    static const char kDomain[] = "Veil/linking-fingerprint/v1";
+    constexpr size_t kDomainLen = sizeof(kDomain) - 1;
+
+    uint8_t buffer[kDomainLen + kKeySize + 32 + 32];
+    std::memcpy(buffer, kDomain, kDomainLen);
+    std::memcpy(buffer + kDomainLen, device_dh_pub, kKeySize);
+    std::memcpy(buffer + kDomainLen + kKeySize, device_sign_pub, 32);
+    std::memcpy(buffer + kDomainLen + kKeySize + 32, nonce, 32);
+
+    uint8_t digest[32];
+    crypto::blake2b(digest, sizeof(digest), buffer, sizeof(buffer));
+
+    static const char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(19);
+    for (int group = 0; group < 4; ++group) {
+        if (group != 0) out.push_back('-');
+        for (int byte = 0; byte < 2; ++byte) {
+            const uint8_t b = digest[group * 2 + byte];
+            out.push_back(kHex[b >> 4]);
+            out.push_back(kHex[b & 0x0F]);
+        }
+    }
+
+    veil::wipe(buffer, sizeof(buffer));
+    veil::wipe(digest, sizeof(digest));
+    return out;
+}
+
+bool Engine::parseLinkingRequest(LinkingRequest& out, const uint8_t* data, size_t size) {
+    if (data == nullptr) return false;
+
+    const size_t domain_len = sizeof(kLinkingDomain) - 1;
+    if (size < domain_len + 2) return false;
+    if (std::memcmp(data, kLinkingDomain, domain_len) != 0) return false;
+
+    size_t off = domain_len;
+
+    const size_t id_len = (static_cast<size_t>(data[off]) << 8) | data[off + 1];
+    off += 2;
+    if (id_len == 0 || id_len > 128) return false;
+
+    const size_t rest = kDeviceIdSize + kKeySize + 32 + kBindingSize + 32;
+    if (size - off < id_len + rest) return false;
+
+    out.user_id.assign(reinterpret_cast<const char*>(data + off), id_len);
+    off += id_len;
+
+    std::memcpy(out.device_id, data + off, kDeviceIdSize); off += kDeviceIdSize;
+    std::memcpy(out.device_dh_pub, data + off, kKeySize); off += kKeySize;
+    std::memcpy(out.device_sign_pub, data + off, 32); off += 32;
+    std::memcpy(out.device_binding, data + off, kBindingSize); off += kBindingSize;
+    std::memcpy(out.nonce, data + off, 32);
+
+    // One trailing-byte check: a request with extra data is not this request.
+    return off + 32 == size;
+}
+
+Bytes Engine::approveLinking(const LinkingRequest& request, uint64_t issued_at) const {
+    if (request.user_id.empty() || request.user_id.size() > 128) return {};
+
+    // The device's self-binding came with the request: only the requesting device
+    // holds the private key that produces it, so this engine cannot derive it and
+    // must not pretend to. Copying it forward is what lets the resulting
+    // credential verify as a whole.
+    DeviceCredential signed_cred;
+    signed_cred.user_id = request.user_id;
+    std::memcpy(signed_cred.device_id, request.device_id, kDeviceIdSize);
+    std::memcpy(signed_cred.device_dh_pub, request.device_dh_pub, kKeySize);
+    std::memcpy(signed_cred.device_sign_pub, request.device_sign_pub, 32);
+    signed_cred.issued_at = issued_at;
+    std::memcpy(signed_cred.device_binding, request.device_binding, kBindingSize);
+    std::memset(signed_cred.account_signature, 0, kSigSize);
+
+    if (!signed_cred.signBy(identity_)) return {};
+
+    return signed_cred.serialize();
+}
+
+// ---- Group invitations -------------------------------------------------
+//
+// The payload, after the prefix:
+//
+//   [4] group id length | group id
+//   [4] membership length | membership (the founder's signed record)
+//   [4] chain length | chain (the founder's sender key for that epoch)
+//
+// Both inner blobs are exactly what exportMembership and exportSenderKey
+// produce, so an invitation cannot drift from what those two formats are: it
+// carries them, it does not re-encode them.
+
+Bytes Engine::encodeInvite(const std::string& group_id) const {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) return {};
+
+    const Bytes membership = exportMembership(group_id);
+    if (membership.empty()) return {};
+
+    // The founder's own chain for the current epoch. Without it the invitee can
+    // verify who is in the group but cannot read a single message, which makes
+    // the invitation useless until a second round trip completes.
+    const Bytes chain = exportSenderKey(group_id, it->second.membership.epoch);
+    if (chain.empty()) return {};
+
+    Bytes out;
+    out.reserve(kInvitePrefixSize + 12 + group_id.size() + membership.size() + chain.size());
+
+    out.insert(out.end(), kInvitePrefix, kInvitePrefix + kInvitePrefixSize);
+
+    auto putBlob = [&out](const Bytes& blob) {
+        uint8_t num[4];
+        put_u32(num, static_cast<uint32_t>(blob.size()));
+        out.insert(out.end(), num, num + 4);
+        out.insert(out.end(), blob.begin(), blob.end());
+    };
+
+    Bytes id_bytes(group_id.begin(), group_id.end());
+    putBlob(id_bytes);
+    putBlob(membership);
+    putBlob(chain);
+    return out;
+}
+
+bool Engine::looksLikeInvite(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < kInvitePrefixSize) return false;
+    return std::memcmp(data, kInvitePrefix, kInvitePrefixSize) == 0;
+}
+
+Engine::Result Engine::acceptInvite(const uint8_t* data, size_t size,
+                                    const std::string& expected_founder,
+                                    const uint8_t founder_sign_pub[32],
+                                    std::string& out_group_id) {
+    out_group_id.clear();
+    if (data == nullptr || size < kInvitePrefixSize + 12) return Result::BadBundle;
+    if (!looksLikeInvite(data, size)) return Result::BadBundle;
+
+    size_t off = kInvitePrefixSize;
+
+    auto readBlob = [&](Bytes& out) -> bool {
+        if (size - off < 4) return false;
+        const uint32_t len = get_u32(data + off);
+        off += 4;
+        if (static_cast<size_t>(len) > size - off) return false;
+        out.assign(data + off, data + off + len);
+        off += len;
+        return true;
+    };
+
+    Bytes id_bytes, membership, chain;
+    if (!readBlob(id_bytes)) return Result::BadBundle;
+    if (!readBlob(membership)) return Result::BadBundle;
+    if (!readBlob(chain)) return Result::BadBundle;
+
+    if (id_bytes.empty() || id_bytes.size() > 128) return Result::BadBundle;
+    const std::string group_id(id_bytes.begin(), id_bytes.end());
+
+    // The member list first: it establishes the group and its epoch, which the
+    // chain is then matched against.
+    const Result adopted = adoptMembership(membership.data(), membership.size(),
+                                           founder_sign_pub);
+    if (adopted != Result::Ok) return adopted;
+
+    // Then the founder's chain, verified with the same device key the founder's
+    // credential carries.
+    const Result chained = adoptSenderKey(chain.data(), chain.size(),
+                                          expected_founder, founder_sign_pub);
+    if (chained != Result::Ok && chained != Result::Duplicate) return chained;
+
+    // Only now is the group usable. Reaching this point means the member list
+    // verified, so "the founder said so" is established rather than assumed.
+    if (groups_.find(group_id) == groups_.end()) return Result::NoSession;
+
+    out_group_id = group_id;
     return Result::Ok;
 }
 

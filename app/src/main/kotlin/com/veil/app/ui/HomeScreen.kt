@@ -1,4 +1,4 @@
-package com.veil.app.ui
+﻿package com.veil.app.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -24,12 +24,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.veil.app.LinkState
 import com.veil.app.R
+import com.veil.app.data.GroupUi
 import com.veil.app.data.Peer
 import com.veil.app.data.SessionUiState
 
@@ -52,20 +56,114 @@ fun HomeScreen(
     serverUrl: String,
     link: LinkState,
     peers: List<Peer>,
+    groups: List<GroupUi>,
     status: String?,
     onConnect: (serverUrl: String, userId: String) -> Unit,
     onAddPeer: (String) -> Unit,
     onOpenPeer: (Peer) -> Unit,
+    onCreateGroup: (String) -> Unit,
+    onOpenGroup: (String) -> Unit,
+    onLinkThis: suspend () -> String?,
+    onReadRequest: suspend (String) -> Pair<String, String>?,
+    onApprove: suspend (String) -> String?,
+    onAdopt: suspend (String, String) -> Boolean,
 ) {
     var url by remember { mutableStateOf(serverUrl) }
     var userId by remember { mutableStateOf(selfUserId) }
     var peerId by remember { mutableStateOf("") }
+    var groupName by remember { mutableStateOf("") }
+
+    var linkMode by remember { mutableStateOf<LinkMode?>(null) }
+    var linkRequest by remember { mutableStateOf<String?>(null) }
+    var linkStatus by remember { mutableStateOf<String?>(null) }
+    var fingerprint by remember { mutableStateOf<String?>(null) }
+    var requestedUser by remember { mutableStateOf<String?>(null) }
+
+    val scope = rememberCoroutineScope()
+
+    // The dialog is hoisted out of the Scaffold so it survives a recomposition of
+    // the list behind it: a linking flow interrupted by an incoming message
+    // arriving should not lose the request the user just generated.
+    linkMode?.let { mode ->
+        DeviceLinkDialog(
+            mode = mode,
+            request = linkRequest,
+            status = linkStatus,
+            onDismiss = { linkMode = null },
+            onGenerateRequest = {
+                scope.launch {
+                    linkRequest = onLinkThis()
+                    linkStatus = if (linkRequest == null) {
+                        "this client has no device identity yet; connect first"
+                    } else {
+                        null
+                    }
+                }
+            },
+            onReadRequest = { text ->
+                scope.launch {
+                    // The decoder lives with the controller, which owns the one
+                    // definition of how a request is encoded. Doing it here too
+                    // would be a second definition to keep in step.
+                    fingerprint = null
+                    val read = onReadRequest(text)
+                    if (read == null) {
+                        linkStatus = "that request could not be read"
+                        return@launch
+                    }
+                    requestedUser = read.first
+                    fingerprint = read.second
+                    linkStatus = null
+                }
+            },
+            onApprove = { text ->
+                scope.launch {
+                    val credentialed = onApprove(text)
+                    linkStatus = if (credentialed == null) {
+                        "only the device that holds the account key can approve"
+                    } else {
+                        "approved. Copy this to the new device:\n$credentialed"
+                    }
+                }
+            },
+            onAdopt = { combined ->
+                scope.launch {
+                    val parts = combined.split('|', limit = 2)
+                    if (parts.size != 2) {
+                        linkStatus = "paste the credential and the account key"
+                        return@launch
+                    }
+                    linkStatus = if (onAdopt(parts[0], parts[1])) {
+                        "this device is now part of the account"
+                    } else {
+                        "that credential was refused"
+                    }
+                }
+            },
+        )
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(stringResource(R.string.home_title), fontWeight = FontWeight.SemiBold) },
-                actions = { LinkBadge(link) },
+                actions = {
+                    // Two halves of one flow: a device that has the account
+                    // approves a new one, and a device that does not asks to be
+                    // approved. Both live here because the user is holding one
+                    // device and looking at the other.
+                    TextButton(onClick = {
+                        linkMode = LinkMode.LINK_THIS
+                        linkRequest = null
+                        linkStatus = null
+                    }) { Text("Link", fontSize = 12.sp) }
+                    TextButton(onClick = {
+                        linkMode = LinkMode.APPROVE_OTHER
+                        linkStatus = null
+                        fingerprint = null
+                    }) { Text("Approve", fontSize = 12.sp) }
+                    LinkBadge(link)
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
                 ),
@@ -151,10 +249,36 @@ fun HomeScreen(
             }
 
             Spacer(Modifier.height(16.dp))
+
+            // Creating a group is local: it needs a device, not a connection, so
+            // this stays enabled while offline. A client that could not prepare a
+            // group before its members were reachable would be a worse client.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = groupName,
+                    onValueChange = { groupName = it },
+                    label = { Text("New group name") },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = {
+                        val name = groupName.trim()
+                        groupName = ""
+                        if (name.isNotEmpty()) onCreateGroup(name)
+                    },
+                    enabled = groupName.isNotBlank() && link != LinkState.Connecting,
+                ) {
+                    Text("Group")
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
             Text(stringResource(R.string.conversations), fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
 
-            if (peers.isEmpty()) {
+            if (peers.isEmpty() && groups.isEmpty()) {
                 Text(
                     stringResource(R.string.empty_conversations),
                     fontSize = 13.sp,
@@ -164,6 +288,10 @@ fun HomeScreen(
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     items(peers, key = { it.userId }) { peer ->
                         PeerRow(peer) { onOpenPeer(peer) }
+                        HorizontalDivider()
+                    }
+                    items(groups, key = { "group-${it.groupId}" }) { group ->
+                        GroupRow(group) { onOpenGroup(group.groupId) }
                         HorizontalDivider()
                     }
                 }

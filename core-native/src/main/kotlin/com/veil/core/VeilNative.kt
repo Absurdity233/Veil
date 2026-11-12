@@ -130,4 +130,47 @@ internal object VeilNative {
     /** Carries chain keys: store it in the Keystore-backed vault, not in the clear. */
     external fun nativeExportGroupState(handle: Long): ByteArray?
     external fun nativeImportGroupState(handle: Long, blob: ByteArray): Boolean
+
+    // ---- Group invitations -------------------------------------------------
+    //
+    // An invitation is the content of an ordinary pairwise message, not a new
+    // wire type: the relay needs no changes and never learns the group id.
+
+    external fun nativeEncodeInvite(handle: Long, groupId: String): ByteArray?
+    external fun nativeLooksLikeInvite(data: ByteArray): Boolean
+
+    /**
+     * Accepts an invitation. Returns the group id, or null when it was refused.
+     *
+     * A refused invitation carries no group id rather than an empty one, so a
+     * caller cannot mistake "refused" for "accepted into a nameless group".
+     */
+    external fun nativeAcceptInvite(
+        handle: Long,
+        data: ByteArray,
+        expectedFounder: String,
+        founderSignPub: ByteArray,
+    ): String?
+
+    // ---- Device linking ----------------------------------------------------
+
+    /** This device's request, for the existing device to endorse. */
+    external fun nativeLinkingRequest(handle: Long): ByteArray?
+
+    /**
+     * The account a request names and its fingerprint, as a two-element array.
+     *
+     * Returned together because a UI needs both to show anything useful, and two
+     * calls would let the two answers come from different bytes.
+     */
+    external fun nativeReadLinkingRequest(data: ByteArray): Array<String>?
+
+    /** Signs an endorsement. Null when this engine does not hold the account key. */
+    external fun nativeApproveLinking(handle: Long, request: ByteArray, issuedAt: Long): ByteArray?
+
+    /** 32 bytes: the account signing key, for verifying credentials and lists. */
+    external fun nativeAccountSignPublic(handle: Long): ByteArray?
+
+    /** The device signing key a peer's credential vouches for; null when unknown. */
+    external fun nativePeerDeviceSignPub(handle: Long, peer: String): ByteArray?
 }

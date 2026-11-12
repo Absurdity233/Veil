@@ -283,6 +283,70 @@ public:
     // the two are not separate functions - a per-device safety number would be
     // a different, and less useful, thing to ask a user to compare.
 
+    // ---- Device linking -------------------------------------------------
+    //
+    // The flow, and why each half lives where it does:
+    //
+    //   new device                      existing device (holds the account key)
+    //   ----------                      -------------------------------------
+    //   generateLinkingRequest()  --->  read the fingerprints, compare on screen
+    //                                   approveLinking(...)  signs the endorsement
+    //   <---  the signed credential
+    //   adoptDeviceCredential()
+    //
+    // The signed credential travels over a channel that already authenticates
+    // the account - out of band, or through a session that exists - because the
+    // whole point is that a relay cannot issue one.
+
+    // This device's public keys, plus a one-time nonce, for the other device to
+    // endorse. Carries no secrets: it is meant to be shown as a QR code or read
+    // aloud.
+    Bytes generateLinkingRequest() const;
+
+    // Reads a linking request a new device produced: its device id and public
+    // halves. Returns false on anything malformed, so a UI can refuse to display
+    // a request it does not understand rather than showing garbage to approve.
+    struct LinkingRequest {
+        std::string user_id;
+        uint8_t device_id[kDeviceIdSize]{};
+        uint8_t device_dh_pub[kKeySize]{};
+        uint8_t device_sign_pub[32]{};
+        // The requesting device's signature over its own DH key. It travels in the
+        // request because only that device can produce it, and the credential is
+        // not valid without it.
+        uint8_t device_binding[kBindingSize]{};
+        uint8_t nonce[32]{};
+
+        // What a person compares: the device's keys and the request nonce, not the
+        // id the relay will assign. Including the nonce is what makes two requests
+        // from the same keys read differently, so approving this one cannot be
+        // answered by approving the previous one.
+        std::string fingerprint() const;
+    };
+    static bool parseLinkingRequest(LinkingRequest& out, const uint8_t* data, size_t size);
+
+    // Signs an endorsement for another device.
+    //
+    // Only an engine that holds the account identity can do this - which is what
+    // makes linking an act of the account rather than of the relay. `issued_at`
+    // is passed in rather than read from the clock so a test can pin it.
+    Bytes approveLinking(const LinkingRequest& request, uint64_t issued_at) const;
+
+    // The account signing key, for a UI that needs to verify a credential or a
+    // member list without owning the account. 32 bytes.
+    Bytes accountSignPublic() const;
+
+    // The device signing key of a peer, from the credential this engine adopted
+    // for them; or this engine's own when the label is its own user.
+    //
+    // This is what an invitation is verified against: the key the peer's
+    // credential vouches for, which is the peer this client actually verified
+    // during the handshake rather than whoever sent the bytes.
+    //
+    // Returns false when no key is known, so a caller refuses the invitation
+    // instead of verifying it against nothing.
+    bool peerDeviceSignPublic(const std::string& peer, uint8_t out[32]) const;
+
 private:
     // Session keys are "<user id>#<device id hex>". A composite label rather
     // than a struct keeps the existing session registry, persistence and
@@ -378,6 +442,46 @@ public:
     Result decryptFromGroup(const std::string& group_id,
                             const GroupMessage& message,
                             Bytes& out);
+
+    // ---- Group invitations ----------------------------------------------
+    //
+    // An invitation is not a new wire type. It travels as the *content* of an
+    // ordinary pairwise message, which means the relay needs no changes at all
+    // and the invitation inherits the encryption and authentication the session
+    // already has. A relay that added a dedicated frame would learn the group id,
+    // the member list and who was invited; this way it learns nothing it did not
+    // already learn from "alice sent bob something".
+    //
+    // The payload is a sealed envelope carrying the founder's signed member list
+    // and the founder's chain for that epoch. Accepting it leaves the recipient
+    // able to both send and read immediately, which is the point: an invitation
+    // that required a second round trip would be an invitation nobody accepts.
+    //
+    // Invitations are distinguishable from text by a fixed 8-byte prefix, so a
+    // client that predates them sees the prefix as ordinary text rather than as a
+    // corrupt frame. Nothing decodes it; it is a marker, not a format version.
+
+    // Builds the invitation payload for a group, as content to be encrypted and
+    // sent to one invitee over a pairwise session.
+    Bytes encodeInvite(const std::string& group_id) const;
+
+    // True when a decrypted message is an invitation rather than text.
+    static bool looksLikeInvite(const uint8_t* data, size_t size);
+
+    // Accepts an invitation: adopts the member list, adopts the founder's chain,
+    // and adds the group. `founder_sign_pub` is the key the invitee already pins
+    // for the inviter, which is what makes "the founder said so" checkable.
+    //
+    // Returns the group id on success, empty on failure.
+    Result acceptInvite(const uint8_t* data, size_t size,
+                        const std::string& expected_founder,
+                        const uint8_t founder_sign_pub[32],
+                        std::string& out_group_id);
+
+    // The prefix that marks an invitation. Exposed so a client can show "this is
+    // an invitation" without decoding the payload.
+    static constexpr char kInvitePrefix[] = "VEILINV1";
+    static constexpr size_t kInvitePrefixSize = sizeof(kInvitePrefix) - 1;
 
     // ---- Group persistence ----------------------------------------------
     //

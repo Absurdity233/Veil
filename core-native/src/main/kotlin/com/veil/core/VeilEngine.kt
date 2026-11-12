@@ -325,6 +325,75 @@ class VeilEngine private constructor(handle: Long) : AutoCloseable {
     fun importGroupState(blob: ByteArray): Boolean =
         VeilNative.nativeImportGroupState(state.handle, blob)
 
+    // ---- Group invitations ------------------------------------------------
+
+    /**
+     * Builds the invitation payload, to be encrypted and sent to one invitee.
+     *
+     * It travels as ordinary message content: the relay needs no changes and
+     * never learns the group id or the member list.
+     */
+    fun encodeInvite(groupId: String): ByteArray? =
+        VeilNative.nativeEncodeInvite(state.handle, groupId)
+
+    /** True when a decrypted message is an invitation rather than text. */
+    fun looksLikeInvite(data: ByteArray): Boolean =
+        VeilNative.nativeLooksLikeInvite(data)
+
+    /**
+     * Accepts an invitation against the founder's device signing key.
+     *
+     * Returns the group id, or null when refused. On success the group is usable
+     * immediately - the payload carries the founder's chain, so there is no
+     * second round trip before the first message can be read.
+     */
+    fun acceptInvite(
+        data: ByteArray,
+        expectedFounder: String,
+        founderSignPub: ByteArray,
+    ): String? = VeilNative.nativeAcceptInvite(
+        state.handle, data, expectedFounder, founderSignPub,
+    )
+
+    // ---- Device linking ---------------------------------------------------
+
+    /** This device's request, for the existing device to endorse. */
+    fun linkingRequest(): ByteArray? = VeilNative.nativeLinkingRequest(state.handle)
+
+    /**
+     * The account a request names and its fingerprint.
+     *
+     * Both from one call, so a UI cannot show a fingerprint that belongs to a
+     * different request than the one it is about to approve.
+     */
+    fun readLinkingRequest(data: ByteArray): Pair<String, String>? =
+        VeilNative.nativeReadLinkingRequest(data)?.let {
+            if (it.size == 2) (it[0] ?: "") to (it[1] ?: "") else null
+        }
+
+    /**
+     * Signs an endorsement for another device.
+     *
+     * Null when this engine does not hold the account key, which is the whole
+     * point: only the account can add a device.
+     */
+    fun approveLinking(request: ByteArray, issuedAt: Long): ByteArray? =
+        VeilNative.nativeApproveLinking(state.handle, request, issuedAt)
+
+    /** The account signing key, for verifying a credential or a member list. */
+    fun accountSignPublic(): ByteArray? = VeilNative.nativeAccountSignPublic(state.handle)
+
+    /**
+     * The device signing key a peer's credential vouches for.
+     *
+     * This is what an invitation is verified against: the key the peer's
+     * credential carries, which is the peer this client verified during the
+     * handshake rather than whoever sent the bytes. Null when no key is known,
+     * which is a refusal rather than an empty verification.
+     */
+    fun peerDeviceSignPublic(peer: String): ByteArray? =
+        VeilNative.nativePeerDeviceSignPub(state.handle, peer)
+
     /**
      * Decrypts a wire frame.
      *

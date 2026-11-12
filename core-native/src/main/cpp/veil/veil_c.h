@@ -1,4 +1,4 @@
-// Veil - C ABI.
+﻿// Veil - C ABI.
 //
 // The C++ engine is the implementation; this is the boundary every other
 // language talks to. It exists so that a new platform does not need to
@@ -379,7 +379,69 @@ VEIL_API int veil_export_group_state(const void* handle, uint8_t* out, size_t ou
 // untouched rather than half-loaded.
 VEIL_API int veil_import_group_state(void* handle, const uint8_t* data, size_t size);
 
+// ---- Group invitations -------------------------------------------------
+//
+// An invitation is the *content* of an ordinary pairwise message, not a new
+// wire type: the relay needs no changes, and the invitation inherits the
+// encryption and authentication the session already has. A dedicated frame would
+// tell the relay the group id, the member list and who was invited; this tells it
+// only what it already knew.
+
+// Builds the payload to encrypt and send to one invitee. NULL `out` for the size.
+VEIL_API int veil_encode_invite(const void* handle, const char* group_id,
+                                uint8_t* out, size_t out_size);
+
+// 1 when a decrypted message is an invitation, 0 when it is text.
+VEIL_API int veil_looks_like_invite(const uint8_t* data, size_t size);
+
+// ---- Device linking ----------------------------------------------------
+//
+// The new device generates a request; the existing device (which holds the
+// account key) reads the fingerprints, a person compares them, and only then does
+// it sign. The signed credential travels back over a channel that already
+// authenticates the account.
+
+// This device's request, for the other device to endorse. NULL `out` for size.
+VEIL_API int veil_linking_request(const void* handle, uint8_t* out, size_t out_size);
+
+// Reads a request into `fingerprint` (4 groups of 4 hex, NUL-terminated) and the
+// account it names. Either output may be NULL.
+VEIL_API int veil_read_linking_request(const uint8_t* data, size_t size,
+                                       char* user_id, size_t user_id_size,
+                                       char* fingerprint, size_t fingerprint_size);
+
+// Signs an endorsement for another device. NULL `out` for size.
+//
+// Only an engine holding the account identity can do this, which is what makes
+// linking an act of the account rather than of the relay.
+VEIL_API int veil_approve_linking(const void* handle,
+                                  const uint8_t* request, size_t request_size,
+                                  uint64_t issued_at,
+                                  uint8_t* out, size_t out_size);
+
+// 32 bytes: the account signing key, for a UI that needs to verify a credential
+// or a member list without owning the account.
+VEIL_API int veil_account_sign_public(const void* handle, uint8_t* out, size_t out_size);
+
+// Accepts an invitation, against the founder's device signing key.
+//
+// On success the group is usable immediately: the payload carries the founder's
+// chain, so there is no second round trip before the first message can be read.
+// `out_group_id` receives a NUL-terminated id; a NULL `out_group_id` is allowed.
+VEIL_API int veil_accept_invite(void* handle, const uint8_t* data, size_t size,
+                                const char* expected_founder,
+                                const uint8_t* founder_sign_pub,
+                                char* out_group_id, size_t out_size);
+
 #ifdef __cplusplus
+// The device signing key a peer's credential vouches for, or VEIL_NO_SESSION.
+//
+// This is what an invitation is verified against: the key the peer's credential
+// carries, which is the peer this client verified during the handshake rather
+// than whoever sent the bytes.
+VEIL_API int veil_peer_device_sign_pub(const void* handle, const char* peer,
+                                       uint8_t* out, size_t out_size);
+
 }  // extern "C"
 #endif
 

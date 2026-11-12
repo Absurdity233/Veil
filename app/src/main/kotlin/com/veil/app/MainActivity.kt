@@ -16,6 +16,7 @@ import androidx.compose.ui.platform.LocalContext
 import com.veil.app.data.Peer
 import com.veil.app.data.SessionUiState
 import com.veil.app.ui.ChatScreen
+import com.veil.app.ui.GroupScreen
 import com.veil.app.ui.HomeScreen
 import com.veil.app.ui.VeilTheme
 
@@ -53,17 +54,26 @@ private fun VeilApp() {
     val link by controller.link.collectAsState()
     val peers by controller.peers.collectAsState()
     val status by controller.status.collectAsState()
+    val groups by controller.groups.collectAsState()
 
+    // One navigation slot holding either kind of conversation, rather than two
+    // screens and two flags: the back action has to have one answer for where it
+    // returns to, and two sources of truth is how it stops having one.
     var openPeer by remember { mutableStateOf<Peer?>(null) }
+    var openGroupId by remember { mutableStateOf<String?>(null) }
     var selfUserId by remember { mutableStateOf("") }
 
     val peer = openPeer
-    if (peer == null) {
+    val groupId = openGroupId
+    val group = groups.firstOrNull { it.groupId == groupId }
+
+    if (peer == null && group == null) {
         HomeScreen(
             selfUserId = selfUserId,
             serverUrl = DEFAULT_RELAY,
             link = link,
             peers = peers,
+            groups = groups,
             status = status,
             onConnect = { url, id ->
                 selfUserId = id
@@ -71,8 +81,35 @@ private fun VeilApp() {
             },
             onAddPeer = { controller.addPeer(it) },
             onOpenPeer = { openPeer = it },
+            onCreateGroup = { controller.createGroup(it) },
+            onOpenGroup = { openGroupId = it },
+            onLinkThis = { controller.linkingRequestText() },
+            onReadRequest = { text ->
+                controller.decodeText(text)?.let { controller.readLinkingRequest(it) }
+            },
+            onApprove = { text ->
+                controller.decodeText(text)?.let { controller.approveLinkingText(it) }
+            },
+            onAdopt = { credential, identity ->
+                controller.adoptLinkingFromText(credential, identity)
+            },
         )
-    } else {
+    } else if (group != null) {
+        val groupMessages by controller.groupMessages.collectAsState()
+
+        GroupScreen(
+            group = group,
+            link = link,
+            messages = groupMessages[group.groupId]
+                ?: controller.messagesForGroup(group.groupId),
+            peers = peers,
+            status = status,
+            onSend = { controller.sendToGroup(group.groupId, it) },
+            onSetMembers = { controller.setGroupMembers(group.groupId, it) },
+            onInvite = { controller.inviteToGroup(group.groupId, it) },
+            onBack = { openGroupId = null },
+        )
+    } else if (peer != null) {
         val messages by controller.messages.collectAsState()
 
         // Ask the engine, not the cached copy of the safety number. The cache

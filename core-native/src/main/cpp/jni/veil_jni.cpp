@@ -603,3 +603,112 @@ Java_com_veil_core_VeilNative_nativeSafetyNumber(JNIEnv* env, jobject /*thiz*/,
 }
 
 }  // extern "C"
+
+// ---- Group invitations -------------------------------------------------
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeEncodeInvite(JNIEnv* env, jobject /*thiz*/,
+                                                 jlong handle, jstring groupId) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    return toArray(env, engine->encodeInvite(toStd(env, groupId)));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_veil_core_VeilNative_nativeLooksLikeInvite(JNIEnv* env, jobject /*thiz*/,
+                                                    jbyteArray data) {
+    if (data == nullptr) return JNI_FALSE;
+    const veil::Bytes blob = fromArray(env, data);
+    return veil::Engine::looksLikeInvite(blob.data(), blob.size()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_veil_core_VeilNative_nativeAcceptInvite(JNIEnv* env, jobject /*thiz*/,
+                                                 jlong handle, jbyteArray data,
+                                                 jstring expectedFounder,
+                                                 jbyteArray founderSignPub) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+
+    veil::Bytes blob = fromArray(env, data);
+    veil::Bytes key = fromArray(env, founderSignPub);
+    if (key.size() != 32) return nullptr;
+
+    std::string groupId;
+    const veil::Engine::Result result = engine->acceptInvite(
+        blob.data(), blob.size(), toStd(env, expectedFounder), key.data(), groupId);
+
+    // A refusal carries no id at all, so a caller cannot read "refused" as
+    // "accepted into a group with no name".
+    if (result != veil::Engine::Result::Ok) return nullptr;
+    return toJString(env, groupId);
+}
+
+// ---- Device linking ----------------------------------------------------
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeLinkingRequest(JNIEnv* env, jobject /*thiz*/,
+                                                   jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    return toArray(env, engine->generateLinkingRequest());
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_com_veil_core_VeilNative_nativeReadLinkingRequest(JNIEnv* env, jobject /*thiz*/,
+                                                       jbyteArray data) {
+    if (data == nullptr) return nullptr;
+
+    const veil::Bytes blob = fromArray(env, data);
+    veil::Engine::LinkingRequest request;
+    if (!veil::Engine::parseLinkingRequest(request, blob.data(), blob.size())) {
+        return nullptr;
+    }
+
+    // Both answers from the same bytes: two calls would let them come from
+    // different ones, and a UI that shows the wrong fingerprint for a request is
+    // worse than one that shows nothing.
+    jclass stringClass = env->FindClass("java/lang/String");
+    jobjectArray out = env->NewObjectArray(2, stringClass, nullptr);
+    env->SetObjectArrayElement(out, 0, toJString(env, request.user_id));
+    env->SetObjectArrayElement(out, 1, toJString(env, request.fingerprint()));
+    return out;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeApproveLinking(JNIEnv* env, jobject /*thiz*/,
+                                                   jlong handle, jbyteArray requestData,
+                                                   jlong issuedAt) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr || requestData == nullptr) return nullptr;
+
+    const veil::Bytes blob = fromArray(env, requestData);
+    veil::Engine::LinkingRequest request;
+    if (!veil::Engine::parseLinkingRequest(request, blob.data(), blob.size())) {
+        return nullptr;
+    }
+
+    const veil::Bytes credential =
+        engine->approveLinking(request, static_cast<uint64_t>(issuedAt));
+    if (credential.empty()) return nullptr;
+    return toArray(env, credential);
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeAccountSignPublic(JNIEnv* env, jobject /*thiz*/,
+                                                      jlong handle) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+    return toArray(env, engine->accountSignPublic());
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativePeerDeviceSignPub(JNIEnv* env, jobject /*thiz*/,
+                                                      jlong handle, jstring peer) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return nullptr;
+
+    uint8_t out[32];
+    if (!engine->peerDeviceSignPublic(toStd(env, peer), out)) return nullptr;
+    return toArray(env, veil::Bytes(out, out + 32));
+}

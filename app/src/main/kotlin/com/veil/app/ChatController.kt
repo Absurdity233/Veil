@@ -750,6 +750,185 @@ class ChatController(context: Context) {
         }
     }
 
+    /**
+     * Accepts an invitation that arrived from [peerId].
+     *
+     * The founder's signing key comes from the peer's own device credential, which
+     * this client already pins from the handshake - so "alice invited me" is
+     * checked against the alice this client verified, not against whoever sent the
+     * bytes.
+     */
+    private suspend fun acceptInviteFrom(peerId: String, payload: ByteArray) {
+        val engine = engine ?: return
+
+        val founderSignPub = withContext(crypto) {
+            // The device signing key the peer's credential vouches for: the peer
+            // this client verified during the handshake, not whoever sent these
+            // bytes. Nothing to verify against means the invitation is refused.
+            engine.peerDeviceSignPublic(peerId)
+        }
+        if (founderSignPub == null) {
+            _status.value = "an invitation arrived from $peerId but could not be verified"
+            return
+        }
+
+        val groupId = withContext(crypto) {
+            engine.acceptInvite(payload, peerId, founderSignPub)
+        }
+        if (groupId == null) {
+            _status.value = "an invitation from $peerId was refused"
+            return
+        }
+
+        refreshGroup(groupId)
+        appendGroupMessage(groupId, senderId = peerId, text = "joined the group",
+            outgoing = false)
+        _status.value = "joined $groupId"
+    }
+
+    // ---- Group invitations ------------------------------------------------
+
+    /**
+     * Invites one person to a group.
+     *
+     * The invitation is an ordinary message: it is encrypted to their session and
+     * sent like anything else, so the relay learns only that a message was sent.
+     * Requires a pairwise session, which is what authenticates the founder.
+     */
+    fun inviteToGroup(groupId: String, peerId: String) {
+        val engine = engine ?: return
+        val client = relay ?: return
+
+        scope.launch {
+            val invite = withContext(crypto) { engine.encodeInvite(groupId) }
+            if (invite == null) {
+                _status.value = "cannot invite: $groupId has no chain yet"
+                return@launch
+            }
+
+            val frames = withContext(crypto) {
+                engine.encryptToAccount(peerId, invite)
+            }
+            if (frames.isEmpty()) {
+                _status.value = "cannot invite $peerId: no session with them yet"
+                return@launch
+            }
+
+            var sent = false
+            if (client.isConnected) {
+                for ((device, frame) in frames) {
+                    if (client.sendMessage(peerId, frame, device)) sent = true
+                }
+            }
+            _status.value = if (sent) {
+                "invitation sent to $peerId"
+            } else {
+                "offline: the invitation was not delivered"
+            }
+        }
+    }
+
+    // ---- Device linking ---------------------------------------------------
+
+    /** This device's request, to be shown to an existing device. */
+    suspend fun linkingRequest(): ByteArray? = withContext(crypto) {
+        engine?.linkingRequest()
+    }
+
+    /**
+     * This device's request as text, for the user to copy.
+     *
+     * Base64 rather than the raw bytes because the whole flow is "read this on
+     * one screen and type or paste it on another". A hex dump of a linking
+     * request is 400 characters and cannot be read aloud; base64 is still not
+     * short, but it survives a clipboard and a chat message.
+     */
+    suspend fun linkingRequestText(): String? = withContext(crypto) {
+        engine?.linkingRequest()?.let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
+    }
+
+    /** The account a request names and its fingerprint, for a person to compare. */
+    suspend fun readLinkingRequest(data: ByteArray): Pair<String, String>? =
+        withContext(crypto) { engine?.readLinkingRequest(data) }
+
+    /** Decodes a request the user pasted. Null when it is not base64. */
+    fun decodeLinkingText(text: String): ByteArray? = try {
+        android.util.Base64.decode(text.trim(), android.util.Base64.NO_WRAP)
+    } catch (e: IllegalArgumentException) {
+        null
+    }
+
+    /**
+     * Endorses another device.
+     *
+     * Null when this client does not hold the account key, which is the correct
+     * answer rather than an error: a linked device cannot add further devices.
+     */
+    suspend fun approveLinking(request: ByteArray): ByteArray? = withContext(crypto) {
+        engine?.approveLinking(request, System.currentTimeMillis() / 1000)
+    }
+
+    /** The endorsement as text, for the other device to paste back. */
+    suspend fun approveLinkingText(request: ByteArray): String? = withContext(crypto) {
+        engine?.approveLinking(request, System.currentTimeMillis() / 1000)
+            ?.let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
+    }
+
+    /** This account's full public identity as text, for the linking flow. */
+    suspend fun publicIdentityText(): String? = withContext(crypto) {
+        engine?.publicIdentity()?.let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
+    }
+
+    fun decodeText(text: String): ByteArray? = try {
+        android.util.Base64.decode(text.trim(), android.util.Base64.NO_WRAP)
+    } catch (e: IllegalArgumentException) {
+        null
+    }
+
+    /**
+     * Adopts an endorsement this account issued for this device.
+     *
+     * The account keys are passed in because the device being linked does not have
+     * them; whoever ran the linking flow supplies them, having verified the
+     * founder out of band.
+     */
+    suspend fun adoptLinking(
+        credential: ByteArray,
+        accountDhPub: ByteArray,
+        accountSignPub: ByteArray,
+    ): Boolean = withContext(crypto) {
+        val ok = engine?.adoptDeviceCredential(credential, accountDhPub, accountSignPub)
+        if (ok == true) {
+            engine?.deviceId()?.let { raw ->
+                deviceId = raw.joinToString("") { "%02x".format(it) }
+                deviceState.store(DEVICE_ID, deviceId.toByteArray(Charsets.UTF_8))
+            }
+            persistGroups()
+        }
+        ok == true
+    }
+
+    /**
+     * Adopts an endorsement from two base64 strings the user pasted.
+     *
+     * The account identity arrives as one 64-byte blob (DH public || signing
+     * public), which is what [publicIdentityText] produces on the endorsing
+     * device. Splitting it here rather than asking the user for two strings is
+     * deliberate: one field is one thing to copy, and the split is not a decision
+     * a person should have to make.
+     */
+    suspend fun adoptLinkingFromText(credentialText: String, identityText: String): Boolean {
+        val credential = decodeText(credentialText) ?: return false
+        val identity = decodeText(identityText) ?: return false
+        if (identity.size != 64) return false
+
+        return adoptLinking(
+            credential,
+            identity.copyOfRange(0, 32),
+            identity.copyOfRange(32, 64),
+        )
+    }
+
     /** Re-sends frames that never made it out of the process. */
     private suspend fun flushPending() {
         val client = relay ?: return
@@ -817,6 +996,15 @@ class ChatController(context: Context) {
         }
 
         if (plain == null) return
+
+        // An invitation is message content, not a wire type, so it is recognised
+        // here rather than by the relay. It never reaches the transcript: a blob
+        // of prefix and lengths is not something a person wants to read.
+        if (engine.looksLikeInvite(plain)) {
+            acceptInviteFrom(peerId, plain)
+            if (event.outboxId > 0) relay?.acknowledge(event.outboxId)
+            return
+        }
 
         val text = String(plain, Charsets.UTF_8)
         if (store.peer(peerId) == null) {

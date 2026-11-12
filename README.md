@@ -166,14 +166,13 @@ restarts). The relay addresses frames per device and stores device lists.
 
 **Surfaced in all three clients:** device identity claimed on connect and
 persisted, fan-out sending (one frame per device of a peer), group
-create/send/receive, and group state in each client's encrypted store. Android
-and desktop reach it through JNI and JNA respectively; the web client through
-wasm. The desktop and web clients have group UI; Android has the controller
-surface and needs the screens.
+create/send/receive/invite, and group state in each client's encrypted store.
+Android has both the group screens and the device-linking dialog; the web client
+has groups; the desktop has groups. Device linking is text-based (a base64 request
+and credential copied between devices) and currently only has a screen on Android.
 
-**Not implemented at all:** push notifications, account recovery, a device
-linking UI, and group invitations over the wire (chains and member lists travel
-through export/adopt pairs, so a caller has to hand them over).
+**Not implemented at all:** push notifications, account recovery, a QR-based
+linking flow, and device-list refresh in any client.
 
 The designs, and the honest account of what is missing from each, are in
 [Multi-device](docs/multi-device.md) and [Groups](docs/group.md).

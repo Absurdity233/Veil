@@ -672,6 +672,159 @@ section("group state survives a restart through the ABI");
         veil_engine_free(bob);
     }
 
+section("device linking through the C ABI");
+    {
+        // The flow a client actually drives: show a request, read its
+        // fingerprint, approve, adopt. Every step crosses the ABI, and getting the
+        // buffer contract wrong here means a UI that silently produces nothing.
+        void* phone = veil_engine_new();
+        void* laptop = veil_engine_new();
+        check(phone && laptop, "two engines");
+
+        check(veil_init_device(phone, "alice") == VEIL_OK, "phone claims alice");
+        check(veil_init_device(laptop, "alice") == VEIL_OK, "laptop claims a device");
+
+        // ---- The laptop produces a request ----
+        const int request_size = veil_linking_request(laptop, nullptr, 0);
+        check(request_size > 0, "a request is produced");
+
+        uint8_t request[1024];
+        check(veil_linking_request(laptop, request, sizeof(request)) == request_size,
+              "it fits its own size query");
+
+        // ---- The phone reads it ----
+        char who[128];
+        char fingerprint[64];
+        check(veil_read_linking_request(request, static_cast<size_t>(request_size),
+                                        who, sizeof(who),
+                                        fingerprint, sizeof(fingerprint)) == VEIL_OK,
+              "the phone reads it");
+        check(who[0] != 0, "the request names an account");
+        check(std::strlen(fingerprint) == 19, "and has a fingerprint to compare");
+        check(fingerprint[4] == '-' && fingerprint[9] == '-',
+              "the fingerprint is grouped");
+
+        // ---- The phone approves ----
+        const int credential_size = veil_approve_linking(phone, request,
+                                                         static_cast<size_t>(request_size),
+                                                         1700000000, nullptr, 0);
+        check(credential_size > 0, "the phone signs it");
+
+        uint8_t credential[VEIL_DEVICE_CRED_MAX];
+        check(veil_approve_linking(phone, request, static_cast<size_t>(request_size),
+                                   1700000000, credential, sizeof(credential)) ==
+                  credential_size,
+              "the credential fits its size query");
+
+        // ---- The laptop adopts it ----
+        uint8_t account_pub[VEIL_IDENTITY_PUBLIC_SIZE];
+        veil_identity_public(phone, account_pub, sizeof(account_pub));
+
+        check(veil_adopt_device_credential(laptop, credential,
+                                           static_cast<size_t>(credential_size),
+                                           account_pub, account_pub + 32) == VEIL_OK,
+              "the laptop adopts the endorsed credential");
+
+        // The account signing key is readable, which is what a peer needs to
+        // verify a credential or a member list.
+        uint8_t account_sign[32];
+        check(veil_account_sign_public(phone, account_sign, sizeof(account_sign)) == 32,
+              "the account signing key is available");
+        check(std::memcmp(account_sign, account_pub + 32, 32) == 0,
+              "and matches the identity's signing half");
+
+        // ---- Malformed input is refused, not crashed on ----
+        check(veil_read_linking_request(request, 4, who, sizeof(who),
+                                        fingerprint, sizeof(fingerprint)) == VEIL_BAD_BUNDLE,
+              "a stub request is refused");
+        check(veil_approve_linking(phone, request, 4, 0, nullptr, 0) == VEIL_BAD_BUNDLE,
+              "and cannot be approved");
+
+        veil_engine_free(phone);
+        veil_engine_free(laptop);
+    }
+
+section("group invitations through the C ABI");
+    {
+        void* alice = veil_engine_new();
+        void* bob = veil_engine_new();
+        check(alice && bob, "two engines");
+
+        veil_init_device(alice, "alice");
+        veil_init_device(bob, "bob");
+
+        check(veil_create_group(alice, "team") == VEIL_OK, "alice founds a group");
+        const char members[] = "alice\0bob";
+        check(veil_set_group_members(alice, "team",
+                                     reinterpret_cast<const uint8_t*>(members),
+                                     sizeof(members) - 1) == 2,
+              "with two members");
+
+        // ---- The invitation ----
+        const int invite_size = veil_encode_invite(alice, "team", nullptr, 0);
+        check(invite_size > 0, "an invitation is produced");
+
+        uint8_t invite[2048];
+        check(veil_encode_invite(alice, "team", invite, sizeof(invite)) == invite_size,
+              "it fits its own size query");
+        check(veil_looks_like_invite(invite, static_cast<size_t>(invite_size)) == 1,
+              "and is recognisable as one");
+
+        const char* text = "hello";
+        check(veil_looks_like_invite(reinterpret_cast<const uint8_t*>(text), 5) == 0,
+              "ordinary text is not");
+
+        // ---- Bob accepts ----
+        const int cred_size = veil_device_credential(alice, nullptr, 0);
+        uint8_t cred[VEIL_DEVICE_CRED_MAX];
+        veil_device_credential(alice, cred, sizeof(cred));
+
+        // The founder's device signing key, read out of the credential with the
+        // documented layout: [2] idlen | id | 32 id | 32 dh | 32 sign | ...
+        uint8_t founder_sign_pub[32];
+        {
+            const size_t id_len = (static_cast<size_t>(cred[0]) << 8) | cred[1];
+            std::memcpy(founder_sign_pub, cred + 2 + id_len + 64, 32);
+        }
+
+        char group_id[128];
+        check(veil_accept_invite(bob, invite, static_cast<size_t>(invite_size),
+                                 "alice", founder_sign_pub,
+                                 group_id, sizeof(group_id)) == VEIL_OK,
+              "bob accepts it");
+        check(std::strcmp(group_id, "team") == 0, "and learns the group id");
+        check(veil_group_epoch(bob, "team") == 2, "with the right epoch");
+
+        // ---- And can read immediately ----
+        const char* message = "welcome";
+        const int record_size = veil_encrypt_to_group(
+            alice, "team", reinterpret_cast<const uint8_t*>(message),
+            std::strlen(message), nullptr, 0);
+        check(record_size > 0, "alice sends");
+
+        uint8_t record[512];
+        veil_encrypt_to_group(alice, "team", reinterpret_cast<const uint8_t*>(message),
+                              std::strlen(message), record, sizeof(record));
+
+        uint8_t plain[256];
+        size_t plain_len = 0;
+        check(veil_decrypt_from_group(bob, "team", record,
+                                      static_cast<size_t>(record_size),
+                                      plain, sizeof(plain), &plain_len) == VEIL_OK,
+              "bob reads it with no further exchange");
+        check(plain_len == std::strlen(message), "content length matches");
+
+        // ---- An invitation from the wrong founder is refused ----
+        char rejected[128];
+        check(veil_accept_invite(bob, invite, static_cast<size_t>(invite_size),
+                                 "mallory", founder_sign_pub,
+                                 rejected, sizeof(rejected)) != VEIL_OK,
+              "an invitation attributed to another founder is refused");
+
+        veil_engine_free(alice);
+        veil_engine_free(bob);
+    }
+
 section("safety number is a string across the boundary");
     {
         void* engine = veil_engine_new();

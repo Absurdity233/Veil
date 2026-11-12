@@ -895,3 +895,141 @@ extern "C" int veil_import_group_state(void* handle, const uint8_t* data, size_t
 
     return engine->importGroupState(data, size) ? VEIL_OK : VEIL_BAD_BUNDLE;
 }
+
+// ---- Group invitations -------------------------------------------------
+
+extern "C" int veil_encode_invite(const void* handle, const char* group_id,
+                                  uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(group_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    int written = 0;
+    const veil::Bytes blob = engine->encodeInvite(id);
+    if (blob.empty()) return VEIL_NO_SESSION;
+
+    const int status = copyOut(blob, out, out_size, &written);
+    return status == VEIL_OK ? written : status;
+}
+
+extern "C" int veil_looks_like_invite(const uint8_t* data, size_t size) {
+    if (data == nullptr) return 0;
+    return veil::Engine::looksLikeInvite(data, size) ? 1 : 0;
+}
+
+extern "C" int veil_accept_invite(void* handle, const uint8_t* data, size_t size,
+                                  const char* expected_founder,
+                                  const uint8_t* founder_sign_pub,
+                                  char* out_group_id, size_t out_size) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (data == nullptr || founder_sign_pub == nullptr) return VEIL_ERR_NULL_ARG;
+
+    std::string founder;
+    if (!readPeer(expected_founder, founder)) return VEIL_ERR_BAD_PARAM;
+
+    std::string group_id;
+    const veil::Engine::Result result =
+        engine->acceptInvite(data, size, founder, founder_sign_pub, group_id);
+
+    if (result != veil::Engine::Result::Ok) {
+        if (out_group_id != nullptr && out_size > 0) out_group_id[0] = 0;
+        return static_cast<int>(result);
+    }
+
+    if (out_group_id != nullptr && out_size > 0) {
+        const size_t n = group_id.size() < out_size - 1 ? group_id.size() : out_size - 1;
+        std::memcpy(out_group_id, group_id.data(), n);
+        out_group_id[n] = 0;
+    }
+    return VEIL_OK;
+}
+
+// ---- Device linking ----------------------------------------------------
+
+extern "C" int veil_linking_request(const void* handle, uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    int written = 0;
+    const veil::Bytes blob = engine->generateLinkingRequest();
+    if (blob.empty()) return VEIL_NO_SESSION;
+
+    const int status = copyOut(blob, out, out_size, &written);
+    return status == VEIL_OK ? written : status;
+}
+
+extern "C" int veil_read_linking_request(const uint8_t* data, size_t size,
+                                         char* user_id, size_t user_id_size,
+                                         char* fingerprint, size_t fingerprint_size) {
+    if (data == nullptr) return VEIL_ERR_NULL_ARG;
+
+    veil::Engine::LinkingRequest request;
+    if (!veil::Engine::parseLinkingRequest(request, data, size)) return VEIL_BAD_BUNDLE;
+
+    if (user_id != nullptr && user_id_size > 0) {
+        const size_t n = request.user_id.size() < user_id_size - 1
+                             ? request.user_id.size()
+                             : user_id_size - 1;
+        std::memcpy(user_id, request.user_id.data(), n);
+        user_id[n] = 0;
+    }
+
+    if (fingerprint != nullptr && fingerprint_size > 0) {
+        const std::string fp = request.fingerprint();
+        const size_t n = fp.size() < fingerprint_size - 1 ? fp.size() : fingerprint_size - 1;
+        std::memcpy(fingerprint, fp.data(), n);
+        fingerprint[n] = 0;
+    }
+
+    return VEIL_OK;
+}
+
+extern "C" int veil_approve_linking(const void* handle,
+                                    const uint8_t* request_data, size_t request_size,
+                                    uint64_t issued_at,
+                                    uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (request_data == nullptr) return VEIL_ERR_NULL_ARG;
+
+    veil::Engine::LinkingRequest request;
+    if (!veil::Engine::parseLinkingRequest(request, request_data, request_size)) {
+        return VEIL_BAD_BUNDLE;
+    }
+
+    int written = 0;
+    const veil::Bytes credential = engine->approveLinking(request, issued_at);
+    if (credential.empty()) return VEIL_ERR_BAD_PARAM;
+
+    const int status = copyOut(credential, out, out_size, &written);
+    return status == VEIL_OK ? written : status;
+}
+
+extern "C" int veil_account_sign_public(const void* handle, uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (out == nullptr) return 32;
+    if (out_size < 32) return VEIL_ERR_BUFFER_TOO_SMALL;
+
+    const veil::Bytes key = engine->accountSignPublic();
+    if (key.size() != 32) return VEIL_NO_SESSION;
+
+    std::memcpy(out, key.data(), 32);
+    return 32;
+}
+
+extern "C" int veil_peer_device_sign_pub(const void* handle, const char* peer,
+                                         uint8_t* out, size_t out_size) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+    if (out == nullptr) return 32;
+    if (out_size < 32) return VEIL_ERR_BUFFER_TOO_SMALL;
+
+    std::string label;
+    if (!readPeer(peer, label)) return VEIL_ERR_BAD_PARAM;
+
+    return engine->peerDeviceSignPublic(label, out) ? 32 : VEIL_NO_SESSION;
+}
