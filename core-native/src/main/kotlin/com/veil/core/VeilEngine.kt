@@ -100,6 +100,18 @@ enum class SessionState {
  * [close] wipes all key material. The instance is unusable afterwards.
  */
 class VeilEngine private constructor(handle: Long) : AutoCloseable {
+    /**
+     * Argon2id, for the account vault.
+     *
+     * Exposed here rather than on the internal native object because the account
+     * layer lives in another module: this is the one primitive it needs, and
+     * widening the whole ABI surface to reach it would make every native call
+     * public.
+     *
+     * Throws rather than returning a weaker key when the parameters are outside
+     * what the build supports: a caller that asked for 1 GiB and got 64 MiB would
+     * believe its ciphertext is stronger than it is.
+     */
 
     private val state = State(handle)
     private val cleaner = CLEANER.register(this, state)
@@ -463,5 +475,26 @@ class VeilEngine private constructor(handle: Long) : AutoCloseable {
         /** Restores an identity from [exportIdentitySecrets] output. */
         fun restore(identitySecrets: ByteArray): VeilEngine =
             VeilEngine(VeilNative.nativeRestore(identitySecrets))
+
+        /**
+         * Argon2id, for the account vault.
+         *
+         * A companion function because deriving a key needs no engine: it is the
+         * one primitive the account layer needs from the native code, and keeping
+         * it off the instance means a client can derive a key before it has an
+         * identity - which is exactly what restoring one requires.
+         *
+         * Throws rather than returning a weaker key when the parameters are outside
+         * what the build supports: a caller that asked for 1 GiB and silently got
+         * 64 MiB would believe its ciphertext is stronger than it is.
+         */
+        fun deriveKey(
+            password: ByteArray,
+            salt: ByteArray,
+            memoryKiB: Int = 64 * 1024,
+            passes: Int = 3,
+            lanes: Int = 2,
+        ): ByteArray = VeilNative.nativeArgon2id(password, salt, memoryKiB, passes, lanes)
+            ?: throw IllegalStateException("argon2id refused its parameters")
     }
 }

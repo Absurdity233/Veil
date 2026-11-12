@@ -76,3 +76,137 @@ export function drawQr(
     }
   }
 }
+
+// ---- Scanning ----------------------------------------------------------
+//
+// Two paths, because no single one works everywhere:
+//
+//   - `BarcodeDetector` is native and fast, and exists on Chrome/Edge and recent
+//     Android browsers. It is tried first.
+//   - otherwise the `jsqr` decoder runs on frames pulled from a canvas. It is a
+//     devDependency today and is bundled here, which costs about 40 KB for the
+//     browsers that need it.
+//
+// Camera access requires a secure origin, which the deployment already is - over
+// http the browser refuses `getUserMedia` for the same reason it refuses
+// `crypto.subtle`, and the caller reports that rather than showing a black box.
+
+/** What a scan attempt produced. */
+export type ScanResult =
+  | { ok: true; text: string }
+  | { ok: false; reason: string };
+
+interface ScannerHandle {
+  stop(): void;
+}
+
+/**
+ * Starts scanning from the device camera into `video`.
+ *
+ * Resolves once the camera is running; `onCode` is called with the first decoded
+ * payload and the scanner then stops itself. Rejects when the camera is
+ * unavailable, so the caller can fall back to typing the request.
+ */
+export async function startScanning(
+  video: HTMLVideoElement,
+  onCode: (text: string) => void,
+): Promise<ScannerHandle> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error(
+      "this browser has no camera access; serve the page over https and try again",
+    );
+  }
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment" },
+    audio: false,
+  });
+
+  video.srcObject = stream;
+  video.setAttribute("playsinline", "true");
+  await video.play().catch(() => {
+    // Autoplay can be refused; the frames still arrive once the user taps play,
+    // so this is not fatal.
+  });
+
+  let stopped = false;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    for (const track of stream.getTracks()) track.stop();
+    video.srcObject = null;
+  };
+
+  // Native path.
+  const Detector = (globalThis as { BarcodeDetector?: new (opts: { formats: string[] }) => {
+    detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>>;
+  } }).BarcodeDetector;
+
+  if (Detector) {
+    const detector = new Detector({ formats: ["qr_code"] });
+    const tick = async () => {
+      if (stopped) return;
+      try {
+        const found = await detector.detect(video);
+        if (found.length > 0 && found[0]?.rawValue) {
+          onCode(found[0].rawValue);
+          stop();
+          return;
+        }
+      } catch {
+        // A transient decode failure is normal while the camera focuses.
+      }
+      if (!stopped) requestAnimationFrame(() => void tick());
+    };
+    // The first frames are usually too early: the camera has not exposed one yet.
+    setTimeout(() => void tick(), 250);
+
+    return { stop };
+  }
+
+  // Fallback: pull frames into a canvas and decode them.
+  const { default: jsQR } = await import("jsqr");
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    stop();
+    throw new Error("this browser cannot decode images");
+  }
+
+  const tick = () => {
+    if (stopped) return;
+
+    if (video.readyState >= video.HAVE_CURRENT_DATA) {
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+      if (width > 0 && height > 0) {
+        // Downscale: a 4K frame is slower to decode and buys nothing, since a
+        // QR at typical screen distance is well above the decoder's minimum.
+        const scale = Math.min(1, 640 / Math.max(width, height));
+        canvas.width = Math.round(width * scale);
+        canvas.height = Math.round(height * scale);
+
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const decoded = jsQR(image.data, canvas.width, canvas.height);
+
+        if (decoded?.data) {
+          onCode(decoded.data);
+          stop();
+          return;
+        }
+      }
+    }
+
+    if (!stopped) setTimeout(tick, 120);
+  };
+  setTimeout(tick, 250);
+
+  return { stop };
+}
+
+/** Whether this browser can scan at all, for a UI that should not offer it otherwise. */
+export function canScan(): boolean {
+  return typeof navigator !== "undefined" &&
+    typeof navigator.mediaDevices?.getUserMedia === "function";
+}

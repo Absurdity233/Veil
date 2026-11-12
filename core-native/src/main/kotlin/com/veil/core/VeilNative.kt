@@ -173,4 +173,13 @@ internal object VeilNative {
 
     /** The device signing key a peer's credential vouches for; null when unknown. */
     external fun nativePeerDeviceSignPub(handle: Long, peer: String): ByteArray?
+
+    /** Argon2id, for the account vault. The password never leaves this process. */
+    external fun nativeArgon2id(
+        password: ByteArray,
+        salt: ByteArray,
+        memoryKiB: Int,
+        passes: Int,
+        lanes: Int,
+    ): ByteArray?
 }

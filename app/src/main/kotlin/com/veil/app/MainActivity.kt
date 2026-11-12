@@ -93,6 +93,9 @@ private fun VeilApp() {
             onAdopt = { credential, identity ->
                 controller.adoptLinkingFromText(credential, identity)
             },
+            onCreateAccount = { password -> controller.createAccount(password) },
+            onRestoreAccount = { id, password -> controller.restoreAccount(id, password) },
+            onChangePassword = { old, new -> controller.changePassword(old, new) },
         )
     } else if (group != null) {
         val groupMessages by controller.groupMessages.collectAsState()

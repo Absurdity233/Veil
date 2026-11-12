@@ -1,6 +1,8 @@
-package com.veil.app.net
+﻿package com.veil.app.net
 
 import android.util.Log
+import com.veil.app.SealedVault
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -36,6 +38,18 @@ class RelayClient(private val url: String) {
 
         /** A full page of replayed entries went out; the next ACK pulls more. */
         data object MorePending : Event
+
+        /** A sealed vault. Every field is opaque to the relay. */
+        data class Vault(
+            val salt: ByteArray,
+            val memoryKiB: Int,
+            val passes: Int,
+            val lanes: Int,
+            val generation: Int,
+            val ciphertext: ByteArray,
+        ) : Event
+
+        data class VaultStored(val generation: Int) : Event
         data class Failed(val message: String) : Event
         data object Disconnected : Event
     }
@@ -47,6 +61,80 @@ class RelayClient(private val url: String) {
         .build()
 
     private val events = Channel<Event>(Channel.BUFFERED)
+
+    /**
+     * Vault replies, kept out of the event channel.
+     *
+     * A delivery arriving while a vault read is in flight would otherwise be
+     * swallowed by whoever read the channel first, and a lost message is worse than
+     * a slow account dialog. One slot because the dialog makes one request at a
+     * time and the relay answers the connection that asked.
+     */
+    private val vaultReply = java.util.concurrent.ArrayBlockingQueue<Event>(1)
+
+    // ---- Password vault ---------------------------------------------------
+
+    /** Uploads a sealed vault, returning the generation the relay assigned. */
+    suspend fun putVault(
+        userId: String,
+        salt: ByteArray,
+        memoryKiB: Int,
+        passes: Int,
+        lanes: Int,
+        ciphertext: ByteArray,
+        timeoutMs: Long = 30_000,
+    ): Int? {
+        val payload = Writer()
+            .string(userId)
+            .blob(salt)
+            .u32(memoryKiB)
+            .u32(passes)
+            .u32(lanes)
+            .blob(ciphertext)
+            .build()
+
+        if (!send(Wire.TYPE_PUT_VAULT, payload)) return null
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val event = withTimeoutOrNull(500) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    vaultReply.poll(400, java.util.concurrent.TimeUnit.MILLISECONDS)
+                }
+            } ?: continue
+
+            if (event is Event.VaultStored) return event.generation
+            if (event is Event.Failed) return null
+        }
+        return null
+    }
+
+    /** Fetches a sealed vault, or null when the user has none. */
+    suspend fun getVault(userId: String, timeoutMs: Long = 30_000): SealedVault? {
+        if (!send(Wire.TYPE_GET_VAULT, Writer().string(userId).build())) return null
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val event = withTimeoutOrNull(500) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    vaultReply.poll(400, java.util.concurrent.TimeUnit.MILLISECONDS)
+                }
+            } ?: continue
+
+            if (event is Event.Vault) {
+                return SealedVault(
+                    salt = event.salt,
+                    memoryKiB = event.memoryKiB,
+                    passes = event.passes,
+                    lanes = event.lanes,
+                    generation = event.generation,
+                    ciphertext = event.ciphertext,
+                )
+            }
+            if (event is Event.Failed) return null
+        }
+        return null
+    }
     val stream: Flow<Event> = events.receiveAsFlow()
 
     private var socket: WebSocket? = null
@@ -148,6 +236,21 @@ class RelayClient(private val url: String) {
                     )
                 }
                 Wire.TYPE_ERROR -> events.trySend(Event.Failed(r.string()))
+
+                Wire.TYPE_VAULT_ACK -> vaultReply.offer(Event.VaultStored(r.u32()))
+
+                Wire.TYPE_VAULT_DATA -> {
+                    vaultReply.offer(
+                        Event.Vault(
+                            salt = r.blob(),
+                            memoryKiB = r.u32(),
+                            passes = r.u32(),
+                            lanes = r.u32(),
+                            generation = r.u32(),
+                            ciphertext = r.blob(),
+                        ),
+                    )
+                }
                 else -> Log.d(TAG, "ignoring frame type ${frame.type}")
             }
         } catch (e: Exception) {
@@ -168,7 +271,6 @@ class RelayClient(private val url: String) {
 
     fun requestBundle(userId: String): Boolean =
         send(Wire.TYPE_GET_BUNDLE, Writer().string(userId).build())
-
     /**
      * Queues one ciphertext frame.
      *

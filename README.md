@@ -172,10 +172,10 @@ Android has both the group screens and the device-linking dialog; the web client
 has groups; the desktop has groups. Device linking is text-based (a base64 request
 and credential copied between devices) and currently only has a screen on Android.
 
-**Not implemented at all:** push notifications, camera-based QR scanning (the web
-client shows a QR; nothing scans one yet), password change, and accounts on
-Android and desktop (the derivation and the vault protocol are there; only the web
-client has the screens).
+**Not implemented at all:** push notifications, and a vault that tolerates two
+devices writing at once (changing the password re-seals it, and a device still
+signed in with the old one would overwrite that on its next write — sign it out
+first).
 
 **One deliberate trust assumption:** an optional account password stores a sealed
 vault on the relay so an identity can be restored on another device. The relay

@@ -329,6 +329,11 @@ class ChatController(context: Context) {
                 RelayClient.Event.Disconnected -> {
                     _link.value = LinkState.Offline
                 }
+
+                // Vault replies never reach this pump: they go to the account
+                // dialog through RelayClient's own slot, so a message arriving
+                // mid-request is not swallowed by whoever reads the channel first.
+                is RelayClient.Event.Vault, is RelayClient.Event.VaultStored -> Unit
             }
         }
     }
@@ -883,6 +888,134 @@ class ChatController(context: Context) {
         android.util.Base64.decode(text.trim(), android.util.Base64.NO_WRAP)
     } catch (e: IllegalArgumentException) {
         null
+    }
+
+    // ---- Accounts ---------------------------------------------------------
+    //
+    // A password that lets the identity be restored on another device. What goes
+    // over the wire is a blob sealed under a key derived from it with Argon2id,
+    // so the relay cannot verify the password and cannot open the vault.
+    //
+    // AES comes from the platform's JCE, Argon2id from the engine's native code:
+    // the JCE has no Argon2, and one implementation of a key-derivation function
+    // is one fewer thing that can disagree about a key.
+
+    /** Uploads this device's whole state, sealed under the password. */
+    suspend fun createAccount(password: String): String? = withContext(crypto) {
+        val engine = engine ?: return@withContext "the engine is not loaded"
+        val client = relay ?: return@withContext "connect before creating an account"
+        if (selfUserId.isEmpty()) return@withContext "connect with an id first"
+
+        val problem = checkPassword(password)
+        if (problem != null) return@withContext problem
+
+        val identity = engine.exportIdentitySecrets()
+        val plain = buildVaultPlaintext(identity)
+        identity.fill(0)
+
+        val sealed = sealVault(plain, password)
+        val generation = client.putVault(
+            selfUserId,
+            sealed.salt,
+            sealed.memoryKiB,
+            sealed.passes,
+            sealed.lanes,
+            sealed.ciphertext,
+        ) ?: return@withContext "the relay did not accept the vault"
+
+        _status.value = "account stored (generation $generation)"
+        null
+    }
+
+    /** Restores this device's state from the vault. */
+    suspend fun restoreAccount(id: String, password: String): String? = withContext(crypto) {
+        val client = relay ?: return@withContext "connect before signing in"
+
+        val stored = client.getVault(id) ?: return@withContext "no account stored for $id"
+        val plain = openVault(stored, password)
+            ?: return@withContext "wrong password, or the stored account is damaged"
+
+        engine?.close()
+        val restored = VeilEngine.restore(plain.identity)
+        engine = restored
+        vault.store(plain.identity)
+        plain.identity.fill(0)
+
+        plain.preKeyState?.let { restored.importPreKeyState(it) }
+        plain.peerRegistry?.let { restored.importPeerRegistry(it) }
+        plain.groupState?.let { restored.importGroupState(it) }
+
+        restored.exportPreKeyState()?.let { prekeyState.store(PREKEY_STATE, it) }
+        restored.exportPeerRegistry()?.let { peerPins.store(PIN_REGISTRY, it) }
+        restored.exportGroupState()?.let { deviceState.store(GROUP_STATE, it) }
+
+        selfUserId = id
+        refreshPeers()
+        restoreGroups(restored)
+
+        _status.value = "restored $id from the account store"
+        null
+    }
+
+    /** Re-seals the vault under a new password, after proving the old one. */
+    suspend fun changePassword(oldPassword: String, newPassword: String): String? =
+        withContext(crypto) {
+            val engine = engine ?: return@withContext "the engine is not loaded"
+            val client = relay ?: return@withContext "connect before changing the password"
+            if (selfUserId.isEmpty()) return@withContext "connect with an id first"
+
+            val problem = checkPassword(newPassword)
+            if (problem != null) return@withContext problem
+
+            val current = client.getVault(selfUserId)
+                ?: return@withContext "there is no account stored yet"
+            val opened = openVault(current, oldPassword)
+                ?: return@withContext "the current password is wrong"
+            opened.identity.fill(0)
+
+            val identity = engine.exportIdentitySecrets()
+            val plain = buildVaultPlaintext(identity)
+            identity.fill(0)
+
+            val sealed = sealVault(plain, newPassword)
+            val generation = client.putVault(
+                selfUserId,
+                sealed.salt,
+                sealed.memoryKiB,
+                sealed.passes,
+                sealed.lanes,
+                sealed.ciphertext,
+            ) ?: return@withContext "the relay did not accept the new password"
+
+            _status.value = "password changed (generation $generation). Sign out " +
+                "other devices first: their next write would overwrite this one."
+            null
+        }
+
+    private fun buildVaultPlaintext(identity: ByteArray): VaultPlain {
+        val records = mutableListOf<String>()
+        for (peer in store.peers()) {
+            for (m in store.loadMessages(peer.userId)) {
+                records += buildString {
+                    append(peer.userId).append('\u0002')
+                    append(if (m.outgoing) 1 else 0).append('\u0002')
+                    append(m.timestamp).append('\u0002')
+                    append(m.state.name).append('\u0002')
+                    append(
+                        m.text.replace("\u0000", " ").replace("\u0001", " ")
+                            .replace("\u0002", " "),
+                    )
+                }
+            }
+        }
+
+        return VaultPlain(
+            identity = identity,
+            preKeyState = prekeyState.load(PREKEY_STATE),
+            peerRegistry = peerPins.load(),
+            groupState = deviceState.load(GROUP_STATE),
+            history = records.joinToString("\u0001").toByteArray(Charsets.UTF_8),
+        )
     }
 
     /**

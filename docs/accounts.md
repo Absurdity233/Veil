@@ -95,13 +95,29 @@ deployment makes by choosing whether to use the feature at all.
 
 ## Scope
 
-Implemented: create, restore, encrypted history.
+Implemented: create, restore, change password, and encrypted history — on the web
+client; create, restore and change on desktop and Android too.
 
 Not implemented:
 
-- **password change** — it would re-seal the vault, which is straightforward, but
-  it must also handle the case where a second device is signed in with the old
-  password and would then write a vault the first device cannot open;
-- **recovery** — see above;
-- **accounts on Android and desktop** — the engine and the ABI support the
-  derivation, and the vault protocol is transport-only, so this is client work.
+- **recovery** — see above. A reset would require the server to be able to open
+  the vault, which would give up the property this exists to keep.
+- **a vault that survives two devices at once** — see the conflict note below.
+
+## The two-device conflict
+
+Changing the password re-seals the vault under a new key. Any other device still
+signed in with the old password can:
+
+- still **read** the vault, because it has the old key and the vault was written
+  with it once;
+- **overwrite** it on its next write, silently reverting the change.
+
+Nothing in the protocol prevents this. It is not a bug in the KDF or the vault
+format: two clients that each believe they own the account will each write what
+they believe. The generation counter makes the overwrite visible after the fact,
+and both the web and desktop dialogs say to sign the other device out first.
+
+The real fix is a device list on the vault (write only from a device the account
+has endorsed) — the same shape as the multi-device credential list that already
+exists for messaging. That is the next step, not a change to this design.

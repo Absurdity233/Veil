@@ -35,6 +35,15 @@ object Wire {
     // Sent after a full page of replayed outbox entries: more is waiting, and
     // the next ACK pulls the following page.
     const val TYPE_MORE_PENDING = 0x0C
+    const val TYPE_PUBLISH_DEVICES = 0x0D
+    const val TYPE_GET_DEVICES = 0x0E
+    const val TYPE_DEVICES = 0x0F
+    // Password vaults. The only types usable before authenticating: restoring an
+    // identity is exactly the case where a client has nothing to sign with yet.
+    const val TYPE_PUT_VAULT = 0x10
+    const val TYPE_GET_VAULT = 0x11
+    const val TYPE_VAULT_DATA = 0x12
+    const val TYPE_VAULT_ACK = 0x13
 
     const val MAX_PAYLOAD = 1 shl 20
 

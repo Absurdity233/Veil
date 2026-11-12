@@ -243,6 +243,9 @@ class RelayInteropTest {
             scope.launch {
                 client.stream.collect { event ->
                     when (event) {
+                        // Vault replies travel on the client's own slot rather
+                        // than this channel, so the test never sees them.
+                        is RelayClient.Event.Vault, is RelayClient.Event.VaultStored -> Unit
                         is RelayClient.Event.Connected -> inbox.add(
                             Wire.Frame(Wire.TYPE_HELLO_OK, ByteArray(0)),
                         )

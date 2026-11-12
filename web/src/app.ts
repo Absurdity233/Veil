@@ -1,4 +1,4 @@
-﻿/**
+/**
  * The web client's application logic.
  *
  * Structurally the same as the Android `ChatController` and the desktop
@@ -998,6 +998,82 @@ export class ChatApp {
         this.messages.set(key, value as StoredMessage[]);
       }
     }
+  }
+
+  /**
+   * Re-seals the vault under a new password.
+   *
+   * The old password is required, not because the server checks it, but because
+   * re-sealing is the only moment a wrong password would silently produce a vault
+   * this client cannot open later. Opening the existing vault proves the old
+   * password before anything is overwritten.
+   *
+   * The conflict worth knowing about: another device signed in with the old
+   * password still has the old key, so it can still *read* the vault — but its
+   * next write would replace this one. Nothing here prevents that; the generation
+   * counter makes it visible, and the honest advice is to sign the other device
+   * out first.
+   */
+  async changePassword(oldPassword: string, newPassword: string): Promise<string | null> {
+    const engine = this.engine;
+    const relay = this.relay;
+    if (!engine) return "the engine is not loaded";
+    if (!relay || !relay.isConnected) return "connect before changing the password";
+    if (!this.selfUserId) return "connect with an id first";
+
+    const problem = checkPassword(newPassword);
+    if (problem) return problem;
+
+    // Prove the old password against the stored vault rather than against
+    // anything local: the local key store has no password, and a change that
+    // skipped this could lock the user out of a vault they never had access to.
+    const current = await relay.getVault(this.selfUserId);
+    if (!current) return "there is no account stored yet: create one first";
+
+    const opened = await openVault(
+      {
+        salt: current.salt,
+        memoryKiB: current.memoryKiB,
+        passes: current.passes,
+        lanes: current.lanes,
+        generation: current.generation,
+        ciphertext: current.ciphertext,
+      },
+      oldPassword,
+    );
+    if (!opened) return "the current password is wrong";
+
+    // The vault that just opened is the authority on what to preserve; this
+    // client's live state may be a subset of it if another device wrote later.
+    opened.identity.fill(0);
+
+    const contents: VaultContents = {
+      identity: engine.identitySecrets(),
+      preKeyState: engine.exportPreKeyState(),
+      peerRegistry: engine.exportPeerRegistry(),
+      groupState: engine.exportGroupState(),
+      history: this.collectHistory(),
+    };
+
+    // Sealed with the *new* password.
+    const sealed = await sealVault(contents, newPassword);
+    contents.identity.fill(0);
+
+    const generation = await relay.putVault(
+      this.selfUserId,
+      sealed.salt,
+      { memoryKiB: sealed.memoryKiB, passes: sealed.passes, lanes: sealed.lanes },
+      sealed.ciphertext,
+    );
+
+    if (generation === null) return "the relay did not accept the new password";
+
+    this.setStatus(
+      `password changed (generation ${generation}). Any other device signed in ` +
+        `with the old password can still read the vault, and its next write ` +
+        `would overwrite this one - sign it out first.`,
+    );
+    return null;
   }
 
   /**

@@ -1,4 +1,4 @@
-package com.veil.desktop
+﻿package com.veil.desktop
 
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -38,6 +38,24 @@ class RelayClient(private val url: String) {
         ) : Event
 
         data object MorePending : Event
+
+        /**
+         * A sealed vault, as the relay returned it.
+         *
+         * Every field is opaque to the relay: the salt and KDF parameters exist so
+         * any client that knows the password can reproduce the key, and the
+         * ciphertext is what that key opens.
+         */
+        data class Vault(
+            val salt: ByteArray,
+            val memoryKiB: Int,
+            val passes: Int,
+            val lanes: Int,
+            val generation: Int,
+            val ciphertext: ByteArray,
+        ) : Event
+
+        data class VaultStored(val generation: Int) : Event
         data class Failed(val message: String) : Event
         data object Disconnected : Event
     }
@@ -142,6 +160,23 @@ class RelayClient(private val url: String) {
                     )
                 }
                 Wire.TYPE_ERROR -> events.trySend(Event.Failed(r.string()))
+
+                Wire.TYPE_VAULT_ACK -> {
+                    val generation = r.u32()
+                    vaultReply.offer(Event.VaultStored(generation))
+                }
+
+                Wire.TYPE_VAULT_DATA -> {
+                    val salt = r.blob()
+                    val memoryKiB = r.u32()
+                    val passes = r.u32()
+                    val lanes = r.u32()
+                    val generation = r.u32()
+                    val ciphertext = r.blob()
+                    vaultReply.offer(
+                        Event.Vault(salt, memoryKiB, passes, lanes, generation, ciphertext),
+                    )
+                }
             }
         } catch (e: Exception) {
             // A frame that does not parse is a relay bug or a version skew, not
@@ -173,6 +208,95 @@ class RelayClient(private val url: String) {
 
     fun acknowledge(outboxId: Long): Boolean =
         send(Wire.TYPE_ACK, Writer().u64(outboxId).build())
+
+    // ---- Password vault ---------------------------------------------------
+    //
+    // Blocking rather than event-driven: account operations happen once, from a
+    // dialog, and a caller that had to subscribe to an event stream to read its
+    // own vault would be more code for no benefit. The request and the reply are
+    // correlated by the connection, one at a time.
+
+    /** Uploads a sealed vault, returning the generation the relay assigned. */
+    suspend fun putVault(
+        userId: String,
+        salt: ByteArray,
+        memoryKiB: Int,
+        passes: Int,
+        lanes: Int,
+        ciphertext: ByteArray,
+        timeoutMs: Long = 30_000,
+    ): Int? {
+        val payload = Writer()
+            .string(userId)
+            .blob(salt)
+            .u32(memoryKiB)
+            .u32(passes)
+            .u32(lanes)
+            .blob(ciphertext)
+            .build()
+
+        if (!send(Wire.TYPE_PUT_VAULT, payload)) return null
+
+        return try {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                val event = awaitVaultReply(deadline - System.currentTimeMillis()) ?: return null
+                if (event is Event.VaultStored) return event.generation
+                if (event is Event.Failed) return null
+            }
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Fetches a sealed vault, or null when the user has none. */
+    suspend fun getVault(userId: String, timeoutMs: Long = 30_000): SealedVault? {
+        if (!send(Wire.TYPE_GET_VAULT, Writer().string(userId).build())) return null
+
+        return try {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                val event = awaitVaultReply(deadline - System.currentTimeMillis()) ?: return null
+                if (event is Event.Vault) {
+                    return SealedVault(
+                        salt = event.salt,
+                        memoryKiB = event.memoryKiB,
+                        passes = event.passes,
+                        lanes = event.lanes,
+                        generation = event.generation,
+                        ciphertext = event.ciphertext,
+                    )
+                }
+                if (event is Event.Failed) return null
+            }
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Vault requests, correlated by the connection.
+     *
+     * A single slot rather than a map: the account dialog makes one request at a
+     * time, and the relay answers the connection that asked. The important part is
+     * that these do *not* consume the event channel - a delivery arriving while a
+     * vault read is in flight would be swallowed by whoever read the channel
+     * first, and a lost message is worse than a slow account dialog.
+     */
+    private val vaultReply = java.util.concurrent.ArrayBlockingQueue<Event>(1)
+
+    /** Waits up to [timeoutMs] for the vault reply that a request asked for. */
+    private suspend fun awaitVaultReply(timeoutMs: Long): Event? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val event = vaultReply.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+                ?: continue
+            return event
+        }
+        return null
+    }
 
     private fun send(type: Int, payload: ByteArray): Boolean {
         if (!connected || closed) return false

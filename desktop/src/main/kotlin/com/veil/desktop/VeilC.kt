@@ -103,6 +103,12 @@ interface VeilC : Library {
                                   outSize: Int): Int
     fun veil_peer_identity(handle: Pointer?, peer: String, out: ByteArray?,
                            outSize: Int): Int
+
+    /** Argon2id, for the account vault. The password never leaves this process. */
+    fun veil_argon2id(out: ByteArray?, outSize: Int,
+                      password: ByteArray, passwordSize: Int,
+                      salt: ByteArray, saltSize: Int,
+                      memoryKib: Int, passes: Int, lanes: Int): Int
     fun veil_device_fingerprint(credential: ByteArray, size: Int, out: ByteArray,
                                 outSize: Int): Int
     fun veil_establish_with_devices(handle: Pointer?, userId: String,

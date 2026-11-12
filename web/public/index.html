@@ -114,6 +114,7 @@
     <div class="link-tabs">
       <button type="button" id="tab-register" class="tab selected">Create account</button>
       <button type="button" id="tab-restore" class="tab">Sign in elsewhere</button>
+      <button type="button" id="tab-change" class="tab">Change password</button>
     </div>
 
     <section id="pane-register">
@@ -148,6 +149,28 @@
         <input id="restore-password" type="password" autocomplete="current-password">
       </label>
       <button type="button" id="restore" class="primary">Sign in</button>
+    </section>
+
+    <section id="pane-change" hidden>
+      <p class="hint">
+        Re-seals the stored account under a new password. The current one is
+        required: re-sealing is the one moment a typo would produce an account
+        this browser cannot open later.
+      </p>
+      <label class="field">
+        <span>Current password</span>
+        <input id="change-old" type="password" autocomplete="current-password">
+      </label>
+      <label class="field">
+        <span>New password</span>
+        <input id="change-new" type="password" autocomplete="new-password">
+      </label>
+      <p id="change-strength" class="hint"></p>
+      <button type="button" id="change" class="primary">Change password</button>
+      <p class="hint">
+        Any other device signed in with the old password can still read the vault,
+        and its next write would overwrite this one. Sign it out first.
+      </p>
     </section>
 
     <p id="account-status" class="status" hidden></p>
@@ -199,6 +222,16 @@
       </p>
       <textarea id="incoming-request" class="mono" rows="3"
                 placeholder="the new device's request"></textarea>
+
+      <!-- Scanning is the fast path; typing is what makes the flow survive a
+           camera that is broken, blocked or absent. Both produce the same string,
+           so the rest of the dialog does not care which was used. -->
+      <div class="scan-row">
+        <button type="button" id="scan-request">Scan a QR</button>
+        <button type="button" id="stop-scan" hidden>Stop</button>
+      </div>
+      <video id="scan-video" class="scan-video" hidden playsinline muted></video>
+
       <button type="button" id="read-request">Read it</button>
 
       <div id="request-details" hidden>

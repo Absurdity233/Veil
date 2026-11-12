@@ -200,6 +200,18 @@ class ChatController(private val stateDir: Path) {
                     blob.fill(0)
                 }
             }
+
+            // The transcript comes back from disk. A chat client that lost it on
+            // restart would show an empty conversation for a peer it had been
+            // talking to for a week.
+            val thread = vault.loadMessages(peer.userId)
+            if (thread.isNotEmpty()) {
+                _messages.value = _messages.value + (peer.userId to thread)
+                // The id counter has to resume above what was loaded, or a new
+                // message would reuse an id and a state update would hit the
+                // wrong one.
+                nextMessageId = maxOf(nextMessageId, thread.maxOf { it.id } + 1)
+            }
         }
 
         // Groups and the device id last, because both depend on the engine
@@ -315,6 +327,12 @@ class ChatController(private val stateDir: Path) {
                     if (_link.value == LinkState.CONNECTING) _link.value = LinkState.ERROR
                 }
                 RelayClient.Event.Disconnected -> _link.value = LinkState.OFFLINE
+
+                // Vault replies never reach this pump: they are delivered to the
+                // account dialog through RelayClient's own slot, so a message
+                // arriving mid-request is not swallowed by whoever reads the
+                // channel first.
+                is RelayClient.Event.Vault, is RelayClient.Event.VaultStored -> Unit
             }
         }
     }
@@ -693,6 +711,33 @@ class ChatController(private val stateDir: Path) {
         val current = _messages.value[peerId].orEmpty()
         _messages.value = _messages.value + (peerId to current + message)
         messageSeq++
+        persistMessages(peerId)
+    }
+
+    /**
+     * Writes one conversation to disk.
+     *
+     * Called on every append and every state change rather than on a timer: a
+     * client that lost the last message of a conversation to a crash would look
+     * like the peer never sent it, and the user has no way to tell the difference.
+     */
+    private fun persistMessages(peerId: String) {
+        val thread = _messages.value[peerId] ?: return
+        runCatching {
+            vault.storeMessages(
+                peerId,
+                thread.map {
+                    ChatMessage(
+                        id = it.id,
+                        peerId = it.peerId,
+                        outgoing = it.outgoing,
+                        text = it.text,
+                        timestamp = it.timestamp,
+                        state = it.state,
+                    )
+                },
+            )
+        }
     }
 
     private fun markLastAs(peerId: String, state: SendState) {
@@ -881,11 +926,148 @@ class ChatController(private val stateDir: Path) {
         null
     }
 
+    // ---- Accounts ---------------------------------------------------------
+    //
+    // A password that lets the identity be restored on another device. What goes
+    // over the wire is a blob sealed under a key derived from it with Argon2id,
+    // so the relay cannot verify the password and cannot open the vault.
+
+    /** Uploads this client's whole state, sealed under the password. */
+    suspend fun createAccount(password: String): String? = withContext(crypto) {
+        val engine = engine ?: return@withContext "the engine is not loaded"
+        val client = relay ?: return@withContext "connect before creating an account"
+        if (userId.isEmpty()) return@withContext "connect with an id first"
+
+        val problem = checkPassword(password)
+        if (problem != null) return@withContext problem
+
+        val identity = engine.identitySecrets()
+        val plain = buildVaultPlaintext(engine, identity)
+        identity.fill(0)
+
+        val sealed = sealVault(plain, password)
+        val generation = client.putVault(
+            userId,
+            sealed.salt,
+            sealed.memoryKiB,
+            sealed.passes,
+            sealed.lanes,
+            sealed.ciphertext,
+        ) ?: return@withContext "the relay did not accept the vault"
+
+        _status.value = "account stored (generation $generation)"
+        null
+    }
+
+    /**
+     * Restores this client's state from the vault.
+     *
+     * A wrong password fails to open the vault, which is the only check available:
+     * there is no password hash to compare against.
+     */
+    suspend fun restoreAccount(id: String, password: String): String? = withContext(crypto) {
+        val client = relay ?: return@withContext "connect before signing in"
+
+        val stored = client.getVault(id) ?: return@withContext "no account stored for $id"
+        val plain = openVault(stored, password)
+            ?: return@withContext "wrong password, or the stored account is damaged"
+
+        engine?.close()
+        val restored = VeilEngine.restore(plain.identity)
+        engine = restored
+        vault.storeIdentity(plain.identity)
+        plain.identity.fill(0)
+
+        plain.preKeyState?.let { restored.importPreKeyState(it) }
+        plain.peerRegistry?.let { restored.importPeerRegistry(it) }
+        plain.groupState?.let { restored.importGroupState(it) }
+
+        restored.exportPreKeyState()?.let { vault.storePreKeyState(it) }
+        restored.exportPeerRegistry()?.let { vault.storeRegistry(it) }
+        restored.exportGroupState()?.let { vault.storeGroupState(it) }
+
+        this@ChatController.userId = id
+        restoreState(restored)
+
+        _status.value = "restored $id from the account store"
+        null
+    }
+
+    /** Re-seals the vault under a new password, after proving the old one. */
+    suspend fun changePassword(oldPassword: String, newPassword: String): String? =
+        withContext(crypto) {
+            val engine = engine ?: return@withContext "the engine is not loaded"
+            val client = relay ?: return@withContext "connect before changing the password"
+            if (userId.isEmpty()) return@withContext "connect with an id first"
+
+            val problem = checkPassword(newPassword)
+            if (problem != null) return@withContext problem
+
+            // Prove the old password against the stored vault. Re-sealing is the
+            // one moment a typo would produce an account this browser cannot open.
+            val current = client.getVault(userId)
+                ?: return@withContext "there is no account stored yet"
+            val opened = openVault(current, oldPassword)
+                ?: return@withContext "the current password is wrong"
+            opened.identity.fill(0)
+
+            val identity = engine.identitySecrets()
+            val plain = buildVaultPlaintext(engine, identity)
+            identity.fill(0)
+
+            val sealed = sealVault(plain, newPassword)
+            val generation = client.putVault(
+                userId,
+                sealed.salt,
+                sealed.memoryKiB,
+                sealed.passes,
+                sealed.lanes,
+                sealed.ciphertext,
+            ) ?: return@withContext "the relay did not accept the new password"
+
+            _status.value = "password changed (generation $generation). Sign out " +
+                "other devices first: their next write would overwrite this one."
+            null
+        }
+
+    /**
+     * Flattens the transcript for the vault.
+     *
+     * A delimiter-separated string rather than a nested structure: the vault only
+     * needs to carry it, and a format the reader can rebuild with one `split` is
+     * one that cannot drift from a schema nobody maintains. The separators are
+     * control characters that a message body cannot contain unescaped, because
+     * they are stripped on input.
+     */
+    private fun buildVaultPlaintext(engine: VeilEngine, identity: ByteArray): VaultPlain {
+        val records = mutableListOf<String>()
+        for ((peerId, thread) in _messages.value) {
+            for (m in thread) {
+                records += buildString {
+                    append(peerId).append('\u0002')
+                    append(if (m.outgoing) 1 else 0).append('\u0002')
+                    append(m.timestamp).append('\u0002')
+                    append(m.state.name).append('\u0002')
+                    append(m.text.replace("\u0002", " ").replace("\u0000", " ").replace("\u0001", " "))
+                }
+            }
+        }
+        val history = records.joinToString("\u0001")
+
+        return VaultPlain(
+            identity = identity,
+            preKeyState = engine.exportPreKeyState(),
+            peerRegistry = engine.exportPeerRegistry(),
+            groupState = engine.exportGroupState(),
+            history = history.toByteArray(Charsets.UTF_8),
+        )
+    }
+
     /**
      * Accepts an invitation that arrived from [peerId].
      *
      * The founder's signing key comes from the peer's own credential, which this
-     * client already pins — so "alice invited me" is checked against the alice
+     * client already pins 閳?so "alice invited me" is checked against the alice
      * this client verified, not against whoever sent the bytes.
      */
     private suspend fun acceptInviteFrom(peerId: String, payload: ByteArray) {
@@ -967,7 +1149,7 @@ class ChatController(private val stateDir: Path) {
  * version: a directory with owner-only permissions, and no pretend that it is
  * anything stronger.
  *
- * The identity itself is *not* stored here in plain text — [Vault.storeIdentity]
+ * The identity itself is *not* stored here in plain text 閳?[Vault.storeIdentity]
  * receives 96 bytes of secret material, and the file is created 0600 before the
  * bytes are written, so there is no window in which it is world-readable.
  */
@@ -993,6 +1175,118 @@ class Vault(private val dir: Path) {
     fun loadSession(peerId: String): ByteArray? = read("session-${safe(peerId)}.bin")
 
     fun storeSession(peerId: String, blob: ByteArray) = write("session-${safe(peerId)}.bin", blob)
+
+    // ---- Transcript -------------------------------------------------------
+    //
+    // One file per conversation, rather than one file for everything: a write
+    // touches only the conversation that changed, so a busy chat does not rewrite
+    // every other transcript on each message.
+    //
+    // The format is line-delimited JSON. It is not the most compact choice, but it
+    // survives a partially-written file: a crash mid-write loses the last line
+    // rather than the whole transcript, which is the failure this store exists to
+    // prevent.
+
+    fun loadMessages(peerId: String): List<ChatMessage> {
+        val raw = read("messages-${safe(peerId)}.jsonl") ?: return emptyList()
+        return raw.toString(Charsets.UTF_8)
+            .lineSequence()
+            .filter { it.isNotBlank() }
+            .mapNotNull { line -> parseMessageLine(line, peerId) }
+            .toList()
+    }
+
+    fun storeMessages(peerId: String, messages: List<ChatMessage>) {
+        val body = messages.joinToString("\n") { m ->
+            "{" +
+                "\"id\":${m.id}," +
+                "\"out\":${m.outgoing}," +
+                "\"text\":\"${escapeJson(m.text)}\"," +
+                "\"at\":${m.timestamp}," +
+                "\"state\":\"${m.state.name}\"" +
+                "}"
+        }
+        write("messages-${safe(peerId)}.jsonl", body.toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * Minimal JSON encoding, for one flat record.
+     *
+     * Hand-written rather than pulling in a serialization plugin: the shape is five
+     * fixed fields, and a plugin would be a build configuration change for a
+     * problem that is one escaping function. The reader is deliberately lenient -
+     * a line that does not parse is dropped rather than failing the whole
+     * transcript, which is what makes a partially-written file survivable.
+     */
+    private fun escapeJson(text: String): String {
+        val out = StringBuilder(text.length + 8)
+        for (c in text) {
+            when (c) {
+                '"' -> out.append("\\\"")
+                '\\' -> out.append("\\\\")
+                '\n' -> out.append("\\n")
+                '\r' -> out.append("\\r")
+                '\t' -> out.append("\\t")
+                else -> if (c < ' ') {
+                    out.append("\\u").append("%04x".format(c.code))
+                } else {
+                    out.append(c)
+                }
+            }
+        }
+        return out.toString()
+    }
+
+    private fun parseMessageLine(line: String, peerId: String): ChatMessage? {
+        fun field(name: String): String? {
+            val key = "\"$name\":"
+            val start = line.indexOf(key) ?: return null
+            val from = start + key.length
+            return if (name == "text") {
+                // A string field: read to the closing quote, honouring escapes.
+                val sb = StringBuilder()
+                var i = from + 1  // skip the opening quote
+                while (i < line.length) {
+                    when (val c = line[i]) {
+                        '"' -> return sb.toString()
+                        '\\' -> {
+                            i++
+                            when (val e = line.getOrNull(i)) {
+                                '"' -> sb.append('"')
+                                '\\' -> sb.append('\\')
+                                'n' -> sb.append('\n')
+                                'r' -> sb.append('\r')
+                                't' -> sb.append('\t')
+                                'u' -> {
+                                    val hex = line.substring(i + 1, minOf(i + 5, line.length))
+                                    sb.append(hex.toIntOrNull(16)?.toChar() ?: '?')
+                                    i += 4
+                                }
+                                else -> if (e != null) sb.append(e)
+                            }
+                        }
+                        else -> sb.append(c)
+                    }
+                    i++
+                }
+                null
+            } else {
+                val end = line.indexOf(',', from).let { if (it < 0) line.length else it }
+                line.substring(from, end).trim().trim('"')
+            }
+        }
+
+        return runCatching {
+            ChatMessage(
+                id = field("id")?.toLongOrNull() ?: return null,
+                peerId = peerId,
+                outgoing = field("out")?.toBooleanStrictOrNull() ?: return null,
+                text = field("text") ?: return null,
+                timestamp = field("at")?.toLongOrNull() ?: return null,
+                state = field("state")?.let { SendState.valueOf(it) } ?: return null,
+            )
+        }.getOrNull()
+    }
 
     // ---- Device and group state -------------------------------------------
     //

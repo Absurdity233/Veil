@@ -38,6 +38,7 @@ import javax.swing.JDialog
 import javax.swing.JTabbedPane
 import javax.swing.JFrame
 import javax.swing.JLabel
+import javax.swing.JPasswordField
 import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.JScrollBar
@@ -56,7 +57,7 @@ import javax.swing.border.EmptyBorder
  * Swing, not Compose, on purpose: this client exists to demonstrate that the
  * protocol engine and the wire format are portable, and pulling in a
  * cross-platform UI toolkit would make the build about the toolkit instead. A
- * plain JVM window keeps the dependency list to three entries 閳?JNA for the C
+ * plain JVM window keeps the dependency list to three entries 闁?JNA for the C
  * ABI, OkHttp for the socket, coroutines for the plumbing.
  */
 fun main() {
@@ -132,6 +133,7 @@ class DesktopWindow(stateDir: Path) {
     private val linkButton = JButton("Link device")
     private val inviteField = HintField(18)
     private val inviteButton = JButton("Invite")
+    private val accountButton = JButton("Account")
 
     /** What the transcript pane is currently showing. */
     private sealed class Conversation {
@@ -180,6 +182,9 @@ class DesktopWindow(stateDir: Path) {
 
         gbc.gridx = 6
         top.add(linkButton, gbc)
+
+        gbc.gridx = 7
+        top.add(accountButton, gbc)
 
         root.add(top, BorderLayout.NORTH)
 
@@ -335,6 +340,7 @@ class DesktopWindow(stateDir: Path) {
         inviteField.addActionListener { inviteButton.doClick() }
 
         linkButton.addActionListener { showLinkingDialog() }
+        accountButton.addActionListener { showAccountDialog() }
 
         peerList.addListSelectionListener {
             if (it.valueIsAdjusting) return@addListSelectionListener
@@ -761,6 +767,215 @@ class DesktopWindow(stateDir: Path) {
                 issued.text = base64(credential)
                 issued.isVisible = true
                 approveStatus.text = "approved. Send this to the new device."
+            }
+        }
+
+        dialog.contentPane = tabs
+        dialog.isVisible = true
+    }
+
+    /**
+     * The account dialog: create, restore, and change the password.
+     *
+     * The password never leaves this process. What goes to the relay is a blob
+     * sealed under a key derived from it with Argon2id, so the relay cannot verify
+     * the password and cannot open the vault - and the honest corollary, which the
+     * dialog states, is that a forgotten password means a lost account.
+     */
+    private fun showAccountDialog() {
+        val dialog = JDialog(frame, "Account", true)
+        dialog.defaultCloseOperation = JDialog.DISPOSE_ON_CLOSE
+        dialog.setSize(520, 460)
+        dialog.setLocationRelativeTo(frame)
+
+        val tabs = JTabbedPane()
+
+        fun passwordRow(label: String, field: JPasswordField, panel: JPanel, row: Int) {
+            val gbc = GridBagConstraints().apply {
+                insets = Insets(4, 0, 4, 0)
+                fill = GridBagConstraints.HORIZONTAL
+                weightx = 1.0
+                gridx = 0
+                gridy = row
+            }
+            panel.add(JLabel(label), gbc)
+            gbc.gridy = row + 1
+            panel.add(field, gbc)
+        }
+
+        // ---- Create ----
+        val createPane = JPanel(BorderLayout(0, 8))
+        createPane.border = EmptyBorder(12, 12, 12, 12)
+
+        val createForm = JPanel(GridBagLayout())
+        val createPassword = JPasswordField(24)
+        val createRepeat = JPasswordField(24)
+        val createStrength = JLabel(" ")
+        createStrength.font = Font(Font.SANS_SERIF, Font.PLAIN, 11)
+        passwordRow("Password", createPassword, createForm, 0)
+        passwordRow("Repeat", createRepeat, createForm, 2)
+
+        val createRow = GridBagConstraints().apply {
+            insets = Insets(4, 0, 4, 0)
+            fill = GridBagConstraints.HORIZONTAL
+            weightx = 1.0
+            gridx = 0
+            gridy = 4
+        }
+        createForm.add(createStrength, createRow)
+
+        val createButton = JButton("Create and upload")
+        createRow.gridy = 5
+        createForm.add(createButton, createRow)
+
+        val createStatus = JLabel(" ")
+        createPane.add(createForm, BorderLayout.CENTER)
+        createPane.add(createStatus, BorderLayout.SOUTH)
+        tabs.addTab("Create account", createPane)
+
+        // ---- Restore ----
+        val restorePane = JPanel(BorderLayout(0, 8))
+        restorePane.border = EmptyBorder(12, 12, 12, 12)
+
+        val restoreForm = JPanel(GridBagLayout())
+        val restoreId = JTextField(24)
+        val restorePassword = JPasswordField(24)
+        val idRow = GridBagConstraints().apply {
+            insets = Insets(4, 0, 4, 0)
+            fill = GridBagConstraints.HORIZONTAL
+            weightx = 1.0
+            gridx = 0
+            gridy = 0
+        }
+        restoreForm.add(JLabel("Id"), idRow)
+        idRow.gridy = 1
+        restoreForm.add(restoreId, idRow)
+        passwordRow("Password", restorePassword, restoreForm, 2)
+
+        val restoreButton = JButton("Sign in")
+        idRow.gridy = 6
+        restoreForm.add(restoreButton, idRow)
+
+        val restoreStatus = JLabel(" ")
+        restorePane.add(restoreForm, BorderLayout.CENTER)
+        restorePane.add(restoreStatus, BorderLayout.SOUTH)
+        tabs.addTab("Sign in elsewhere", restorePane)
+
+        // ---- Change ----
+        val changePane = JPanel(BorderLayout(0, 8))
+        changePane.border = EmptyBorder(12, 12, 12, 12)
+
+        val changeForm = JPanel(GridBagLayout())
+        val changeOld = JPasswordField(24)
+        val changeNew = JPasswordField(24)
+        passwordRow("Current password", changeOld, changeForm, 0)
+        passwordRow("New password", changeNew, changeForm, 2)
+
+        val changeButton = JButton("Change password")
+        val changeRow = GridBagConstraints().apply {
+            insets = Insets(4, 0, 4, 0)
+            fill = GridBagConstraints.HORIZONTAL
+            weightx = 1.0
+            gridx = 0
+            gridy = 4
+        }
+        changeForm.add(changeButton, changeRow)
+
+        val changeNote = JLabel(
+            "<html><body style='width:380px'>Any other device signed in with the " +
+                "old password can still read the vault, and its next write would " +
+                "overwrite this one. Sign it out first.</body></html>",
+        )
+        changeNote.font = Font(Font.SANS_SERIF, Font.PLAIN, 11)
+        changeRow.gridy = 5
+        changeForm.add(changeNote, changeRow)
+
+        val changeStatus = JLabel(" ")
+        changePane.add(changeForm, BorderLayout.CENTER)
+        changePane.add(changeStatus, BorderLayout.SOUTH)
+        tabs.addTab("Change password", changePane)
+
+        // ---- Behaviour ----
+
+        createPassword.addKeyListener(object : KeyAdapter() {
+            override fun keyReleased(e: KeyEvent) {
+                val text = String(createPassword.password)
+                val problem = checkPassword(text)
+                createStrength.text = problem ?: "strength: ${describeStrength(text)}"
+                createStrength.foreground =
+                    if (problem != null) Color(0xC62828) else Color(0x2E7D32)
+            }
+        })
+
+        createButton.addActionListener {
+            val password = String(createPassword.password)
+            val repeat = String(createRepeat.password)
+
+            if (password != repeat) {
+                createStatus.text = "the two passwords do not match"
+                return@addActionListener
+            }
+            val problem = checkPassword(password)
+            if (problem != null) {
+                createStatus.text = problem
+                return@addActionListener
+            }
+
+            createStatus.text = "deriving the key (this takes a moment)..."
+            scope.launch {
+                val error = controller.createAccount(password)
+                SwingUtilities.invokeLater {
+                    createStatus.text = error ?: "account created"
+                    if (error == null) {
+                        createPassword.text = ""
+                        createRepeat.text = ""
+                        createStrength.text = " "
+                    }
+                }
+            }
+        }
+
+        restoreButton.addActionListener {
+            val id = restoreId.text.trim()
+            if (id.isEmpty()) {
+                restoreStatus.text = "enter the id to restore"
+                return@addActionListener
+            }
+
+            restoreStatus.text = "deriving the key (this takes a moment)..."
+            scope.launch {
+                val error = controller.restoreAccount(id, String(restorePassword.password))
+                SwingUtilities.invokeLater {
+                    restoreStatus.text = error ?: "signed in"
+                    if (error == null) {
+                        restorePassword.text = ""
+                        userField.text = id
+                        applyConversations(controller.peers.value, controller.groups.value)
+                    }
+                }
+            }
+        }
+
+        changeButton.addActionListener {
+            val newPassword = String(changeNew.password)
+            val problem = checkPassword(newPassword)
+            if (problem != null) {
+                changeStatus.text = problem
+                return@addActionListener
+            }
+
+            changeStatus.text = "deriving the key (this takes a moment)..."
+            scope.launch {
+                val error = controller.changePassword(
+                    String(changeOld.password), newPassword,
+                )
+                SwingUtilities.invokeLater {
+                    changeStatus.text = error ?: "password changed"
+                    if (error == null) {
+                        changeOld.text = ""
+                        changeNew.text = ""
+                    }
+                }
             }
         }
 

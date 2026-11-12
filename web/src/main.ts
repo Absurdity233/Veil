@@ -9,7 +9,7 @@
 import { ChatApp } from "./app.js";
 import { SessionState } from "./engine.js";
 import { checkPassword, describeStrength } from "./account.js";
-import { drawQr, encodeQr } from "./qr.js";
+import { canScan, drawQr, encodeQr, startScanning } from "./qr.js";
 import { encodeSelection, parseSelection, type Selection } from "./selection.js";
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -69,6 +69,9 @@ const pastedIdentity = $<HTMLTextAreaElement>("pasted-identity");
 const adoptCredential = $<HTMLButtonElement>("adopt-credential");
 const incomingRequest = $<HTMLTextAreaElement>("incoming-request");
 const readRequest = $<HTMLButtonElement>("read-request");
+const scanRequest = $<HTMLButtonElement>("scan-request");
+const stopScan = $<HTMLButtonElement>("stop-scan");
+const scanVideo = $<HTMLVideoElement>("scan-video");
 const requestDetails = $<HTMLElement>("request-details");
 const requestUser = $<HTMLElement>("request-user");
 const requestFingerprint = $<HTMLElement>("request-fingerprint");
@@ -92,6 +95,12 @@ const registerButton = $<HTMLButtonElement>("register");
 const restoreId = $<HTMLInputElement>("restore-id");
 const restorePassword = $<HTMLInputElement>("restore-password");
 const restoreButton = $<HTMLButtonElement>("restore");
+const tabChange = $<HTMLButtonElement>("tab-change");
+const paneChange = $<HTMLElement>("pane-change");
+const changeOld = $<HTMLInputElement>("change-old");
+const changeNew = $<HTMLInputElement>("change-new");
+const changeStrength = $<HTMLParagraphElement>("change-strength");
+const changeButton = $<HTMLButtonElement>("change");
 const accountStatus = $<HTMLParagraphElement>("account-status");
 const closeAccount = $<HTMLButtonElement>("close-account");
 
@@ -577,6 +586,57 @@ readRequest.addEventListener("click", () => {
   showLinkStatus(null);
 });
 
+// ---- Scanning ---------------------------------------------------------
+
+let scanner: { stop(): void } | null = null;
+
+function stopScanning(): void {
+  scanner?.stop();
+  scanner = null;
+  scanVideo.hidden = true;
+  stopScan.hidden = true;
+  scanRequest.hidden = false;
+}
+
+scanRequest.addEventListener("click", () => {
+  if (!canScan()) {
+    showLinkStatus(
+      "this browser has no camera access; type or paste the request instead",
+    );
+    return;
+  }
+
+  showLinkStatus("point the camera at the other device's code");
+
+  void startScanning(scanVideo, (text) => {
+    // The scan produces the same string the other device shows, so it lands in
+    // the text field and the existing Read button takes over - one path from
+    // here, whether the request was scanned or typed.
+    incomingRequest.value = text;
+    stopScanning();
+    showLinkStatus("code captured; press Read it");
+  })
+    .then((handle) => {
+      scanner = handle;
+      scanVideo.hidden = false;
+      stopScan.hidden = false;
+      scanRequest.hidden = true;
+    })
+    .catch((e: unknown) => {
+      showLinkStatus(e instanceof Error ? e.message : "the camera did not start");
+      stopScanning();
+    });
+});
+
+stopScan.addEventListener("click", () => {
+  stopScanning();
+  showLinkStatus(null);
+});
+
+// A dialog that closes while the camera is running would leave the track on,
+// and the indicator light on with it.
+closeLink.addEventListener("click", () => stopScanning());
+
 approveRequest.addEventListener("click", () => {
   const bytes = fromBase64(incomingRequest.value);
   if (!bytes) {
@@ -666,23 +726,27 @@ function showAccountStatus(text: string | null): void {
   accountStatus.textContent = text ?? "";
 }
 
-function selectAccountTab(create: boolean): void {
-  paneRegister.hidden = !create;
-  paneRestore.hidden = create;
-  tabRegister.classList.toggle("selected", create);
-  tabRestore.classList.toggle("selected", !create);
+
+function selectAccountTabByName(name: "register" | "restore" | "change"): void {
+  paneRegister.hidden = name !== "register";
+  paneRestore.hidden = name !== "restore";
+  paneChange.hidden = name !== "change";
+  tabRegister.classList.toggle("selected", name === "register");
+  tabRestore.classList.toggle("selected", name === "restore");
+  tabChange.classList.toggle("selected", name === "change");
   showAccountStatus(null);
 }
 
 openAccount.addEventListener("click", () => {
   restoreId.value = userId.value.trim();
   accountDialog.showModal();
-  selectAccountTab(true);
+  selectAccountTabByName("register");
 });
 
 closeAccount.addEventListener("click", () => accountDialog.close());
-tabRegister.addEventListener("click", () => selectAccountTab(true));
-tabRestore.addEventListener("click", () => selectAccountTab(false));
+tabRegister.addEventListener("click", () => selectAccountTabByName("register"));
+tabRestore.addEventListener("click", () => selectAccountTabByName("restore"));
+tabChange.addEventListener("click", () => selectAccountTabByName("change"));
 
 // The strength line is the only feedback a user gets on the one thing that
 // matters, so it updates as they type rather than on submit.
@@ -737,6 +801,35 @@ restoreButton.addEventListener("click", () => {
       // The restored identity is now this browser's; connecting with it is the
       // next step and the user should see that it is available.
       render();
+    }
+  });
+});
+
+changeNew.addEventListener("input", () => {
+  const password = changeNew.value;
+  const problem = checkPassword(password);
+  changeStrength.textContent = problem ?? `strength: ${describeStrength(password)}`;
+  changeStrength.style.color = problem ? "var(--danger, #c62828)" : "";
+});
+
+changeButton.addEventListener("click", () => {
+  const oldPassword = changeOld.value;
+  const newPassword = changeNew.value;
+
+  const problem = checkPassword(newPassword);
+  if (problem) {
+    showAccountStatus(problem);
+    return;
+  }
+
+  showAccountStatus("deriving the key (this takes a moment)...");
+
+  void app.changePassword(oldPassword, newPassword).then((error) => {
+    showAccountStatus(error ?? "password changed");
+    if (!error) {
+      changeOld.value = "";
+      changeNew.value = "";
+      changeStrength.textContent = "";
     }
   });
 });

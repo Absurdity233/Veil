@@ -30,7 +30,15 @@ object Wire {
     const val TYPE_AUTH_CHALLENGE = 0x0A
     const val TYPE_AUTH_RESPONSE = 0x0B
     const val TYPE_MORE_PENDING = 0x0C
-
+    const val TYPE_PUBLISH_DEVICES = 0x0D
+    const val TYPE_GET_DEVICES = 0x0E
+    const val TYPE_DEVICES = 0x0F
+    // Password vaults. The only types usable before authenticating: restoring an
+    // identity is exactly the case where a client has nothing to sign with yet.
+    const val TYPE_PUT_VAULT = 0x10
+    const val TYPE_GET_VAULT = 0x11
+    const val TYPE_VAULT_DATA = 0x12
+    const val TYPE_VAULT_ACK = 0x13
     const val MAX_PAYLOAD = 1 shl 20
 
     /** Envelope: [1] version | [1] type | [4] length (BE) | payload. */

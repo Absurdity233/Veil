@@ -67,6 +67,9 @@ fun HomeScreen(
     onReadRequest: suspend (String) -> Pair<String, String>?,
     onApprove: suspend (String) -> String?,
     onAdopt: suspend (String, String) -> Boolean,
+    onCreateAccount: suspend (String) -> String?,
+    onRestoreAccount: suspend (String, String) -> String?,
+    onChangePassword: suspend (String, String) -> String?,
 ) {
     var url by remember { mutableStateOf(serverUrl) }
     var userId by remember { mutableStateOf(selfUserId) }
@@ -74,6 +77,12 @@ fun HomeScreen(
     var groupName by remember { mutableStateOf("") }
 
     var linkMode by remember { mutableStateOf<LinkMode?>(null) }
+
+    // The account dialog. Separate from [linkMode] because the two answer
+    // different questions: linking joins this device to an account that already
+    // exists, while the account password is what can restore an identity when
+    // there is no device left to link from.
+    var showAccount by remember { mutableStateOf(false) }
     var linkRequest by remember { mutableStateOf<String?>(null) }
     var linkStatus by remember { mutableStateOf<String?>(null) }
     var fingerprint by remember { mutableStateOf<String?>(null) }
@@ -84,9 +93,18 @@ fun HomeScreen(
     // The dialog is hoisted out of the Scaffold so it survives a recomposition of
     // the list behind it: a linking flow interrupted by an incoming message
     // arriving should not lose the request the user just generated.
+    if (showAccount) {
+        AccountDialog(
+            signedInAs = selfUserId,
+            onDismiss = { showAccount = false },
+            onCreate = onCreateAccount,
+            onRestore = onRestoreAccount,
+            onChange = onChangePassword,
+        )
+    }
+
     linkMode?.let { mode ->
-        DeviceLinkDialog(
-            mode = mode,
+        DeviceLinkDialog(mode = mode,
             request = linkRequest,
             status = linkStatus,
             onDismiss = { linkMode = null },
@@ -162,6 +180,11 @@ fun HomeScreen(
                         linkStatus = null
                         fingerprint = null
                     }) { Text("Approve", fontSize = 12.sp) }
+                    // The account dialog: a password that seals this device's
+                    // state on the relay, so it can be restored elsewhere.
+                    TextButton(onClick = { showAccount = true }) {
+                        Text("Account", fontSize = 12.sp)
+                    }
                     LinkBadge(link)
                 },
                 colors = TopAppBarDefaults.topAppBarColors(

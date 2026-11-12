@@ -712,3 +712,28 @@ Java_com_veil_core_VeilNative_nativePeerDeviceSignPub(JNIEnv* env, jobject /*thi
     if (!engine->peerDeviceSignPublic(toStd(env, peer), out)) return nullptr;
     return toArray(env, veil::Bytes(out, out + 32));
 }
+
+// ---- Password derivation -----------------------------------------------
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_veil_core_VeilNative_nativeArgon2id(JNIEnv* env, jobject /*thiz*/,
+                                             jbyteArray password, jbyteArray salt,
+                                             jint memoryKiB, jint passes, jint lanes) {
+    if (password == nullptr || salt == nullptr) return nullptr;
+
+    const veil::Bytes pw = fromArray(env, password);
+    const veil::Bytes st = fromArray(env, salt);
+
+    veil::Bytes out(32);
+    veil::crypto::Argon2Params params;
+    params.memory_kib = static_cast<uint32_t>(memoryKiB);
+    params.passes = static_cast<uint32_t>(passes);
+    params.lanes = static_cast<uint32_t>(lanes);
+
+    const bool ok = veil::crypto::argon2id(out.data(), out.size(),
+                                           pw.data(), pw.size(),
+                                           st.data(), st.size(), params);
+    veil::wipe(const_cast<veil::Bytes&>(pw));
+    if (!ok) return nullptr;
+    return toArray(env, out);
+}
