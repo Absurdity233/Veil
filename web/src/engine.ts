@@ -111,6 +111,39 @@ interface EmscriptenModule {
   ): number;
   _veil_export_group_state(handle: number, out: number, outSize: number): number;
   _veil_import_group_state(handle: number, data: number, size: number): number;
+
+  // Device list freshness.
+  _veil_set_clock(handle: number, nowMs: number): void;
+  _veil_device_list_needs_refresh(
+    handle: number, userId: number, stalenessMs: number,
+  ): number;
+  _veil_note_send_failed(handle: number, userId: number): void;
+  _veil_note_device_list_fetched(handle: number, userId: number): void;
+
+  // Invitations and linking.
+  _veil_encode_invite(handle: number, groupId: number, out: number, outSize: number): number;
+  _veil_looks_like_invite(data: number, size: number): number;
+  _veil_accept_invite(
+    handle: number, data: number, size: number, founder: number,
+    founderSignPub: number, outGroupId: number, outSize: number,
+  ): number;
+  _veil_linking_request(handle: number, out: number, outSize: number): number;
+  _veil_read_linking_request(
+    data: number, size: number, userId: number, userIdSize: number,
+    fingerprint: number, fingerprintSize: number,
+  ): number;
+  _veil_approve_linking(
+    handle: number, request: number, requestSize: number,
+    issuedAt: number, out: number, outSize: number,
+  ): number;
+  _veil_account_sign_public(handle: number, out: number, outSize: number): number;
+  _veil_peer_device_sign_pub(
+    handle: number, peer: number, out: number, outSize: number,
+  ): number;
+
+  _veil_peer_identity(
+    handle: number, peer: number, out: number, outSize: number,
+  ): number;
 }
 
 declare const createVeilModule: (opts?: unknown) => Promise<EmscriptenModule>;
@@ -135,6 +168,19 @@ export const Status = {
 } as const;
 
 export type StatusCode = (typeof Status)[keyof typeof Status];
+
+/**
+ * Why a peer's device list should be re-fetched.
+ *
+ * Mirrors the C ABI's constants. `SendFailed` outranks `Stale` in the engine's
+ * answer because it is evidence rather than a guess.
+ */
+export enum RefreshReason {
+  None = 0,
+  Stale = 1,
+  SendFailed = 2,
+  Unknown = 3,
+}
 
 export enum SessionState {
   NoPeer = 0,
@@ -898,5 +944,170 @@ export class VeilEngine {
     const mod = VeilEngine.require();
     return this.callWithBlob(blob, (m, ptr, size) =>
       m._veil_import_group_state(this.handle, ptr, size)) as StatusCode;
+  }
+
+  // ---- Device list freshness --------------------------------------------
+  //
+  // A device list is a cache the peer controls, and it can be wrong in the one
+  // direction that matters: they linked a device this client has not heard of,
+  // and frames encrypted to it are simply never received.
+
+  /** Supplies this client's notion of now. Without it, only send failures count. */
+  setClock(nowMs: number): void {
+    VeilEngine.require()._veil_set_clock(this.handle, nowMs);
+  }
+
+  deviceListNeedsRefresh(userId: string, stalenessMs: number): RefreshReason {
+    const mod = VeilEngine.require();
+    return this.withPeer(userId, (ptr) =>
+      mod._veil_device_list_needs_refresh(this.handle, ptr, stalenessMs) as RefreshReason);
+  }
+
+  /** Records that a send could not reach one of the peer's devices. */
+  noteSendFailed(userId: string): void {
+    const mod = VeilEngine.require();
+    this.withPeer(userId, (ptr) => mod._veil_note_send_failed(this.handle, ptr));
+  }
+
+  noteDeviceListFetched(userId: string): void {
+    const mod = VeilEngine.require();
+    this.withPeer(userId, (ptr) => mod._veil_note_device_list_fetched(this.handle, ptr));
+  }
+
+  // ---- Invitations ------------------------------------------------------
+
+  /** The invitation payload, to encrypt and send to one invitee. */
+  encodeInvite(groupId: string): Uint8Array | null {
+    return this.withPeer(groupId, (ptr) =>
+      this.produceVariable(4096, (mod, out, size) =>
+        mod._veil_encode_invite(this.handle, ptr, out, size)));
+  }
+
+  looksLikeInvite(data: Uint8Array): boolean {
+    const mod = VeilEngine.require();
+    const p = mod._malloc(data.length || 1);
+    try {
+      if (data.length) mod.HEAPU8.set(data, p);
+      return mod._veil_looks_like_invite(p, data.length) === 1;
+    } finally {
+      mod._free(p);
+    }
+  }
+
+  /**
+   * Accepts an invitation against the founder's device signing key.
+   *
+   * Returns the group id, or null when refused - so a caller cannot read a
+   * refusal as "accepted into a group with no name".
+   */
+  acceptInvite(
+    data: Uint8Array, founder: string, founderSignPub: Uint8Array,
+  ): string | null {
+    const mod = VeilEngine.require();
+    if (founderSignPub.length !== 32) return null;
+
+    const d = mod._malloc(data.length || 1);
+    const key = mod._malloc(32);
+    const out = mod._malloc(128);
+    try {
+      if (data.length) mod.HEAPU8.set(data, d);
+      mod.HEAPU8.set(founderSignPub, key);
+
+      const status = this.withPeer(founder, (ptr) =>
+        mod._veil_accept_invite(this.handle, d, data.length, ptr, key, out, 128));
+
+      if (status !== Status.OK) return null;
+      const end = mod.HEAPU8.indexOf(0, out);
+      return new TextDecoder().decode(
+        mod.HEAPU8.slice(out, end < 0 ? out + 128 : end),
+      );
+    } finally {
+      mod._free(d);
+      mod._free(key);
+      mod._free(out);
+    }
+  }
+
+  // ---- Device linking ---------------------------------------------------
+
+  /** This device's request, for the existing device to endorse. */
+  linkingRequest(): Uint8Array | null {
+    return this.produceVariable(1024, (mod, out, size) =>
+      mod._veil_linking_request(this.handle, out, size));
+  }
+
+  /** The account a request names and its fingerprint, from the same bytes. */
+  readLinkingRequest(data: Uint8Array): { userId: string; fingerprint: string } | null {
+    const mod = VeilEngine.require();
+    const p = mod._malloc(data.length || 1);
+    const userId = mod._malloc(128);
+    const fp = mod._malloc(64);
+    try {
+      if (data.length) mod.HEAPU8.set(data, p);
+
+      const status = mod._veil_read_linking_request(
+        p, data.length, userId, 128, fp, 64,
+      );
+      if (status !== Status.OK) return null;
+
+      const readCString = (at: number, bound: number): string => {
+        const end = mod.HEAPU8.indexOf(0, at);
+        const stop = end < 0 || end > at + bound ? at + bound : end;
+        return new TextDecoder().decode(mod.HEAPU8.slice(at, stop));
+      };
+
+      return {
+        userId: readCString(userId, 128),
+        fingerprint: readCString(fp, 64),
+      };
+    } finally {
+      mod._free(p);
+      mod._free(userId);
+      mod._free(fp);
+    }
+  }
+
+  /** Signs an endorsement. Null when this engine does not hold the account key. */
+  approveLinking(request: Uint8Array, issuedAt: number): Uint8Array | null {
+    const mod = VeilEngine.require();
+    const p = mod._malloc(request.length || 1);
+    try {
+      if (request.length) mod.HEAPU8.set(request, p);
+
+      return this.produceVariable(512, (m, out, size) =>
+        m._veil_approve_linking(this.handle, p, request.length, issuedAt, out, size));
+    } finally {
+      mod._free(p);
+    }
+  }
+
+  accountSignPublic(): Uint8Array | null {
+    return this.produceVariable(32, (mod, out, size) =>
+      mod._veil_account_sign_public(this.handle, out, size));
+  }
+
+  /**
+   * The device signing key a peer's credential vouches for.
+   *
+   * This is what an invitation is verified against: the key the peer's credential
+   * carries, which is the peer this client verified, not whoever sent the bytes.
+   */
+  peerDeviceSignPublic(peer: string): Uint8Array | null {
+    return this.withPeer(peer, (ptr) =>
+      this.produceVariable(32, (mod, out, size) =>
+        mod._veil_peer_device_sign_pub(this.handle, ptr, out, size)));
+  }
+
+  /**
+   * A peer's pinned account identity: DH public || signing public, 64 bytes.
+   *
+   * This is the key the client already verified during the handshake, which is
+   * why device lists are verified against it rather than against anything carried
+   * in a reply.
+   */
+  peerIdentity(peer: string): Uint8Array | null {
+    return this.withPeer(peer, (ptr) =>
+      this.produceVariable(64, (mod, out, size) =>
+        mod._veil_peer_identity(this.handle, ptr, out, size)));
   }
 }

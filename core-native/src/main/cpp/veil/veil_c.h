@@ -442,6 +442,40 @@ VEIL_API int veil_accept_invite(void* handle, const uint8_t* data, size_t size,
 VEIL_API int veil_peer_device_sign_pub(const void* handle, const char* peer,
                                        uint8_t* out, size_t out_size);
 
+// ---- Device list freshness ----------------------------------------------
+//
+// A device list is a cache the peer controls, and it can be wrong in the one
+// direction that matters: a peer linked a device this client has not heard of,
+// and frames encrypted to that device are simply never received.
+//
+// The policy has three triggers and no timer. Polling costs the peer a bundle
+// fetch each time and still leaves a window; these catch the two moments the
+// list is actually likely to have moved - a send that could not be addressed, and
+// a list the caller decides is old.
+
+#define VEIL_REFRESH_NONE         0
+#define VEIL_REFRESH_STALE        1
+#define VEIL_REFRESH_SEND_FAILED  2
+#define VEIL_REFRESH_UNKNOWN      3
+
+// Supplies the caller's notion of now, in milliseconds.
+//
+// Set once rather than passed to every call, so staleness is computable without
+// the engine reading a clock. An engine that never receives one reports only
+// send failures, which is a working policy rather than a wrong one.
+VEIL_API void veil_set_clock(void* handle, uint64_t now_ms);
+
+// Why a peer's device list should be re-fetched. `staleness_ms` is the caller's
+// policy: how old is too old depends on the client.
+VEIL_API int veil_device_list_needs_refresh(const void* handle, const char* user_id,
+                                            uint64_t staleness_ms);
+
+// Records that a send to this peer could not reach one of its devices.
+VEIL_API void veil_note_send_failed(void* handle, const char* user_id);
+
+// Marks the list fresh, after a successful adoptDeviceList.
+VEIL_API void veil_note_device_list_fetched(void* handle, const char* user_id);
+
 }  // extern "C"
 #endif
 

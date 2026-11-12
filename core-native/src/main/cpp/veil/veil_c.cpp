@@ -1033,3 +1033,40 @@ extern "C" int veil_peer_device_sign_pub(const void* handle, const char* peer,
 
     return engine->peerDeviceSignPublic(label, out) ? 32 : VEIL_NO_SESSION;
 }
+
+// ---- Device list freshness ----------------------------------------------
+
+extern "C" void veil_set_clock(void* handle, uint64_t now_ms) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return;
+    engine->setClock(now_ms);
+}
+
+extern "C" int veil_device_list_needs_refresh(const void* handle, const char* user_id,
+                                              uint64_t staleness_ms) {
+    const auto* engine = toEngine(handle);
+    if (engine == nullptr) return VEIL_ERR_NULL_HANDLE;
+
+    std::string id;
+    if (!readPeer(user_id, id)) return VEIL_ERR_BAD_PARAM;
+
+    return static_cast<int>(engine->deviceListNeedsRefresh(id, staleness_ms));
+}
+
+extern "C" void veil_note_send_failed(void* handle, const char* user_id) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return;
+
+    std::string id;
+    if (!readPeer(user_id, id)) return;
+    engine->noteSendFailed(id);
+}
+
+extern "C" void veil_note_device_list_fetched(void* handle, const char* user_id) {
+    auto* engine = toEngine(handle);
+    if (engine == nullptr) return;
+
+    std::string id;
+    if (!readPeer(user_id, id)) return;
+    engine->noteDeviceListFetched(id);
+}

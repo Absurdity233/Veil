@@ -413,3 +413,100 @@ button.ghost {
   white-space: nowrap;
   border: 0;
 }
+/* ---- Device linking -------------------------------------------------- */
+
+.link-dialog {
+  max-width: 34rem;
+  border: 1px solid var(--border, #d8dbe0);
+  border-radius: 10px;
+  padding: 1.25rem;
+}
+
+.link-dialog::backdrop {
+  background: rgb(0 0 0 / 0.45);
+}
+
+.link-dialog h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+}
+
+.link-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.9rem;
+}
+
+.link-tabs .tab {
+  flex: 1;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border, #d8dbe0);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.link-tabs .tab.selected {
+  background: var(--accent, #2f6feb);
+  border-color: var(--accent, #2f6feb);
+  color: #fff;
+}
+
+.link-dialog .hint {
+  font-size: 0.82rem;
+  color: var(--muted, #6b7280);
+  margin: 0 0 0.6rem;
+}
+
+.link-dialog textarea {
+  width: 100%;
+  font-size: 0.75rem;
+  resize: vertical;
+}
+
+.link-dialog .mono,
+.link-dialog .fingerprint {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* The fingerprint is the one thing a person has to compare, so it is the
+   largest text in the dialog rather than the smallest. */
+.link-dialog .fingerprint {
+  font-size: 1.5rem;
+  letter-spacing: 0.06em;
+  margin: 0.35rem 0 0.9rem;
+  padding: 0.5rem 0.6rem;
+  background: var(--surface-alt, #f4f5f7);
+  border-radius: 6px;
+  text-align: center;
+}
+
+.link-dialog .kv {
+  font-size: 0.85rem;
+  margin: 0.4rem 0 0;
+}
+
+.link-dialog .qr {
+  display: block;
+  margin: 0.8rem auto;
+  max-width: 100%;
+  image-rendering: pixelated;
+}
+
+.link-dialog .field {
+  display: block;
+  margin: 0.6rem 0;
+  font-size: 0.8rem;
+}
+
+.link-dialog .field span {
+  display: block;
+  margin-bottom: 0.25rem;
+  color: var(--muted, #6b7280);
+}
+
+.link-dialog hr {
+  margin: 1rem 0;
+  border: none;
+  border-top: 1px solid var(--border, #d8dbe0);
+}

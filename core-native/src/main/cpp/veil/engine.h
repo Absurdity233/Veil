@@ -250,6 +250,48 @@ public:
     // The version of the list held for a peer; 0 when none.
     uint32_t peerDeviceVersion(const std::string& user_id) const;
 
+    // ---- Device list freshness ------------------------------------------
+    //
+    // A device list is a cache of something the peer controls, and the cache can
+    // be wrong in the one direction that matters: a peer linked a device and this
+    // client has not heard. The consequence is a frame encrypted to a device that
+    // did not exist a minute ago, and the new device simply never receives it.
+    //
+    // The policy has three triggers, and they are deliberately not "poll on a
+    // timer". Polling costs the peer a bundle fetch each time and still leaves a
+    // window; these catch the two moments the list is actually likely to have
+    // moved.
+
+    // The caller's notion of now, in milliseconds. Set once so staleness is
+    // computable without the engine reading a clock.
+    void setClock(uint64_t now_ms);
+
+    // Why a refresh is wanted, or None.
+    enum RefreshReason : int32_t {
+        RefreshNone       = 0,
+        RefreshStale      = 1,  // older than the caller's threshold
+        RefreshSendFailed = 2,  // a frame could not be addressed
+        RefreshUnknown    = 3,  // no list held at all
+    };
+
+    // Whether a peer's device list should be re-fetched, and why.
+    //
+    // `staleness_ms` is the caller's policy, because how old is too old depends on
+    // the client: a phone that stays connected for days and a desktop that
+    // connects for an hour have different answers.
+    RefreshReason deviceListNeedsRefresh(const std::string& user_id,
+                                         uint64_t staleness_ms) const;
+
+    // Records that a send to this peer could not reach one of its devices.
+    //
+    // The next deviceListNeedsRefresh will say so. This is the trigger that
+    // actually catches a linked device: the frame went to a list that did not
+    // include it, so the *failure itself* is the signal.
+    void noteSendFailed(const std::string& user_id);
+
+    // Marks the list fresh, after a successful adoptDeviceList.
+    void noteDeviceListFetched(const std::string& user_id);
+
     // Starts a session with every device in a peer's list that does not have one.
     // `bundles` supplies one bundle per device id, in any order.
     struct DeviceBundle {
@@ -555,10 +597,23 @@ private:
     struct PeerDevices {
         uint32_t version = 0;
         std::vector<DeviceCredential> devices;
+        // Monotonic milliseconds, supplied by the caller. Used only for staleness
+        // decisions, never for anything security-relevant: a device list that is
+        // old is still *valid*, it just may be missing a newly linked device.
+        uint64_t refreshed_at = 0;
+        // Set when a send failed because a device in this list had no session.
+        // A device list that produced an undeliverable frame is exactly the one
+        // worth re-fetching.
+        bool needs_refresh = false;
     };
     std::map<std::string, PeerDevices> peer_devices_;
 
     std::map<std::string, GroupState> groups_;
+
+    // Caller-supplied clock, in milliseconds. Zero means "no clock set", in which
+    // case staleness is never reported: an engine cannot decide a list is stale
+    // without knowing how long it has been.
+    uint64_t now_ms_ = 0;
 };
 
 }  // namespace veil

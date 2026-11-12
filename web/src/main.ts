@@ -1,4 +1,4 @@
-/**
+﻿/**
 void main();
  * The web client's DOM layer.
  *
@@ -9,6 +9,7 @@ void main();
 
 import { ChatApp } from "./app.js";
 import { SessionState } from "./engine.js";
+import { drawQr, encodeQr } from "./qr.js";
 import { encodeSelection, parseSelection, type Selection } from "./selection.js";
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -51,6 +52,30 @@ const groupEpoch = $<HTMLParagraphElement>("group-epoch");
 const groupMembersForm = $<HTMLFormElement>("group-members");
 const membersInput = $<HTMLInputElement>("members");
 const groupHint = $<HTMLParagraphElement>("group-hint");
+
+// ---- Device linking ----
+
+const openLink = $<HTMLButtonElement>("open-link");
+const linkDialog = $<HTMLDialogElement>("link-dialog");
+const tabLink = $<HTMLButtonElement>("tab-link");
+const tabApprove = $<HTMLButtonElement>("tab-approve");
+const paneLink = $<HTMLElement>("pane-link");
+const paneApprove = $<HTMLElement>("pane-approve");
+const generateRequest = $<HTMLButtonElement>("generate-request");
+const qrCanvas = $<HTMLCanvasElement>("qr-canvas");
+const ownRequest = $<HTMLTextAreaElement>("own-request");
+const pastedCredential = $<HTMLTextAreaElement>("pasted-credential");
+const pastedIdentity = $<HTMLTextAreaElement>("pasted-identity");
+const adoptCredential = $<HTMLButtonElement>("adopt-credential");
+const incomingRequest = $<HTMLTextAreaElement>("incoming-request");
+const readRequest = $<HTMLButtonElement>("read-request");
+const requestDetails = $<HTMLElement>("request-details");
+const requestUser = $<HTMLElement>("request-user");
+const requestFingerprint = $<HTMLElement>("request-fingerprint");
+const approveRequest = $<HTMLButtonElement>("approve-request");
+const issuedCredential = $<HTMLTextAreaElement>("issued-credential");
+const linkStatus = $<HTMLParagraphElement>("link-status");
+const closeLink = $<HTMLButtonElement>("close-link");
 
 /** The conversation on screen. Kept beside the parser so the two agree. */
 let selected: Selection | null = null;
@@ -447,5 +472,148 @@ toggleSafety.addEventListener("click", () => {
   toggleSafety.setAttribute("aria-expanded", String(open));
   toggleSafety.textContent = open ? "Hide code" : "Verify";
 });
+
+// ---- Device linking ---------------------------------------------------
+
+function showLinkStatus(text: string | null): void {
+  linkStatus.hidden = text === null;
+  linkStatus.textContent = text ?? "";
+}
+
+function selectTab(linkThis: boolean): void {
+  paneLink.hidden = !linkThis;
+  paneApprove.hidden = linkThis;
+  tabLink.classList.toggle("selected", linkThis);
+  tabApprove.classList.toggle("selected", !linkThis);
+  showLinkStatus(null);
+}
+
+openLink.addEventListener("click", () => {
+  linkDialog.showModal();
+  selectTab(true);
+});
+
+closeLink.addEventListener("click", () => linkDialog.close());
+
+tabLink.addEventListener("click", () => selectTab(true));
+tabApprove.addEventListener("click", () => selectTab(false));
+
+generateRequest.addEventListener("click", () => {
+  const request = app.linkingRequest();
+  if (!request) {
+    showLinkStatus(
+      "this browser has no device identity yet: connect first, then generate",
+    );
+    return;
+  }
+
+  // Base64 for both the text field and the QR: one representation, so a device
+  // that scans and a device that is typed into receive the same bytes.
+  const text = toBase64(request);
+  ownRequest.value = text;
+  ownRequest.hidden = false;
+
+  try {
+    const code = encodeQr(new TextEncoder().encode(text));
+    qrCanvas.width = (code.size + 8) * 5;
+    qrCanvas.height = (code.size + 8) * 5;
+    const ctx = qrCanvas.getContext("2d");
+    if (ctx) drawQr(ctx, code, { scale: 5, margin: 4 });
+    qrCanvas.hidden = false;
+  } catch (e) {
+    // A request too large to encode is a real possibility if the format grows;
+    // saying so is better than showing a code that lost its tail.
+    qrCanvas.hidden = true;
+    showLinkStatus(
+      `too large for a QR code (${request.length} bytes); use the text below`,
+    );
+  }
+
+  showLinkStatus(null);
+});
+
+readRequest.addEventListener("click", () => {
+  const bytes = fromBase64(incomingRequest.value);
+  if (!bytes) {
+    showLinkStatus("that is not a request");
+    return;
+  }
+
+  const parsed = app.readLinkingRequest(bytes);
+  if (!parsed) {
+    showLinkStatus("that request could not be read");
+    return;
+  }
+
+  requestUser.textContent = parsed.userId;
+  requestFingerprint.textContent = parsed.fingerprint;
+  requestDetails.hidden = false;
+  showLinkStatus(null);
+});
+
+approveRequest.addEventListener("click", () => {
+  const bytes = fromBase64(incomingRequest.value);
+  if (!bytes) {
+    showLinkStatus("that is not a request");
+    return;
+  }
+
+  const credential = app.approveLinking(bytes);
+  if (!credential) {
+    showLinkStatus("only the device that holds the account key can approve");
+    return;
+  }
+
+  issuedCredential.value = toBase64(credential);
+  issuedCredential.hidden = false;
+  showLinkStatus("approved. Send this to the new device.");
+});
+
+adoptCredential.addEventListener("click", () => {
+  const credential = fromBase64(pastedCredential.value);
+  const identity = fromBase64(pastedIdentity.value);
+
+  if (!credential || !identity) {
+    showLinkStatus("paste both the credential and the account identity");
+    return;
+  }
+  if (identity.length !== 64) {
+    showLinkStatus("the account identity must be 64 bytes");
+    return;
+  }
+
+  void app
+    .adoptLinking(credential, identity.slice(0, 32), identity.slice(32, 64))
+    .then((ok) => {
+      showLinkStatus(
+        ok
+          ? "this device is now part of the account"
+          : "that credential was refused",
+      );
+      if (ok) render();
+    });
+});
+
+/** Base64 without padding, so it survives a copy-paste round trip intact. */
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+/** Accepts what toBase64 produced, and tolerates whitespace from a paste. */
+function fromBase64(text: string): Uint8Array | null {
+  const cleaned = text.replace(/\s+/g, "");
+  if (cleaned.length === 0) return null;
+
+  try {
+    const binary = atob(cleaned);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
 
 void main();

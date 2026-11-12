@@ -681,6 +681,11 @@ Engine::Result Engine::adoptDeviceList(const std::string& user_id,
     std::memcpy(peer_identity_[user_id].data() + kKeySize, account_sign_pub, 32);
 
     peer_devices_[user_id] = std::move(parsed);
+
+    // The list is fresh as of now. recorded here rather than by the caller so
+    // there is no way to adopt a list and forget to say when.
+    peer_devices_[user_id].refreshed_at = now_ms_;
+    peer_devices_[user_id].needs_refresh = false;
     return Result::Ok;
 }
 
@@ -699,6 +704,60 @@ std::vector<std::string> Engine::peerDevices(const std::string& user_id) const {
 uint32_t Engine::peerDeviceVersion(const std::string& user_id) const {
     auto it = peer_devices_.find(user_id);
     return it == peer_devices_.end() ? 0 : it->second.version;
+}
+
+// ---- Device list freshness --------------------------------------------
+
+void Engine::setClock(uint64_t now_ms) {
+    now_ms_ = now_ms;
+}
+
+void Engine::noteSendFailed(const std::string& user_id) {
+    auto it = peer_devices_.find(user_id);
+    if (it == peer_devices_.end()) return;
+
+    // Only an existing list is marked. A peer with no list is already handled by
+    // RefreshUnknown, and creating an entry here would pretend a list was known.
+    it->second.needs_refresh = true;
+}
+
+void Engine::noteDeviceListFetched(const std::string& user_id) {
+    auto it = peer_devices_.find(user_id);
+    if (it == peer_devices_.end()) return;
+
+    it->second.needs_refresh = false;
+    it->second.refreshed_at = now_ms_;
+}
+
+Engine::RefreshReason Engine::deviceListNeedsRefresh(const std::string& user_id,
+                                                     uint64_t staleness_ms) const {
+    auto it = peer_devices_.find(user_id);
+    if (it == peer_devices_.end()) {
+        // No list held. The caller may not need one - a single-device peer works
+        // without - but "unknown" is the honest answer, and it is up to the client
+        // whether to act on it.
+        return RefreshUnknown;
+    }
+
+    // A send that could not reach a device outranks staleness: it is evidence,
+    // where staleness is only a guess.
+    if (it->second.needs_refresh) return RefreshSendFailed;
+
+    if (now_ms_ == 0 || it->second.refreshed_at == 0) {
+        // No clock has been supplied, so nothing can be called stale. Reporting
+        // None here is deliberate: a client that never sets a clock gets "refresh
+        // only when a send fails", which is a working policy rather than a wrong
+        // one.
+        return RefreshNone;
+    }
+
+    // Guards against a clock that went backwards (a wall clock adjusted by NTP),
+    // which would otherwise report a huge staleness for a list fetched a second
+    // ago.
+    if (now_ms_ < it->second.refreshed_at) return RefreshNone;
+
+    if (now_ms_ - it->second.refreshed_at >= staleness_ms) return RefreshStale;
+    return RefreshNone;
 }
 
 size_t Engine::establishWithDevices(const std::string& user_id,
@@ -750,7 +809,14 @@ std::vector<Engine::DeviceFrame> Engine::encryptToAccount(const std::string& use
         // A device with no session is skipped rather than treated as an error:
         // a peer's laptop may not have been online since the last handshake, and
         // failing the whole send would make one stale device block the account.
-        if (findSession(label) == nullptr) continue;
+        //
+        // It is also recorded: a list that names a device this client cannot
+        // reach is exactly the list worth re-fetching, because the most likely
+        // reason is that the device was linked after the list was cached.
+        if (findSession(label) == nullptr) {
+            list->second.needs_refresh = true;
+            continue;
+        }
 
         Bytes frame = encrypt(label, plain, size);
         if (!frame.empty()) out.push_back({device_hex, std::move(frame)});

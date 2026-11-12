@@ -300,11 +300,59 @@ the account.
 
 ### What is still missing
 
-- **QR / camera transfer.** The flow is text: a base64 request and a base64
-  credential, copied between devices. That works and is honest; a QR code would be
-  faster and is a client-side addition.
-- **Device list refresh strategy.** When a client re-fetches, and how it behaves
-  when a send fails because a device list moved, is a client decision that has not
-  been made. The web client has `refreshPeerDevices` and `connectPeerDevices`.
 - **History transfer to a new device.** Out of scope above, and still out of
   scope.
+
+## Device list freshness
+
+A device list is a cache of something the peer controls, and it can be wrong in
+the one direction that matters: the peer linked a device and this client has not
+heard. The consequence is a frame encrypted to a device that does not exist in the
+cached list, and the new device simply never receives it.
+
+The policy has **three triggers and no timer**. Polling costs the peer a bundle
+fetch each time and still leaves a window; these catch the two moments the list is
+actually likely to have moved:
+
+| reason | when |
+|---|---|
+| `SendFailed` | a fan-out could not address one of the devices in the list |
+| `Stale` | older than the caller's threshold (the web client uses 10 minutes) |
+| `Unknown` | no list held at all — the peer may be single-device, so this is not an error |
+
+`SendFailed` outranks `Stale` in the answer because it is evidence where staleness
+is a guess: the failure *is* the signal that a device was added.
+
+Two details that are easy to get wrong:
+
+- **The engine never reads a clock.** The caller supplies one via `setClock`. An
+  engine that never receives one reports only send failures, which is a working
+  policy rather than a wrong one — and it keeps the engine testable.
+- **A clock that moves backwards reports nothing.** Wall clocks get adjusted by
+  NTP, and reporting a list fetched a second ago as ancient would cause a
+  re-fetch storm.
+
+A successful `adoptDeviceList` clears both the staleness timestamp and the
+send-failure flag in one place, so there is no way to adopt a list and forget to
+record when.
+
+## Client UI
+
+| | groups | linking | QR |
+|---|---|---|---|
+| Android | yes | yes (dialog, both halves) | no |
+| desktop | yes | yes (dialog, both halves) | no |
+| web | yes | yes (dialog, both halves) | yes |
+
+The QR carries the request so the other device scans rather than being read a
+200-character base64 string aloud. The text is still shown and still accepted: a
+camera can fail, and a flow that only works when it does not is a flow that does
+not work.
+
+The web QR encoder is a thin wrapper over `qrcode` rather than hand-written. That
+was learned the hard way — a hand-rolled encoder produced codes whose finder
+patterns, module counts and format bits were provably correct and which no decoder
+could read, because QR is a pipeline of bit packing, Reed-Solomon, interleaving,
+placement, masking and BCH where a mistake anywhere yields a well-formed square
+that scans as noise. The library is generation-only, and a test decodes every size
+it produces with an independent decoder.

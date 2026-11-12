@@ -9,7 +9,7 @@
  * queued-frame list something to persist rather than keep in memory.
  */
 
-import { SessionState, Status, VeilEngine, type StatusCode } from "./engine.js";
+import { RefreshReason, SessionState, Status, VeilEngine, type StatusCode } from "./engine.js";
 import { RelayClient, type RelayEvent, buildBundle } from "./relay.js";
 import { Reader } from "./wire.js";
 import { Vault, type GroupMessageRecord, type StoredMessage } from "./vault.js";
@@ -56,6 +56,16 @@ const _groupMessageShape: GroupMessageRecord | GroupMessageView = {
 void _groupMessageShape;
 
 const REFILL_LOW_WATER = 10;
+
+/**
+ * How old a peer's device list may be before a send triggers a re-fetch.
+ *
+ * Ten minutes: long enough that a conversation does not re-fetch on every
+ * message, short enough that a device linked during a session is picked up
+ * without the user noticing. The send-failure trigger is what catches the rest,
+ * so this only needs to be a backstop.
+ */
+const DEVICE_LIST_STALENESS_MS = 10 * 60 * 1000;
 
 /** A frame that was encrypted but not handed to the relay. */
 interface QueuedFrame {
@@ -488,6 +498,55 @@ export class ChatApp {
       this.updateMessageState(message.id, "failed");
       this.setStatus("offline: the message is queued and will be retried");
     }
+
+    // A frame addressed to a device that has no session is the signal that the
+    // cached list is out of date - most likely the peer linked a device after this
+    // client last fetched. Recording it here rather than polling is what makes the
+    // refresh happen at the one moment it is likely to matter.
+    const missing = frames.length === 0 || frames.some((f) => f.deviceId !== "");
+    if (missing) void this.refreshDevicesIfNeeded(peerId);
+  }
+
+  // ---- Device list freshness -------------------------------------------
+
+  /**
+   * Re-fetches a peer's device list when the engine says it is worth doing.
+   *
+   * The engine decides; this only acts. Three triggers, no timer: a send that
+   * could not be addressed, a list older than the threshold, or no list at all.
+   */
+  private async refreshDevicesIfNeeded(peerId: string): Promise<void> {
+    const engine = this.engine;
+    if (!engine) return;
+
+    engine.setClock(Date.now());
+    const reason = engine.deviceListNeedsRefresh(peerId, DEVICE_LIST_STALENESS_MS);
+
+    // Unknown means the peer may be single-device, which works without a list.
+    // Fetching one is worth a try but must not be treated as an error.
+    if (reason === RefreshReason.None) return;
+
+    const peer = this.peers.find((p) => p.userId === peerId);
+
+    // The account identity this client already pins, which is the key the device
+    // list is verified against. There is nothing to verify against without one,
+    // and fetching a list into an unverified slot would be worse than not
+    // fetching.
+    const identity = engine.peerIdentity(peerId);
+    if (!identity || identity.length !== 64) return;
+
+    const adopted = await this.refreshPeerDevices(
+      peerId, identity.slice(0, 32), identity.slice(32, 64),
+    );
+    if (!adopted) return;
+
+    engine.noteDeviceListFetched(peerId);
+    if (peer) peer.devices = engine.peerDevices(peerId);
+
+    // A freshly learned device needs a session before it can receive anything,
+    // so the next send is the first that can reach it.
+    await this.connectPeerDevices(peerId);
+    this.notify();
   }
 
   // ---- Groups -----------------------------------------------------------
@@ -771,11 +830,52 @@ export class ChatApp {
     return this.engine?.deviceCredential() ?? null;
   }
 
+  // ---- Device linking ---------------------------------------------------
+
+  /** This device's linking request, for the existing device to endorse. */
+  linkingRequest(): Uint8Array | null {
+    return this.engine?.linkingRequest() ?? null;
+  }
+
+  /**
+   * The account a request names and its fingerprint.
+   *
+   * Both from one call, so the fingerprint shown cannot belong to a different
+   * request than the one about to be approved.
+   */
+  readLinkingRequest(data: Uint8Array): { userId: string; fingerprint: string } | null {
+    return this.engine?.readLinkingRequest(data) ?? null;
+  }
+
+  /**
+   * Signs an endorsement for another device.
+   *
+   * Null when this client does not hold the account key, which is the correct
+   * answer rather than an error: a linked device cannot add further devices.
+   */
+  approveLinking(request: Uint8Array): Uint8Array | null {
+    const engine = this.engine;
+    if (!engine) return null;
+    return engine.approveLinking(request, Math.floor(Date.now() / 1000));
+  }
+
+  /** This account's identity, for the device being linked to verify against. */
+  publicIdentity(): Uint8Array | null {
+    return this.engine?.publicIdentity() ?? null;
+  }
+
+  /** Adopts a device credential, and takes on its device id. */
+  async adoptLinking(
+    credential: Uint8Array, accountDhPub: Uint8Array, accountSignPub: Uint8Array,
+  ): Promise<boolean> {
+    return this.adoptDeviceCredential(credential, accountDhPub, accountSignPub);
+  }
+
   /**
    * Links this client to an existing account.
    *
    * The credential has to arrive over a channel that already authenticates the
-   * account 閳?the whole point is that a relay cannot issue one 閳?so this takes
+   * account 闁?the whole point is that a relay cannot issue one 闁?so this takes
    * an already-signed blob and verifies it against the account keys.
    */
   async adoptDeviceCredential(

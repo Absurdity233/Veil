@@ -651,6 +651,18 @@ class ChatController(private val stateDir: Path) {
 
         if (plain == null) return
 
+        val engineForInvite = engine
+
+        // An invitation is message content, not a wire type, so it is recognised
+        // here rather than by the relay. It never reaches the transcript: a blob
+        // of prefix and lengths is not something a person wants to read.
+        val isInvite = withContext(crypto) { engineForInvite.looksLikeInvite(plain) }
+        if (isInvite) {
+            withContext(crypto) { acceptInviteFrom(peerId, plain) }
+            if (event.outboxId > 0) relay?.acknowledge(event.outboxId)
+            return
+        }
+
         val text = String(plain, Charsets.UTF_8)
         if (_peers.value.none { it.userId == peerId }) {
             _peers.value = _peers.value + Peer(peerId, peerId)
@@ -769,6 +781,132 @@ class ChatController(private val stateDir: Path) {
 
         engine.exportGroupState()?.let { vault.storeGroupState(it) }
         vault.storeGroupIds(_groups.value.map { it.groupId })
+    }
+
+    // ---- Invitations and linking ------------------------------------------
+
+    /**
+     * Invites one person to a group.
+     *
+     * The invitation is an ordinary message: encrypted to their session and sent
+     * like anything else, so the relay learns only that a message was sent.
+     * Requires a pairwise session, which is what authenticates the founder.
+     */
+    fun inviteToGroup(groupId: String, peerId: String) {
+        val engine = engine ?: return
+        val client = relay ?: return
+
+        scope.launch {
+            val invite = withContext(crypto) { engine.encodeInvite(groupId) }
+            if (invite == null) {
+                _status.value = "cannot invite: $groupId has no chain yet"
+                return@launch
+            }
+
+            val frames = withContext(crypto) {
+                engine.encryptToAccount(peerId, invite)
+            }
+            if (frames.isEmpty()) {
+                _status.value = "cannot invite $peerId: no session with them yet"
+                return@launch
+            }
+
+            var sent = false
+            if (client.isConnected) {
+                for ((device, frame) in frames) {
+                    if (client.sendMessage(peerId, frame, device)) sent = true
+                }
+            }
+            _status.value = if (sent) {
+                "invitation sent to $peerId"
+            } else {
+                "offline: the invitation was not delivered"
+            }
+        }
+    }
+
+    /** This device's linking request, for the existing device to endorse. */
+    suspend fun linkingRequest(): ByteArray? = withContext(crypto) {
+        engine?.linkingRequest()
+    }
+
+    /** The account a request names and its fingerprint, from the same bytes. */
+    suspend fun readLinkingRequest(data: ByteArray): Pair<String, String>? =
+        withContext(crypto) { engine?.readLinkingRequest(data) }
+
+    /**
+     * Signs an endorsement for another device.
+     *
+     * Null when this client does not hold the account key, which is the correct
+     * answer rather than an error: a linked device cannot add further devices.
+     */
+    suspend fun approveLinking(request: ByteArray): ByteArray? = withContext(crypto) {
+        engine?.approveLinking(request, System.currentTimeMillis() / 1000)
+    }
+
+    /**
+     * Adopts an endorsement from two base64 strings the user pasted.
+     *
+     * The account identity arrives as one 64-byte blob (DH public || signing
+     * public), which is what the approving device produces. Splitting it here
+     * rather than asking the user for two strings is deliberate: one field is one
+     * thing to copy, and the split is not a decision a person should have to make.
+     */
+    suspend fun adoptLinkingFromText(credentialText: String, identityText: String): Boolean {
+        val credential = fromBase64(credentialText) ?: return false
+        val identity = fromBase64(identityText) ?: return false
+        if (identity.size != 64) return false
+
+        return withContext(crypto) {
+            val ok = engine?.adoptDeviceCredential(
+                credential,
+                identity.copyOfRange(0, 32),
+                identity.copyOfRange(32, 64),
+            )
+            if (ok == true) {
+                engine?.deviceId()?.let { raw ->
+                    deviceId = raw.joinToString("") { "%02x".format(it) }
+                    vault.storeDeviceId(deviceId)
+                }
+                persistGroups()
+            }
+            ok == true
+        }
+    }
+
+    private fun fromBase64(text: String): ByteArray? = try {
+        val cleaned = text.filterNot { it.isWhitespace() }
+        if (cleaned.isEmpty()) null else java.util.Base64.getDecoder().decode(cleaned)
+    } catch (e: IllegalArgumentException) {
+        null
+    }
+
+    /**
+     * Accepts an invitation that arrived from [peerId].
+     *
+     * The founder's signing key comes from the peer's own credential, which this
+     * client already pins — so "alice invited me" is checked against the alice
+     * this client verified, not against whoever sent the bytes.
+     */
+    private suspend fun acceptInviteFrom(peerId: String, payload: ByteArray) {
+        val engine = engine ?: return
+
+        val founderSignPub = engine.peerDeviceSignPublic(peerId)
+        if (founderSignPub == null) {
+            _status.value = "an invitation arrived from $peerId but could not be verified"
+            return
+        }
+
+        val groupId = engine.acceptInvite(payload, peerId, founderSignPub)
+        if (groupId == null) {
+            _status.value = "an invitation from $peerId was refused"
+            return
+        }
+
+        refreshGroup(groupId)
+        appendGroupMessage(groupId, senderId = peerId, text = "joined the group",
+            outgoing = false)
+        _status.value = "joined $groupId"
     }
 
     /** Reloads groups after a restart, so a reload does not drop every one. */

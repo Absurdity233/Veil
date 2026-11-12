@@ -1,4 +1,4 @@
-﻿package com.veil.desktop
+package com.veil.desktop
 
 import com.sun.jna.Library
 import com.sun.jna.Native
@@ -50,7 +50,6 @@ interface VeilC : Library {
     fun veil_export_session(handle: Pointer?, peer: String, out: ByteArray, outSize: Int): Int
     fun veil_import_session(handle: Pointer?, peer: String, data: ByteArray, size: Int): Int
     fun veil_drop_session(handle: Pointer?, peer: String)
-    fun veil_peer_identity(handle: Pointer?, peer: String, out: ByteArray, outSize: Int): Int
 
     // ---- Registry ----
     fun veil_export_peer_registry(handle: Pointer?, out: ByteArray, outSize: Int): Int
@@ -78,6 +77,32 @@ interface VeilC : Library {
     fun veil_peer_devices(handle: Pointer?, userId: String, out: ByteArray?,
                           outSize: Int): Int
     fun veil_peer_device_version(handle: Pointer?, userId: String): Int
+
+    // ---- Device list freshness ----
+    fun veil_set_clock(handle: Pointer?, nowMs: Long)
+    fun veil_device_list_needs_refresh(handle: Pointer?, userId: String,
+                                       stalenessMs: Long): Int
+    fun veil_note_send_failed(handle: Pointer?, userId: String)
+    fun veil_note_device_list_fetched(handle: Pointer?, userId: String)
+
+    // ---- Invitations and linking ----
+    fun veil_encode_invite(handle: Pointer?, groupId: String, out: ByteArray?,
+                           outSize: Int): Int
+    fun veil_looks_like_invite(data: ByteArray, size: Int): Int
+    fun veil_accept_invite(handle: Pointer?, data: ByteArray, size: Int,
+                           expectedFounder: String, founderSignPub: ByteArray,
+                           outGroupId: ByteArray?, outSize: Int): Int
+    fun veil_read_linking_request(data: ByteArray, size: Int, userId: ByteArray?,
+                                  userIdSize: Int, fingerprint: ByteArray?,
+                                  fingerprintSize: Int): Int
+    fun veil_linking_request(handle: Pointer?, out: ByteArray?, outSize: Int): Int
+    fun veil_approve_linking(handle: Pointer?, request: ByteArray, requestSize: Int,
+                             issuedAt: Long, out: ByteArray?, outSize: Int): Int
+    fun veil_account_sign_public(handle: Pointer?, out: ByteArray?, outSize: Int): Int
+    fun veil_peer_device_sign_pub(handle: Pointer?, peer: String, out: ByteArray?,
+                                  outSize: Int): Int
+    fun veil_peer_identity(handle: Pointer?, peer: String, out: ByteArray?,
+                           outSize: Int): Int
     fun veil_device_fingerprint(credential: ByteArray, size: Int, out: ByteArray,
                                 outSize: Int): Int
     fun veil_establish_with_devices(handle: Pointer?, userId: String,
@@ -359,6 +384,93 @@ class VeilEngine private constructor(private val handle: Pointer) : AutoCloseabl
 
     fun peerDeviceVersion(userId: String): Int =
         lib.veil_peer_device_version(handle, userId)
+
+    // ---- Device list freshness -------------------------------------------
+    //
+    // A device list is a cache the peer controls, and it can be wrong in the one
+    // direction that matters: they linked a device this client has not heard of,
+    // and frames encrypted to it are simply never received.
+
+    /** Supplies this client's notion of now. Without it, only send failures count. */
+    fun setClock(nowMs: Long) = lib.veil_set_clock(handle, nowMs)
+
+    /** 0 = none, 1 = stale, 2 = a send failed, 3 = no list held. */
+    fun deviceListNeedsRefresh(userId: String, stalenessMs: Long): Int =
+        lib.veil_device_list_needs_refresh(handle, userId, stalenessMs)
+
+    fun noteSendFailed(userId: String) = lib.veil_note_send_failed(handle, userId)
+
+    fun noteDeviceListFetched(userId: String) =
+        lib.veil_note_device_list_fetched(handle, userId)
+
+    /** A peer's pinned account identity: DH public || signing public, 64 bytes. */
+    fun peerIdentity(peer: String): ByteArray? =
+        produce(64) { buf, size -> lib.veil_peer_identity(handle, peer, buf, size) }
+
+    // ---- Invitations and linking -----------------------------------------
+
+    fun encodeInvite(groupId: String): ByteArray? =
+        produce(4096) { buf, size -> lib.veil_encode_invite(handle, groupId, buf, size) }
+
+    fun looksLikeInvite(data: ByteArray): Boolean =
+        lib.veil_looks_like_invite(data, data.size) == 1
+
+    /**
+     * Accepts an invitation against the founder's device signing key.
+     *
+     * Returns the group id, or null when refused - so a caller cannot read a
+     * refusal as "accepted into a group with no name".
+     */
+    fun acceptInvite(data: ByteArray, founder: String, founderSignPub: ByteArray): String? {
+        if (founderSignPub.size != 32) return null
+
+        val out = ByteArray(128)
+        val status = lib.veil_accept_invite(
+            handle, data, data.size, founder, founderSignPub, out, out.size,
+        )
+        if (status != VeilC.OK) return null
+
+        val end = out.indexOfFirst { it == 0.toByte() }
+        return String(out, 0, if (end < 0) out.size else end, Charsets.UTF_8)
+    }
+
+    /** The account a request names and its fingerprint, from the same bytes. */
+    fun readLinkingRequest(data: ByteArray): Pair<String, String>? {
+        val user = ByteArray(128)
+        val fp = ByteArray(64)
+        val status = lib.veil_read_linking_request(data, data.size, user, user.size, fp, fp.size)
+        if (status != VeilC.OK) return null
+
+        fun readCString(buf: ByteArray): String {
+            val end = buf.indexOfFirst { it == 0.toByte() }
+            return String(buf, 0, if (end < 0) buf.size else end, Charsets.UTF_8)
+        }
+        return readCString(user) to readCString(fp)
+    }
+
+    fun linkingRequest(): ByteArray? =
+        produce(1024) { buf, size -> lib.veil_linking_request(handle, buf, size) }
+
+    /** Signs an endorsement. Null when this engine does not hold the account key. */
+    fun approveLinking(request: ByteArray, issuedAt: Long): ByteArray? =
+        produce(512) { buf, size ->
+            lib.veil_approve_linking(handle, request, request.size, issuedAt, buf, size)
+        }
+
+    fun accountSignPublic(): ByteArray? =
+        produce(32) { buf, size -> lib.veil_account_sign_public(handle, buf, size) }
+
+    /**
+     * The device signing key a peer's credential vouches for.
+     *
+     * This is what an invitation is verified against: the key the peer's
+     * credential carries, which is the peer this client verified, not whoever
+     * sent the bytes.
+     */
+    fun peerDeviceSignPublic(peer: String): ByteArray? =
+        produce(32) { buf, size ->
+            lib.veil_peer_device_sign_pub(handle, peer, buf, size)
+        }
 
     /**
      * Encrypts one plaintext to every device of a peer that has a session.

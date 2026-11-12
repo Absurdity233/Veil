@@ -2174,6 +2174,123 @@ section("device linking: a second device joins an account");
         }
     }
 
+section("device list refresh has three triggers and no timer");
+    {
+        // A device list is a cache of something the peer controls, and it can be
+        // wrong in the one direction that matters: the peer linked a device and
+        // this client has not heard. These are the moments the list is likely to
+        // have moved.
+        Engine alice, bob;
+        alice.createIdentity(); alice.initDevice("alice");
+        bob.createIdentity();   bob.initDevice("bob");
+        bob.rotatePreKeys();
+
+        Bytes bob_pub = bob.exportIdentityPublic();
+        Bytes bob_cred = bob.ownDeviceCredential();
+
+        auto listOf = [](const std::vector<Bytes>& entries) {
+            Bytes out;
+            uint8_t num[4];
+            put_u32(num, static_cast<uint32_t>(entries.size()));
+            out.insert(out.end(), num, num + 4);
+            for (const auto& e : entries) out.insert(out.end(), e.begin(), e.end());
+            return out;
+        };
+
+        // ---- Unknown: no list at all ----
+        check(alice.deviceListNeedsRefresh("bob", 60'000) == Engine::RefreshUnknown,
+              "no list held is reported as unknown, not as stale");
+
+        // ---- Fresh after adoption ----
+        alice.setClock(1'000'000);
+        Bytes list = listOf({bob_cred});
+        check(alice.adoptDeviceList("bob", 1, list.data(), list.size(),
+                                    bob_pub.data(), bob_pub.data() + kKeySize) ==
+                  Engine::Result::Ok,
+              "the list is adopted");
+        check(alice.deviceListNeedsRefresh("bob", 60'000) == Engine::RefreshNone,
+              "and is fresh immediately after");
+
+        // ---- Stale: the caller's threshold passed ----
+        alice.setClock(1'000'000 + 59'999);
+        check(alice.deviceListNeedsRefresh("bob", 60'000) == Engine::RefreshNone,
+              "still fresh one millisecond short of the threshold");
+
+        alice.setClock(1'000'000 + 60'000);
+        check(alice.deviceListNeedsRefresh("bob", 60'000) == Engine::RefreshStale,
+              "stale exactly at the threshold");
+
+        // ---- A clock that went backwards is not a huge staleness ----
+        // Wall clocks get adjusted. Reporting a list fetched a second ago as
+        // ancient because NTP moved the clock back would cause a re-fetch storm.
+        alice.setClock(500'000);
+        check(alice.deviceListNeedsRefresh("bob", 60'000) == Engine::RefreshNone,
+              "a clock that moved back does not make a fresh list stale");
+
+        // ---- Send failure outranks staleness ----
+        // This is the trigger that actually catches a newly linked device: the
+        // frame went to a list that did not include it, so the failure itself is
+        // the signal.
+        alice.noteSendFailed("bob");
+        check(alice.deviceListNeedsRefresh("bob", 60'000) == Engine::RefreshSendFailed,
+              "a failed send asks for a refresh even when the list is fresh");
+
+        // Re-fetching clears it.
+        check(alice.adoptDeviceList("bob", 2, list.data(), list.size(),
+                                    bob_pub.data(), bob_pub.data() + kKeySize) ==
+                  Engine::Result::Ok,
+              "a fresh list is adopted");
+        check(alice.deviceListNeedsRefresh("bob", 60'000) == Engine::RefreshNone,
+              "and clears the send-failure flag");
+
+        // ---- Without a clock, staleness is never reported ----
+        // A client that never sets one gets "refresh when a send fails", which is
+        // a working policy rather than a wrong one.
+        Engine clockless;
+        clockless.createIdentity(); clockless.initDevice("carol");
+        check(clockless.adoptDeviceList("bob", 1, list.data(), list.size(),
+                                        bob_pub.data(), bob_pub.data() + kKeySize) ==
+                  Engine::Result::Ok,
+              "adopted without a clock");
+        check(clockless.deviceListNeedsRefresh("bob", 1) == Engine::RefreshNone,
+              "and never reported stale");
+
+        // ---- A fan-out that could not reach a device asks for a refresh ----
+        // The end-to-end version of the trigger: two devices in the list, only
+        // one with a session, and the engine records why.
+        {
+            Engine multi, peer;
+            multi.createIdentity(); multi.initDevice("dave");
+            peer.createIdentity();  peer.initDevice("erin");
+            peer.rotatePreKeys();
+
+            Bytes peer_pub = peer.exportIdentityPublic();
+            Bytes peer_cred = peer.ownDeviceCredential();
+
+            // The same device twice under two ids is enough to have two entries
+            // with only one session; the second cannot be reached.
+            Bytes two = listOf({peer_cred, peer_cred});
+            multi.setClock(10'000);
+            check(multi.adoptDeviceList("erin", 1, two.data(), two.size(),
+                                        peer_pub.data(), peer_pub.data() + kKeySize) ==
+                      Engine::Result::Ok,
+                  "a two-entry list is adopted");
+
+            const std::vector<std::string> devices = multi.peerDevices("erin");
+            check(devices.size() == 2, "two devices are known");
+            check(multi.deviceListNeedsRefresh("erin", 60'000) == Engine::RefreshNone,
+                  "fresh before the send");
+
+            // No sessions at all, so the fan-out produces nothing and records it.
+            auto frames = multi.encryptToAccount("erin",
+                                                 reinterpret_cast<const uint8_t*>("hi"), 2);
+            check(frames.empty(), "no sessions, no frames");
+            check(multi.deviceListNeedsRefresh("erin", 60'000) ==
+                      Engine::RefreshSendFailed,
+                  "and the send failure asks for a refresh");
+        }
+    }
+
 section("ratchet does not move backwards");
     {
         // Alice sends two messages; Bob reads only the first, then replies.

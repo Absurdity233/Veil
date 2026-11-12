@@ -366,9 +366,13 @@ class DesktopInteropTest {
             // rather than a sleep: a fixed delay would make this test slow on a
             // fast machine and flaky on a loaded one.
             first.createGroup("team")
-            waitUntil(3_000) { first.groups.value.isNotEmpty() }
             first.setGroupMembers("team", listOf("alice", "bob"))
-            waitUntil(3_000) { first.groups.value.firstOrNull()?.epoch == 2 }
+
+            // Wait for the epoch, not merely for the group to appear: both calls
+            // are asynchronous, and createGroup alone puts a group there with
+            // epoch 1. Asserting "not empty" raced the second call and then failed
+            // on the epoch a moment later.
+            waitUntil(5_000) { first.groups.value.firstOrNull()?.epoch == 2 }
 
             waitUntil(5_000) { Files.exists(dir.resolve("groups.bin")) }
         } finally {

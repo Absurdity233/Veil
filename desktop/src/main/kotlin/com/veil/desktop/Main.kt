@@ -34,6 +34,8 @@ import javax.swing.BoxLayout
 import javax.swing.DefaultListCellRenderer
 import javax.swing.DefaultListModel
 import javax.swing.JButton
+import javax.swing.JDialog
+import javax.swing.JTabbedPane
 import javax.swing.JFrame
 import javax.swing.JLabel
 import javax.swing.JList
@@ -54,7 +56,7 @@ import javax.swing.border.EmptyBorder
  * Swing, not Compose, on purpose: this client exists to demonstrate that the
  * protocol engine and the wire format are portable, and pulling in a
  * cross-platform UI toolkit would make the build about the toolkit instead. A
- * plain JVM window keeps the dependency list to three entries 鈥?JNA for the C
+ * plain JVM window keeps the dependency list to three entries 閳?JNA for the C
  * ABI, OkHttp for the socket, coroutines for the plumbing.
  */
 fun main() {
@@ -123,6 +125,14 @@ class DesktopWindow(stateDir: Path) {
     private val membersButton = JButton("Set members")
     private val groupInfoLabel = JLabel(" ")
 
+    // ---- Device linking ----
+    //
+    // Both halves of the flow in one dialog, because the user is holding one
+    // device and looking at the other.
+    private val linkButton = JButton("Link device")
+    private val inviteField = HintField(18)
+    private val inviteButton = JButton("Invite")
+
     /** What the transcript pane is currently showing. */
     private sealed class Conversation {
         data class WithPeer(val peer: Peer) : Conversation()
@@ -167,6 +177,9 @@ class DesktopWindow(stateDir: Path) {
 
         gbc.gridx = 5
         top.add(linkLabel, gbc)
+
+        gbc.gridx = 6
+        top.add(linkButton, gbc)
 
         root.add(top, BorderLayout.NORTH)
 
@@ -230,12 +243,27 @@ class DesktopWindow(stateDir: Path) {
         memberRow.add(membersField, BorderLayout.CENTER)
         memberRow.add(membersButton, BorderLayout.EAST)
         memberRow.isVisible = false
+        placeholder(membersField, "alice, bob")
 
         val groupInfoRow = JPanel(BorderLayout())
         groupInfoRow.border = EmptyBorder(4, 0, 0, 0)
         groupInfoLabel.font = Font(Font.MONOSPACED, Font.PLAIN, 11)
         groupInfoRow.add(groupInfoLabel, BorderLayout.CENTER)
         groupInfoRow.isVisible = false
+
+        // Inviting is a pairwise act: it needs a session with the person, because
+        // that session is what authenticates the founder to them.
+        val inviteRow = JPanel(BorderLayout(6, 0))
+        inviteRow.border = EmptyBorder(4, 0, 0, 0)
+        inviteRow.add(inviteField, BorderLayout.CENTER)
+        inviteRow.add(inviteButton, BorderLayout.EAST)
+        inviteRow.isVisible = false
+        placeholder(inviteField, "invite by id")
+
+        val groupRows = JPanel(BorderLayout())
+        groupRows.add(groupInfoRow, BorderLayout.NORTH)
+        groupRows.add(memberRow, BorderLayout.CENTER)
+        groupRows.add(inviteRow, BorderLayout.SOUTH)
 
         val compose = JPanel(BorderLayout(8, 0))
         compose.add(messageField, BorderLayout.CENTER)
@@ -246,8 +274,7 @@ class DesktopWindow(stateDir: Path) {
         rightStack.add(right, BorderLayout.CENTER)
 
         val rightBottom = JPanel(BorderLayout())
-        rightBottom.add(groupInfoRow, BorderLayout.NORTH)
-        rightBottom.add(memberRow, BorderLayout.CENTER)
+        rightBottom.add(groupRows, BorderLayout.NORTH)
         rightBottom.add(compose, BorderLayout.SOUTH)
         rightStack.add(rightBottom, BorderLayout.SOUTH)
 
@@ -298,6 +325,16 @@ class DesktopWindow(stateDir: Path) {
 
         membersButton.addActionListener { applyMembers() }
         membersField.addActionListener { applyMembers() }
+
+        inviteButton.addActionListener {
+            val group = (selection as? Conversation.WithGroup)?.group ?: return@addActionListener
+            val peer = inviteField.text.trim()
+            inviteField.text = ""
+            if (peer.isNotEmpty()) controller.inviteToGroup(group.groupId, peer)
+        }
+        inviteField.addActionListener { inviteButton.doClick() }
+
+        linkButton.addActionListener { showLinkingDialog() }
 
         peerList.addListSelectionListener {
             if (it.valueIsAdjusting) return@addListSelectionListener
@@ -557,11 +594,197 @@ class DesktopWindow(stateDir: Path) {
         memberRowVisible(onGroup)
     }
 
+    /**
+     * The device linking dialog.
+     *
+     * Both halves in one window, with tabs, because the user is holding one device
+     * and looking at the other. The fingerprint is shown in a large monospaced
+     * font: it is the one thing a person has to actually compare, so it cannot be
+     * the smallest text on screen.
+     */
+    private fun showLinkingDialog() {
+        val dialog = JDialog(frame, "Link a device", true)
+        dialog.defaultCloseOperation = JDialog.DISPOSE_ON_CLOSE
+        dialog.setSize(520, 560)
+        dialog.setLocationRelativeTo(frame)
+
+        val tabs = JTabbedPane()
+
+        // ---- Link this device ----
+        val linkPane = JPanel(BorderLayout(0, 8))
+        linkPane.border = EmptyBorder(12, 12, 12, 12)
+
+        val ownRequest = JTextArea(3, 40)
+        ownRequest.isEditable = false
+        ownRequest.lineWrap = true
+        ownRequest.font = Font(Font.MONOSPACED, Font.PLAIN, 10)
+
+        val generate = JButton("Generate request")
+        val linkStatus = JLabel(" ")
+
+        val credentialField = JTextArea(3, 40)
+        credentialField.font = Font(Font.MONOSPACED, Font.PLAIN, 10)
+        val identityField = JTextArea(2, 40)
+        identityField.font = Font(Font.MONOSPACED, Font.PLAIN, 10)
+        val adopt = JButton("Adopt credential")
+
+        val linkTop = JPanel(BorderLayout(0, 6))
+        linkTop.add(generate, BorderLayout.NORTH)
+        linkTop.add(JScrollPane(ownRequest), BorderLayout.CENTER)
+
+        val linkForm = JPanel(GridBagLayout())
+        val gbc = GridBagConstraints().apply {
+            insets = Insets(3, 0, 3, 0)
+            fill = GridBagConstraints.HORIZONTAL
+            weightx = 1.0
+            gridx = 0
+        }
+        fun addRow(label: String, field: java.awt.Component, row: Int) {
+            gbc.gridy = row * 2
+            gbc.weighty = 0.0
+            linkForm.add(JLabel(label), gbc)
+            gbc.gridy = row * 2 + 1
+            gbc.weighty = 1.0
+            linkForm.add(JScrollPane(field), gbc)
+        }
+        addRow("Credential from the other device", credentialField, 0)
+        addRow("Account identity from that device", identityField, 1)
+
+        val linkBottom = JPanel(BorderLayout(0, 6))
+        linkBottom.add(linkForm, BorderLayout.CENTER)
+        linkBottom.add(adopt, BorderLayout.SOUTH)
+
+        linkPane.add(linkTop, BorderLayout.NORTH)
+        linkPane.add(linkBottom, BorderLayout.CENTER)
+        linkPane.add(linkStatus, BorderLayout.SOUTH)
+        tabs.addTab("Link this device", linkPane)
+
+        // ---- Approve another ----
+        val approvePane = JPanel(BorderLayout(0, 8))
+        approvePane.border = EmptyBorder(12, 12, 12, 12)
+
+        val requestField = JTextArea(3, 40)
+        requestField.font = Font(Font.MONOSPACED, Font.PLAIN, 10)
+        val readIt = JButton("Read it")
+
+        val accountLabel = JLabel(" ")
+        val fingerprintLabel = JLabel(" ")
+        fingerprintLabel.font = Font(Font.MONOSPACED, Font.BOLD, 20)
+        val approve = JButton("Approve and show the credential")
+        val issued = JTextArea(3, 40)
+        issued.isEditable = false
+        issued.font = Font(Font.MONOSPACED, Font.PLAIN, 10)
+        issued.isVisible = false
+        val approveStatus = JLabel(" ")
+
+        val details = JPanel(GridBagLayout())
+        val dgbc = GridBagConstraints().apply {
+            insets = Insets(4, 0, 4, 0)
+            fill = GridBagConstraints.HORIZONTAL
+            weightx = 1.0
+            gridx = 0
+            gridy = 0
+        }
+        details.add(JLabel("Account"), dgbc)
+        dgbc.gridy = 1
+        details.add(accountLabel, dgbc)
+        dgbc.gridy = 2
+        details.add(JLabel("Fingerprint - must match the other device"), dgbc)
+        dgbc.gridy = 3
+        details.add(fingerprintLabel, dgbc)
+        dgbc.gridy = 4
+        details.add(approve, dgbc)
+        dgbc.gridy = 5
+        dgbc.fill = GridBagConstraints.BOTH
+        dgbc.weighty = 1.0
+        details.add(JScrollPane(issued), dgbc)
+        details.isVisible = false
+
+        val approveTop = JPanel(BorderLayout(0, 6))
+        approveTop.add(JScrollPane(requestField), BorderLayout.CENTER)
+        approveTop.add(readIt, BorderLayout.SOUTH)
+
+        approvePane.add(approveTop, BorderLayout.NORTH)
+        approvePane.add(details, BorderLayout.CENTER)
+        approvePane.add(approveStatus, BorderLayout.SOUTH)
+        tabs.addTab("Approve another", approvePane)
+
+        generate.addActionListener {
+            scope.launch {
+                val request = controller.linkingRequest()
+                if (request == null) {
+                    linkStatus.text = "this client has no device identity yet: connect first"
+                    return@launch
+                }
+                ownRequest.text = base64(request)
+                linkStatus.text = " "
+            }
+        }
+
+        adopt.addActionListener {
+            scope.launch {
+                val ok = controller.adoptLinkingFromText(
+                    credentialField.text, identityField.text,
+                )
+                linkStatus.text = if (ok) {
+                    "this device is now part of the account"
+                } else {
+                    "that credential was refused"
+                }
+            }
+        }
+
+        readIt.addActionListener {
+            scope.launch {
+                val bytes = fromBase64(requestField.text)
+                val parsed = bytes?.let { controller.readLinkingRequest(it) }
+                if (parsed == null) {
+                    approveStatus.text = "that request could not be read"
+                    return@launch
+                }
+                accountLabel.text = parsed.first
+                fingerprintLabel.text = parsed.second
+                details.isVisible = true
+                approveStatus.text = " "
+            }
+        }
+
+        approve.addActionListener {
+            scope.launch {
+                val bytes = fromBase64(requestField.text)
+                val credential = bytes?.let { controller.approveLinking(it) }
+                if (credential == null) {
+                    approveStatus.text =
+                        "only the device that holds the account key can approve"
+                    return@launch
+                }
+                issued.text = base64(credential)
+                issued.isVisible = true
+                approveStatus.text = "approved. Send this to the new device."
+            }
+        }
+
+        dialog.contentPane = tabs
+        dialog.isVisible = true
+    }
+
+    private fun base64(bytes: ByteArray): String =
+        java.util.Base64.getEncoder().encodeToString(bytes)
+
+    private fun fromBase64(text: String): ByteArray? = try {
+        val cleaned = text.filterNot { it.isWhitespace() }
+        if (cleaned.isEmpty()) null else java.util.Base64.getDecoder().decode(cleaned)
+    } catch (e: IllegalArgumentException) {
+        null
+    }
+
     private fun memberRowVisible(visible: Boolean) {
-        // The row is a compound component created in buildUi; toggling its
-        // children is what actually shows or hides it in a BorderLayout.
+        // These are children of a compound row; toggling them is what actually
+        // shows or hides it in a BorderLayout.
         membersField.isVisible = visible
         membersButton.isVisible = visible
+        inviteField.isVisible = visible
+        inviteButton.isVisible = visible
     }
 
     /**

@@ -29,6 +29,7 @@
       </label>
       <button id="connect" class="primary">Connect</button>
       <span id="link-badge" class="badge offline" role="status" aria-live="polite">offline</span>
+      <button id="open-link" class="ghost" type="button">Link device</button>
     </div>
   </header>
 
@@ -98,6 +99,69 @@
       <p>Select a conversation, or add someone by their id.</p>
     </section>
   </main>
+
+  <!-- Device linking. Both halves of the flow in one dialog, because the user is
+       holding one device and looking at the other.
+
+       The QR carries the request, so the other device scans rather than being
+       read a 200-character base64 string aloud. The text is still shown and still
+       accepted: a camera can fail, and a flow that only works when it does not is
+       a flow that does not work. -->
+  <dialog id="link-dialog" class="link-dialog">
+    <h2 id="link-title">Link a device</h2>
+
+    <div class="link-tabs">
+      <button type="button" id="tab-link" class="tab selected">Link this device</button>
+      <button type="button" id="tab-approve" class="tab">Approve another</button>
+    </div>
+
+    <section id="pane-link">
+      <p class="hint">
+        Show this to the device that already has your account, then paste back the
+        credential it gives you.
+      </p>
+      <button type="button" id="generate-request" class="primary">Generate request</button>
+      <canvas id="qr-canvas" class="qr" hidden></canvas>
+      <textarea id="own-request" class="mono" rows="3" readonly
+                placeholder="your request appears here" hidden></textarea>
+
+      <hr>
+
+      <label class="field">
+        <span>Credential from the other device</span>
+        <textarea id="pasted-credential" class="mono" rows="3"></textarea>
+      </label>
+      <label class="field">
+        <span>Account identity from that device</span>
+        <textarea id="pasted-identity" class="mono" rows="2"></textarea>
+      </label>
+      <button type="button" id="adopt-credential" class="primary">Adopt credential</button>
+    </section>
+
+    <section id="pane-approve" hidden>
+      <p class="hint">
+        Paste the request the new device is showing. Compare the fingerprint with
+        what that device displays before approving.
+      </p>
+      <textarea id="incoming-request" class="mono" rows="3"
+                placeholder="the new device's request"></textarea>
+      <button type="button" id="read-request">Read it</button>
+
+      <div id="request-details" hidden>
+        <p class="kv"><span>Account</span> <strong id="request-user"></strong></p>
+        <!-- Large and monospaced: this is the one thing a person has to actually
+             compare, so it cannot be the smallest text on screen. -->
+        <p class="fingerprint" id="request-fingerprint"></p>
+        <button type="button" id="approve-request" class="primary">
+          Approve and show the credential
+        </button>
+        <textarea id="issued-credential" class="mono" rows="3" readonly hidden></textarea>
+      </div>
+    </section>
+
+    <p id="link-status" class="status" hidden></p>
+    <button type="button" id="close-link" class="ghost">Close</button>
+  </dialog>
 
   <footer class="foot">
     <span id="version"></span>

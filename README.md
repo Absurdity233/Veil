@@ -171,8 +171,9 @@ Android has both the group screens and the device-linking dialog; the web client
 has groups; the desktop has groups. Device linking is text-based (a base64 request
 and credential copied between devices) and currently only has a screen on Android.
 
-**Not implemented at all:** push notifications, account recovery, a QR-based
-linking flow, and device-list refresh in any client.
+**Not implemented at all:** push notifications, account recovery, camera-based QR
+scanning (the web client shows a QR; nothing scans one yet), and history transfer
+to a newly linked device.
 
 The designs, and the honest account of what is missing from each, are in
 [Multi-device](docs/multi-device.md) and [Groups](docs/group.md).
