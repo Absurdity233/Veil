@@ -41,10 +41,20 @@
                aria-label="Peer id to add">
         <button type="submit">Add</button>
       </form>
+
+      <!-- Creating a group sits beside adding a peer: both add a conversation,
+           which is the only thing this column is for. It works offline, because
+           a group is local until its member list is handed to somebody. -->
+      <form id="new-group" class="add-peer">
+        <input id="group-id" type="text" placeholder="New group name" spellcheck="false"
+               aria-label="Group name to create">
+        <button type="submit">Group</button>
+      </form>
+
       <ul id="peer-list" class="peer-list" aria-label="Conversations"></ul>
       <p id="peers-empty" class="empty">
-        No conversations yet. Add someone by their id once both clients are
-        connected to the same relay.
+        No conversations yet. Add someone by their id, or create a group, once
+        both clients are connected to the same relay.
       </p>
     </aside>
 
@@ -65,6 +75,18 @@
       </div>
 
       <ol id="transcript" class="transcript" aria-live="polite"></ol>
+
+      <!-- Group membership. Hidden for a peer conversation rather than
+           disabled: a control that never applies to what is on screen is noise. -->
+      <div id="group-panel" class="safety" hidden>
+        <p class="safety-title" id="group-epoch"></p>
+        <form id="group-members" class="add-peer">
+          <input id="members" type="text" placeholder="alice, bob" spellcheck="false"
+                 aria-label="Group members, comma separated">
+          <button type="submit">Set members</button>
+        </form>
+        <p class="safety-number" id="group-hint"></p>
+      </div>
 
       <form id="compose" class="compose">
         <textarea id="draft" rows="1" placeholder="Message" aria-label="Message"></textarea>

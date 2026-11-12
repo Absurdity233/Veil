@@ -115,6 +115,21 @@ accepted.
   pairwise session, and the clients expose them as export/adopt pairs rather than
   sending them automatically. A caller has to hand them over; there is no
   "invite" message yet.
+- **Android group UI.** The controller has the full surface; there are no screens
+  for it.
+
+## What the clients show
+
+Both the desktop and web clients treat a group as a conversation in the same
+list as a peer, rather than a separate tab or window. A chat client's left column
+is "who you can talk to", and a group is one of those; splitting it by type makes
+the user remember which tab a conversation lives in, which is a fact about the
+implementation rather than about the conversation.
+
+Both state the epoch on screen, and both say why a send is unavailable when it
+is: a membership change re-keys every chain, so nobody can send until each member
+publishes one. Letting the send fail silently would look like a bug in the
+protocol.
 
 ## Persistence
 

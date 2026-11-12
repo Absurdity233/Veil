@@ -168,7 +168,8 @@ restarts). The relay addresses frames per device and stores device lists.
 persisted, fan-out sending (one frame per device of a peer), group
 create/send/receive, and group state in each client's encrypted store. Android
 and desktop reach it through JNI and JNA respectively; the web client through
-wasm.
+wasm. The desktop and web clients have group UI; Android has the controller
+surface and needs the screens.
 
 **Not implemented at all:** push notifications, account recovery, a device
 linking UI, and group invitations over the wire (chains and member lists travel

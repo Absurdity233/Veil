@@ -4,7 +4,7 @@
  * Structurally the same as the Android `ChatController` and the desktop
  * `ChatController`: encrypt on the way out, persist the exact frame if it cannot
  * be sent, restore state before decrypting anything. The parts that differ are
- * the ones that are genuinely different on the web 闁?storage (see vault.ts) and
+ * the ones that are genuinely different on the web 闂?storage (see vault.ts) and
  * the fact that a page can be reloaded at any moment, which makes the
  * queued-frame list something to persist rather than keep in memory.
  */
@@ -38,12 +38,20 @@ export interface GroupMessageView {
   senderId: string;
   text: string;
   at: number;
+  /**
+   * Whether this client sent it.
+   *
+   * Stored rather than derived from `senderId === selfUserId`, because a
+   * reloaded page has the transcript before it has reconnected, and a message
+   * that silently switches sides on reconnect is worse than one field.
+   */
+  outgoing: boolean;
 }
 
 // The view and the stored record are the same shape, so a reload needs no
 // translation and cannot drift.
 const _groupMessageShape: GroupMessageRecord | GroupMessageView = {
-  groupId: "", senderId: "", text: "", at: 0,
+  groupId: "", senderId: "", text: "", at: 0, outgoing: false,
 };
 void _groupMessageShape;
 
@@ -176,7 +184,7 @@ export class ChatApp {
    * Restores groups, including their chain keys.
    *
    * Without this a reload drops every group, and a member can no longer read
-   * anything sent to a group they are still in 閳?indistinguishable from having
+   * anything sent to a group they are still in 闂?indistinguishable from having
    * been removed. The blob carries secrets, so it lives in the same encrypted
    * vault as ratchet state.
    */
@@ -504,8 +512,8 @@ export class ChatApp {
   /**
    * Replaces the member list.
    *
-   * Every chain is discarded and the epoch moves, so nobody 閳?including this
-   * client 閳?can send until each member republishes a chain. That is the point:
+   * Every chain is discarded and the epoch moves, so nobody 闂?including this
+   * client 闂?can send until each member republishes a chain. That is the point:
    * a removed member holds the old chain key and re-keying is the only thing
    * that stops them reading what follows.
    */
@@ -529,7 +537,7 @@ export class ChatApp {
    * Adopts a member list a founder signed.
    *
    * `founderSignPub` is the founder's account signing key, which the caller got
-   * by verifying the founder's safety number out of band 閳?the same trust anchor
+   * by verifying the founder's safety number out of band 闂?the same trust anchor
    * the rest of the protocol uses.
    */
   async adoptMembership(
@@ -583,6 +591,7 @@ export class ChatApp {
       senderId: this.selfUserId,
       text,
       at: Date.now(),
+      outgoing: true,
     });
 
     // A group frame is addressed by group id, not by device: every member needs
@@ -610,6 +619,7 @@ export class ChatApp {
           senderId,
           text: new TextDecoder().decode(result.plain),
           at: Date.now(),
+          outgoing: false,
         });
         void this.persistGroups();
         return true;
@@ -765,7 +775,7 @@ export class ChatApp {
    * Links this client to an existing account.
    *
    * The credential has to arrive over a channel that already authenticates the
-   * account — the whole point is that a relay cannot issue one — so this takes
+   * account 閳?the whole point is that a relay cannot issue one 閳?so this takes
    * an already-signed blob and verifies it against the account keys.
    */
   async adoptDeviceCredential(
@@ -824,7 +834,7 @@ export class ChatApp {
       case Status.NO_SESSION:
         // Not necessarily an error: a group message arrives addressed by its
         // sender, and this client holds no pairwise session with them. Try it as
-        // a group frame before deciding to drop it 閳?the MAC is what decides
+        // a group frame before deciding to drop it 闂?the MAC is what decides
         // which it is.
         if (this.onGroupDelivered(peerId, frame)) {
           if (outboxId > 0n) this.relay?.acknowledge(outboxId);

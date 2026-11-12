@@ -308,4 +308,6 @@ export interface GroupMessageRecord {
   senderId: string;
   text: string;
   at: number;
+  /** Whether this client sent it, so a reload does not re-derive it wrongly. */
+  outgoing: boolean;
 }

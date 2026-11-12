@@ -1,4 +1,5 @@
 /**
+void main();
  * The web client's DOM layer.
  *
  * Deliberately thin: [ChatApp] owns every decision worth testing, and this file
@@ -8,6 +9,7 @@
 
 import { ChatApp } from "./app.js";
 import { SessionState } from "./engine.js";
+import { encodeSelection, parseSelection, type Selection } from "./selection.js";
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
@@ -42,10 +44,19 @@ const draft = $<HTMLTextAreaElement>("draft");
 const sendButton = $<HTMLButtonElement>("send");
 const versionLabel = $<HTMLSpanElement>("version");
 
-let selectedPeerId: string | null = null;
+const newGroupForm = $<HTMLFormElement>("new-group");
+const groupIdInput = $<HTMLInputElement>("group-id");
+const groupPanel = $<HTMLElement>("group-panel");
+const groupEpoch = $<HTMLParagraphElement>("group-epoch");
+const groupMembersForm = $<HTMLFormElement>("group-members");
+const membersInput = $<HTMLInputElement>("members");
+const groupHint = $<HTMLParagraphElement>("group-hint");
 
-/** Which peer the user is looking at, remembered across re-renders. */
-const STORAGE_KEY = "veil.selectedPeer";
+/** The conversation on screen. Kept beside the parser so the two agree. */
+let selected: Selection | null = null;
+
+/** Remembered across re-renders, so a reload keeps the conversation. */
+const STORAGE_KEY = "veil.selected";
 
 // ---- Startup ----------------------------------------------------------
 
@@ -58,7 +69,7 @@ async function main(): Promise<void> {
   }
 
   versionLabel.textContent = `protocol engine ${await engineVersion()}`;
-  selectedPeerId = localStorage.getItem(STORAGE_KEY);
+  restoreSelection();
 
   app.subscribe(render);
 
@@ -107,37 +118,76 @@ function renderStatus(): void {
 
 function renderPeers(): void {
   const peers = app.peerList;
-  peersEmpty.hidden = peers.length > 0;
+  const groups = app.groupViews();
+  peersEmpty.hidden = peers.length + groups.length > 0;
 
-  peerList.replaceChildren(
-    ...peers.map((peer) => {
-      const item = document.createElement("li");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.dataset.peerId = peer.userId;
-      button.setAttribute(
-        "aria-current",
-        String(peer.userId === selectedPeerId),
-      );
+  const rows: HTMLElement[] = [];
 
-      const name = document.createElement("span");
-      name.className = "peer-name";
-      name.textContent = peer.displayName;
+  for (const peer of peers) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.peerId = peer.userId;
+    button.setAttribute(
+      "aria-current",
+      String(selected?.kind === "peer" && selected.id === peer.userId),
+    );
 
-      const state = document.createElement("span");
-      state.className = "peer-state";
-      state.textContent = stateLabel(peer.state);
+    const name = document.createElement("span");
+    name.className = "peer-name";
+    name.textContent = peer.displayName;
 
-      button.append(name, state);
-      button.addEventListener("click", () => selectPeer(peer.userId));
-      item.append(button);
-      return item;
-    }),
-  );
+    const state = document.createElement("span");
+    state.className = "peer-state";
+    // The device count is shown only when there is more than one: a
+    // single-device peer is the ordinary case, and saying "1 device" on every
+    // row is noise that hides the row where it matters.
+    state.textContent =
+      peer.devices.length > 1
+        ? `${stateLabel(peer.state)}, ${peer.devices.length} devices`
+        : stateLabel(peer.state);
 
-  // Keep the selection honest: a peer can disappear if the store is cleared.
-  if (selectedPeerId && !peers.some((p) => p.userId === selectedPeerId)) {
-    selectedPeerId = null;
+    button.append(name, state);
+    button.addEventListener("click", () => select({ kind: "peer", id: peer.userId }));
+    item.append(button);
+    rows.push(item);
+  }
+
+  for (const group of groups) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.groupId = group.groupId;
+    button.setAttribute(
+      "aria-current",
+      String(selected?.kind === "group" && selected.id === group.groupId),
+    );
+
+    const name = document.createElement("span");
+    name.className = "peer-name";
+    name.textContent = `# ${group.groupId}`;
+
+    const state = document.createElement("span");
+    state.className = "peer-state";
+    state.textContent = group.canSend
+      ? `group, epoch ${group.epoch}`
+      : `group, epoch ${group.epoch} - not a member`;
+
+    button.append(name, state);
+    button.addEventListener("click", () => select({ kind: "group", id: group.groupId }));
+    item.append(button);
+    rows.push(item);
+  }
+
+  peerList.replaceChildren(...rows);
+
+  // Keep the selection honest: a conversation can disappear if the store is
+  // cleared, and pointing at a row that no longer exists shows a stale transcript.
+  if (selected?.kind === "peer" && !peers.some((p) => p.userId === selected!.id)) {
+    selected = null;
+  }
+  if (selected?.kind === "group" && !groups.some((g) => g.groupId === selected!.id)) {
+    selected = null;
   }
 }
 
@@ -153,14 +203,24 @@ function stateLabel(state: SessionState): string {
 }
 
 function renderChat(): void {
-  const peer = app.peerList.find((p) => p.userId === selectedPeerId);
-  const showChat = peer !== undefined;
-
+  const showChat = selected !== null;
   chat.hidden = !showChat;
   chatPlaceholder.hidden = showChat;
 
+  if (!selected) {
+    groupPanel.hidden = true;
+    return;
+  }
+
+  if (selected.kind === "group") {
+    renderGroupChat(selected.id);
+    return;
+  }
+
+  const peer = app.peerList.find((p) => p.userId === selected!.id);
   if (!peer) return;
 
+  groupPanel.hidden = true;
   chatPeer.textContent = peer.displayName;
 
   // The safety number is only meaningful once a session exists, and it is the
@@ -170,7 +230,7 @@ function renderChat(): void {
     safetyNumber.textContent = peer.safetyNumber;
     safetyNumber.hidden = false;
   } else {
-    safetyNumber.textContent = "No session yet — send or receive a message first.";
+    safetyNumber.textContent = "No session yet: send or receive a message first.";
     safetyNumber.hidden = false;
   }
 
@@ -179,6 +239,77 @@ function renderChat(): void {
   const canSend = peer.state === SessionState.Ready && app.link === "online";
   draft.disabled = !canSend;
   sendButton.disabled = !canSend;
+}
+
+/**
+ * A group transcript.
+ *
+ * Two things differ from a peer conversation and both are stated on screen
+ * rather than implied: the epoch, because a membership change discards every
+ * chain and the group is unusable until each member republishes one; and the
+ * sender of each message, because there is more than one of them.
+ */
+function renderGroupChat(groupId: string): void {
+  const group = app.groupViews().find((g) => g.groupId === groupId);
+  if (!group) return;
+
+  chatPeer.textContent = `# ${group.groupId}`;
+  safetyTitle.textContent = `Group ${group.groupId}`;
+  safetyNumber.textContent = group.canSend
+    ? "Sender Keys: one frame per message, regardless of group size."
+    : "This client is not a member of this group.";
+  safetyNumber.hidden = false;
+
+  groupPanel.hidden = false;
+  groupEpoch.textContent = `Epoch ${group.epoch} - members: ${group.members.join(", ")}`;
+  groupHint.textContent = group.canSend
+    ? ""
+    : "A membership change re-keys every chain; nobody can send until each " +
+      "member publishes one.";
+
+  // Seed the field with the current members so an edit starts from what is
+  // there rather than from an empty box the user has to retype.
+  if (document.activeElement !== membersInput) {
+    membersInput.value = group.members.join(", ");
+  }
+
+  renderGroupTranscript(groupId);
+
+  // A group frame needs a live chain, not a pairwise session, so the readiness
+  // test is the membership rather than the session state.
+  const canSend = group.canSend && app.link === "online";
+  draft.disabled = !canSend;
+  sendButton.disabled = !canSend;
+}
+
+function renderGroupTranscript(groupId: string): void {
+  const messages = app.groupMessagesFor(groupId);
+  const format = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+  transcript.replaceChildren(
+    ...messages.map((message) => {
+      const item = document.createElement("li");
+      item.className = `bubble ${message.outgoing ? "out" : "in"}`;
+
+      const text = document.createElement("div");
+      text.textContent = message.text;
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      // Every group message names its sender: unlike a peer conversation, the
+      // other side is not one person.
+      const who = message.outgoing ? "you" : message.senderId;
+      meta.textContent = `${who} - ${format.format(message.at)}`;
+
+      item.append(text, meta);
+      return item;
+    }),
+  );
+
+  transcript.scrollTop = transcript.scrollHeight;
 }
 
 function renderTranscript(peerId: string): void {
@@ -222,10 +353,17 @@ function renderTranscript(peerId: string): void {
 
 // ---- Interaction ------------------------------------------------------
 
-function selectPeer(peerId: string): void {
-  selectedPeerId = peerId;
-  localStorage.setItem(STORAGE_KEY, peerId);
+function select(next: Selection): void {
+  selected = next;
+  // One key holding both parts, so a reload cannot read a peer id where a group
+  // was meant: the kind travels with the id.
+  localStorage.setItem(STORAGE_KEY, encodeSelection(next));
   render();
+}
+
+/** Restores the remembered conversation, ignoring anything malformed. */
+function restoreSelection(): void {
+  selected = parseSelection(localStorage.getItem(STORAGE_KEY));
 }
 
 connectButton.addEventListener("click", () => {
@@ -248,15 +386,50 @@ addPeerForm.addEventListener("submit", (event) => {
   if (!id) return;
   app.addPeer(id);
   peerIdInput.value = "";
-  selectPeer(id);
+  select({ kind: "peer", id });
+});
+
+newGroupForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const id = groupIdInput.value.trim();
+  if (!id) return;
+
+  // Creating a group is local: it needs a device, not a connection. Awaiting it
+  // is what lets the new group be selected immediately rather than after the
+  // next notify().
+  void app.createGroup(id).then((ok) => {
+    if (!ok) return;
+    groupIdInput.value = "";
+    select({ kind: "group", id });
+  });
+});
+
+groupMembersForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (selected?.kind !== "group") return;
+
+  const members = membersInput.value
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (members.length === 0) return;
+
+  void app.setGroupMembers(selected.id, members);
 });
 
 composeForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  if (!selectedPeerId) return;
+  if (!selected) return;
+
   const text = draft.value;
+  if (!text.trim()) return;
   draft.value = "";
-  app.send(selectedPeerId, text);
+
+  if (selected.kind === "peer") {
+    app.send(selected.id, text);
+  } else {
+    void app.sendToGroup(selected.id, text);
+  }
 });
 
 // Enter sends, Shift+Enter adds a line: the convention every chat has, and one

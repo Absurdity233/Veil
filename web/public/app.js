@@ -1426,7 +1426,7 @@ var ChatApp = class {
    * Restores groups, including their chain keys.
    *
    * Without this a reload drops every group, and a member can no longer read
-   * anything sent to a group they are still in 閳?indistinguishable from having
+   * anything sent to a group they are still in 闂?indistinguishable from having
    * been removed. The blob carries secrets, so it lives in the same encrypted
    * vault as ratchet state.
    */
@@ -1689,8 +1689,8 @@ var ChatApp = class {
   /**
    * Replaces the member list.
    *
-   * Every chain is discarded and the epoch moves, so nobody 閳?including this
-   * client 閳?can send until each member republishes a chain. That is the point:
+   * Every chain is discarded and the epoch moves, so nobody 闂?including this
+   * client 闂?can send until each member republishes a chain. That is the point:
    * a removed member holds the old chain key and re-keying is the only thing
    * that stops them reading what follows.
    */
@@ -1710,7 +1710,7 @@ var ChatApp = class {
    * Adopts a member list a founder signed.
    *
    * `founderSignPub` is the founder's account signing key, which the caller got
-   * by verifying the founder's safety number out of band 閳?the same trust anchor
+   * by verifying the founder's safety number out of band 闂?the same trust anchor
    * the rest of the protocol uses.
    */
   async adoptMembership(groupId, record, founderSignPub) {
@@ -1751,7 +1751,8 @@ var ChatApp = class {
       groupId,
       senderId: this.selfUserId,
       text,
-      at: Date.now()
+      at: Date.now(),
+      outgoing: true
     });
     if (this.relay?.isConnected !== true || !this.relay.sendMessage(groupId, record)) {
       this.setStatus("offline: the group message was not delivered");
@@ -1769,7 +1770,8 @@ var ChatApp = class {
           groupId: group.groupId,
           senderId,
           text: new TextDecoder().decode(result.plain),
-          at: Date.now()
+          at: Date.now(),
+          outgoing: false
         });
         void this.persistGroups();
         return true;
@@ -1894,7 +1896,7 @@ var ChatApp = class {
    * Links this client to an existing account.
    *
    * The credential has to arrive over a channel that already authenticates the
-   * account — the whole point is that a relay cannot issue one — so this takes
+   * account 閳?the whole point is that a relay cannot issue one 閳?so this takes
    * an already-signed blob and verifies it against the account keys.
    */
   async adoptDeviceCredential(credential, accountDhPub, accountSignPub) {
@@ -2037,6 +2039,28 @@ var ChatApp = class {
 
 // src/main.ts
 init_engine();
+
+// src/selection.ts
+function parseSelection(raw) {
+  if (raw === null || raw.length === 0) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    const looksTruncated = raw.startsWith("{") || raw.startsWith("[");
+    return looksTruncated ? null : { kind: "peer", id: raw };
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  const candidate = parsed;
+  if (candidate.kind !== "peer" && candidate.kind !== "group") return null;
+  if (typeof candidate.id !== "string" || candidate.id.length === 0) return null;
+  return { kind: candidate.kind, id: candidate.id };
+}
+function encodeSelection(selection) {
+  return JSON.stringify(selection);
+}
+
+// src/main.ts
 var $ = (id) => {
   const el = document.getElementById(id);
   if (!el) throw new Error(`missing element #${id}`);
@@ -2064,8 +2088,15 @@ var composeForm = $("compose");
 var draft = $("draft");
 var sendButton = $("send");
 var versionLabel = $("version");
-var selectedPeerId = null;
-var STORAGE_KEY = "veil.selectedPeer";
+var newGroupForm = $("new-group");
+var groupIdInput = $("group-id");
+var groupPanel = $("group-panel");
+var groupEpoch = $("group-epoch");
+var groupMembersForm = $("group-members");
+var membersInput = $("members");
+var groupHint = $("group-hint");
+var selected = null;
+var STORAGE_KEY = "veil.selected";
 async function main() {
   try {
     await app.init("wasm/veil.wasm");
@@ -2074,7 +2105,7 @@ async function main() {
     return;
   }
   versionLabel.textContent = `protocol engine ${await engineVersion()}`;
-  selectedPeerId = localStorage.getItem(STORAGE_KEY);
+  restoreSelection();
   app.subscribe(render);
   relayUrl.value = localStorage.getItem("veil.relay") ?? relayUrl.value;
   userId.value = localStorage.getItem("veil.userId") ?? "";
@@ -2109,31 +2140,55 @@ function renderStatus() {
 }
 function renderPeers() {
   const peers = app.peerList;
-  peersEmpty.hidden = peers.length > 0;
-  peerList.replaceChildren(
-    ...peers.map((peer) => {
-      const item = document.createElement("li");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.dataset.peerId = peer.userId;
-      button.setAttribute(
-        "aria-current",
-        String(peer.userId === selectedPeerId)
-      );
-      const name = document.createElement("span");
-      name.className = "peer-name";
-      name.textContent = peer.displayName;
-      const state = document.createElement("span");
-      state.className = "peer-state";
-      state.textContent = stateLabel(peer.state);
-      button.append(name, state);
-      button.addEventListener("click", () => selectPeer(peer.userId));
-      item.append(button);
-      return item;
-    })
-  );
-  if (selectedPeerId && !peers.some((p) => p.userId === selectedPeerId)) {
-    selectedPeerId = null;
+  const groups = app.groupViews();
+  peersEmpty.hidden = peers.length + groups.length > 0;
+  const rows = [];
+  for (const peer of peers) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.peerId = peer.userId;
+    button.setAttribute(
+      "aria-current",
+      String(selected?.kind === "peer" && selected.id === peer.userId)
+    );
+    const name = document.createElement("span");
+    name.className = "peer-name";
+    name.textContent = peer.displayName;
+    const state = document.createElement("span");
+    state.className = "peer-state";
+    state.textContent = peer.devices.length > 1 ? `${stateLabel(peer.state)}, ${peer.devices.length} devices` : stateLabel(peer.state);
+    button.append(name, state);
+    button.addEventListener("click", () => select({ kind: "peer", id: peer.userId }));
+    item.append(button);
+    rows.push(item);
+  }
+  for (const group of groups) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.groupId = group.groupId;
+    button.setAttribute(
+      "aria-current",
+      String(selected?.kind === "group" && selected.id === group.groupId)
+    );
+    const name = document.createElement("span");
+    name.className = "peer-name";
+    name.textContent = `# ${group.groupId}`;
+    const state = document.createElement("span");
+    state.className = "peer-state";
+    state.textContent = group.canSend ? `group, epoch ${group.epoch}` : `group, epoch ${group.epoch} - not a member`;
+    button.append(name, state);
+    button.addEventListener("click", () => select({ kind: "group", id: group.groupId }));
+    item.append(button);
+    rows.push(item);
+  }
+  peerList.replaceChildren(...rows);
+  if (selected?.kind === "peer" && !peers.some((p) => p.userId === selected.id)) {
+    selected = null;
+  }
+  if (selected?.kind === "group" && !groups.some((g) => g.groupId === selected.id)) {
+    selected = null;
   }
 }
 function stateLabel(state) {
@@ -2147,24 +2202,73 @@ function stateLabel(state) {
   }
 }
 function renderChat() {
-  const peer = app.peerList.find((p) => p.userId === selectedPeerId);
-  const showChat = peer !== void 0;
+  const showChat = selected !== null;
   chat.hidden = !showChat;
   chatPlaceholder.hidden = showChat;
+  if (!selected) {
+    groupPanel.hidden = true;
+    return;
+  }
+  if (selected.kind === "group") {
+    renderGroupChat(selected.id);
+    return;
+  }
+  const peer = app.peerList.find((p) => p.userId === selected.id);
   if (!peer) return;
+  groupPanel.hidden = true;
   chatPeer.textContent = peer.displayName;
   safetyTitle.textContent = `Safety number with ${peer.userId}`;
   if (peer.safetyNumber) {
     safetyNumber.textContent = peer.safetyNumber;
     safetyNumber.hidden = false;
   } else {
-    safetyNumber.textContent = "No session yet \u2014 send or receive a message first.";
+    safetyNumber.textContent = "No session yet: send or receive a message first.";
     safetyNumber.hidden = false;
   }
   renderTranscript(peer.userId);
   const canSend = peer.state === 2 /* Ready */ && app.link === "online";
   draft.disabled = !canSend;
   sendButton.disabled = !canSend;
+}
+function renderGroupChat(groupId) {
+  const group = app.groupViews().find((g) => g.groupId === groupId);
+  if (!group) return;
+  chatPeer.textContent = `# ${group.groupId}`;
+  safetyTitle.textContent = `Group ${group.groupId}`;
+  safetyNumber.textContent = group.canSend ? "Sender Keys: one frame per message, regardless of group size." : "This client is not a member of this group.";
+  safetyNumber.hidden = false;
+  groupPanel.hidden = false;
+  groupEpoch.textContent = `Epoch ${group.epoch} - members: ${group.members.join(", ")}`;
+  groupHint.textContent = group.canSend ? "" : "A membership change re-keys every chain; nobody can send until each member publishes one.";
+  if (document.activeElement !== membersInput) {
+    membersInput.value = group.members.join(", ");
+  }
+  renderGroupTranscript(groupId);
+  const canSend = group.canSend && app.link === "online";
+  draft.disabled = !canSend;
+  sendButton.disabled = !canSend;
+}
+function renderGroupTranscript(groupId) {
+  const messages = app.groupMessagesFor(groupId);
+  const format = new Intl.DateTimeFormat(void 0, {
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+  transcript.replaceChildren(
+    ...messages.map((message) => {
+      const item = document.createElement("li");
+      item.className = `bubble ${message.outgoing ? "out" : "in"}`;
+      const text = document.createElement("div");
+      text.textContent = message.text;
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const who = message.outgoing ? "you" : message.senderId;
+      meta.textContent = `${who} - ${format.format(message.at)}`;
+      item.append(text, meta);
+      return item;
+    })
+  );
+  transcript.scrollTop = transcript.scrollHeight;
 }
 function renderTranscript(peerId) {
   const messages = app.messagesFor(peerId);
@@ -2196,10 +2300,13 @@ function renderTranscript(peerId) {
   );
   transcript.scrollTop = transcript.scrollHeight;
 }
-function selectPeer(peerId) {
-  selectedPeerId = peerId;
-  localStorage.setItem(STORAGE_KEY, peerId);
+function select(next) {
+  selected = next;
+  localStorage.setItem(STORAGE_KEY, encodeSelection(next));
   render();
+}
+function restoreSelection() {
+  selected = parseSelection(localStorage.getItem(STORAGE_KEY));
 }
 connectButton.addEventListener("click", () => {
   const url = relayUrl.value.trim();
@@ -2216,14 +2323,36 @@ addPeerForm.addEventListener("submit", (event) => {
   if (!id) return;
   app.addPeer(id);
   peerIdInput.value = "";
-  selectPeer(id);
+  select({ kind: "peer", id });
+});
+newGroupForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const id = groupIdInput.value.trim();
+  if (!id) return;
+  void app.createGroup(id).then((ok) => {
+    if (!ok) return;
+    groupIdInput.value = "";
+    select({ kind: "group", id });
+  });
+});
+groupMembersForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (selected?.kind !== "group") return;
+  const members = membersInput.value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  if (members.length === 0) return;
+  void app.setGroupMembers(selected.id, members);
 });
 composeForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  if (!selectedPeerId) return;
+  if (!selected) return;
   const text = draft.value;
+  if (!text.trim()) return;
   draft.value = "";
-  app.send(selectedPeerId, text);
+  if (selected.kind === "peer") {
+    app.send(selected.id, text);
+  } else {
+    void app.sendToGroup(selected.id, text);
+  }
 });
 draft.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
