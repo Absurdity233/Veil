@@ -76,6 +76,9 @@ data class GroupMessage(
 class ChatController(private val stateDir: Path) {
 
     private val vault = Vault(stateDir)
+
+    /** System notifications. Holds no message content by construction. */
+    private val notifier = TrayNotifier()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** One thread for the engine: it has no internal locking, by design. */
@@ -712,6 +715,12 @@ class ChatController(private val stateDir: Path) {
         _messages.value = _messages.value + (peerId to current + message)
         messageSeq++
         persistMessages(peerId)
+
+        // Only an incoming message is worth interrupting for. The notification
+        // carries the sender and nothing else; see TrayNotifier.
+        if (!outgoing) {
+            notifier.notifyMessage(peerId, isGroup = false, groupId = null)
+        }
     }
 
     /**
@@ -795,6 +804,12 @@ class ChatController(private val stateDir: Path) {
         )
         val existing = _groupMessages.value[groupId] ?: emptyList()
         _groupMessages.value = _groupMessages.value + (groupId to (existing + message))
+
+        // The group id, not the text: a tray notification is rendered by the
+        // desktop and often lands on a lock screen.
+        if (!outgoing) {
+            notifier.notifyMessage(senderId, isGroup = true, groupId = groupId)
+        }
     }
 
     /**
@@ -1067,7 +1082,7 @@ class ChatController(private val stateDir: Path) {
      * Accepts an invitation that arrived from [peerId].
      *
      * The founder's signing key comes from the peer's own credential, which this
-     * client already pins 閳?so "alice invited me" is checked against the alice
+     * client already pins 闁?so "alice invited me" is checked against the alice
      * this client verified, not against whoever sent the bytes.
      */
     private suspend fun acceptInviteFrom(peerId: String, payload: ByteArray) {
@@ -1149,7 +1164,7 @@ class ChatController(private val stateDir: Path) {
  * version: a directory with owner-only permissions, and no pretend that it is
  * anything stronger.
  *
- * The identity itself is *not* stored here in plain text 閳?[Vault.storeIdentity]
+ * The identity itself is *not* stored here in plain text 闁?[Vault.storeIdentity]
  * receives 96 bytes of secret material, and the file is created 0600 before the
  * bytes are written, so there is no window in which it is world-readable.
  */

@@ -13193,6 +13193,54 @@ function concat(parts) {
   return out;
 }
 
+// src/notify.ts
+function canNotify() {
+  return typeof globalThis !== "undefined" && "Notification" in globalThis && typeof document !== "undefined" && document.visibilityState !== void 0;
+}
+function notifyPermission() {
+  if (!canNotify()) return "unsupported";
+  return globalThis.Notification.permission;
+}
+async function requestNotifyPermission() {
+  if (!canNotify()) return false;
+  const api = globalThis.Notification;
+  if (api.permission === "granted") return true;
+  if (api.permission === "denied") return false;
+  return await api.requestPermission() === "granted";
+}
+var lastShown = 0;
+function notify(target) {
+  if (!canNotify()) return false;
+  const api = globalThis.Notification;
+  if (api.permission !== "granted") return false;
+  if (typeof document !== "undefined" && document.visibilityState === "visible") {
+    return false;
+  }
+  const now = Date.now();
+  if (now - lastShown < 2e3) return false;
+  lastShown = now;
+  const title = target.kind === "group" ? `${target.from} in #${target.groupId ?? "group"}` : target.from;
+  const body = target.kind === "group" ? "New message in a group" : "New message";
+  try {
+    const notification = new api(title, {
+      body,
+      // No icon: this build ships none, and a broken image is worse than none.
+      tag: "veil-message",
+      // The id is not secret - the relay already knows who sent to whom - but
+      // nothing derived from the plaintext is in this string.
+      data: target.from
+    });
+    notification.onclick = () => {
+      target.onOpen();
+      notification.close();
+      globalThis.focus?.();
+    };
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // src/app.ts
 init_engine();
 
@@ -14625,7 +14673,7 @@ var ChatApp = class {
    * password before anything is overwritten.
    *
    * The conflict worth knowing about: another device signed in with the old
-   * password still has the old key, so it can still *read* the vault — but its
+   * password still has the old key, so it can still *read* the vault 鈥?but its
    * next write would replace this one. Nothing here prevents that; the generation
    * counter makes it visible, and the honest advice is to sign the other device
    * out first.
@@ -14772,6 +14820,33 @@ var ChatApp = class {
     list.push(message);
     this.messages.set(message.peerId, list);
     void this.vault.storeMessages(message.peerId, list);
+    if (!message.outgoing) {
+      notify({
+        from: message.peerId,
+        kind: message.peerId.startsWith("group:") ? "group" : "direct",
+        groupId: message.peerId.startsWith("group:") ? message.peerId.slice("group:".length) : void 0,
+        // The selection lives in the DOM layer, so a click is routed out through
+        // a callback rather than duplicated here: two places deciding what is
+        // selected is two places to disagree about it.
+        onOpen: () => {
+          const groupId = message.peerId.startsWith("group:") ? message.peerId.slice("group:".length) : null;
+          this.onNotificationOpen?.(groupId ? { kind: "group", groupId } : { kind: "peer", peerId: message.peerId });
+        }
+      });
+    }
+    this.notify();
+  }
+  /**
+   * Set by the DOM layer, to select a conversation when a notification is
+   * clicked.
+   *
+   * A callback rather than a field the engine owns: the selection is a UI
+   * concern, and this class should not grow one just to please a notification.
+   */
+  onNotificationOpen;
+  /** Shows a one-off message in the status line, for the DOM layer's own events. */
+  showStatusMessage(text) {
+    this.setStatus(text);
     this.notify();
   }
   updateMessageState(id, state) {
@@ -15027,6 +15102,7 @@ var changeStrength = $("change-strength");
 var changeButton = $("change");
 var accountStatus = $("account-status");
 var closeAccount = $("close-account");
+var enableNotify = $("enable-notify");
 var selected = null;
 var STORAGE_KEY = "veil.selected";
 async function main() {
@@ -15038,6 +15114,7 @@ async function main() {
   }
   versionLabel.textContent = `protocol engine ${await engineVersion()}`;
   restoreSelection();
+  refreshNotifyButton();
   app.subscribe(render);
   relayUrl.value = localStorage.getItem("veil.relay") ?? defaultRelayUrl();
   userId.value = localStorage.getItem("veil.userId") ?? "";
@@ -15536,4 +15613,22 @@ changeButton.addEventListener("click", () => {
     }
   });
 });
+function refreshNotifyButton() {
+  const permission = notifyPermission();
+  enableNotify.hidden = permission !== "default";
+}
+enableNotify.addEventListener("click", () => {
+  void requestNotifyPermission().then((granted) => {
+    refreshNotifyButton();
+    if (!granted) {
+      app.showStatusMessage(
+        "notifications were refused; the browser will not ask again"
+      );
+    }
+  });
+});
+app.onNotificationOpen = (target) => {
+  selected = target.kind === "peer" ? { kind: "peer", id: target.peerId } : { kind: "group", id: target.groupId };
+  render();
+};
 void main();

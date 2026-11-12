@@ -1,4 +1,4 @@
-﻿/**
+/**
  * The web client's DOM layer.
  *
  * Deliberately thin: [ChatApp] owns every decision worth testing, and this file
@@ -9,6 +9,7 @@
 import { ChatApp } from "./app.js";
 import { SessionState } from "./engine.js";
 import { checkPassword, describeStrength } from "./account.js";
+import { canNotify, notifyPermission, requestNotifyPermission } from "./notify.js";
 import { canScan, drawQr, encodeQr, startScanning } from "./qr.js";
 import { encodeSelection, parseSelection, type Selection } from "./selection.js";
 
@@ -103,6 +104,7 @@ const changeStrength = $<HTMLParagraphElement>("change-strength");
 const changeButton = $<HTMLButtonElement>("change");
 const accountStatus = $<HTMLParagraphElement>("account-status");
 const closeAccount = $<HTMLButtonElement>("close-account");
+const enableNotify = $<HTMLButtonElement>("enable-notify");
 
 /** The conversation on screen. Kept beside the parser so the two agree. */
 let selected: Selection | null = null;
@@ -122,6 +124,7 @@ async function main(): Promise<void> {
 
   versionLabel.textContent = `protocol engine ${await engineVersion()}`;
   restoreSelection();
+  refreshNotifyButton();
 
   app.subscribe(render);
 
@@ -833,5 +836,47 @@ changeButton.addEventListener("click", () => {
     }
   });
 });
+
+// ---- Notifications ----------------------------------------------------
+
+/**
+ * Shows the notify button only when it can do something.
+ *
+ * Three cases matter: an unsupported browser has no button, a browser that has
+ * already been granted does not need one, and a browser that denied permission
+ * cannot be asked again from script - so the button would be a control that
+ * cannot work. That last case is why the button's absence is not a bug.
+ */
+function refreshNotifyButton(): void {
+  const permission = notifyPermission();
+  enableNotify.hidden = permission !== "default";
+}
+
+enableNotify.addEventListener("click", () => {
+  // Called from a click because every browser refuses a permission prompt that
+  // was not triggered by a gesture - and one that appears on load is dismissed
+  // reflexively.
+  void requestNotifyPermission().then((granted) => {
+    refreshNotifyButton();
+    if (!granted) {
+      // Permission being refused permanently is a fact the user should hear once,
+      // because the button disappears afterwards and its absence would otherwise
+      // look like a bug.
+      app.showStatusMessage(
+        "notifications were refused; the browser will not ask again",
+      );
+    }
+  });
+});
+
+// A notification click selects the conversation it came from. The callback's
+// shape is the App's, not the Selection's, so the translation happens here -
+// where the Selection type is already known.
+app.onNotificationOpen = (target) => {
+  selected = target.kind === "peer"
+    ? { kind: "peer", id: target.peerId }
+    : { kind: "group", id: target.groupId };
+  render();
+};
 
 void main();

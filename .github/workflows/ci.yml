@@ -1,4 +1,4 @@
-name: ci
+﻿name: ci
 
 on:
   push:
@@ -185,8 +185,35 @@ jobs:
           mkdir -p build/relay
           cd server && go build -trimpath -o ../build/relay/veil-relay .
 
+      # The file list is explicit rather than a directory: `node --test test/`
+      # does not recurse, and a new suite that nobody adds here would sit in the
+      # repository never running. That is exactly what happened to the selection,
+      # QR and account suites - they were written, passed locally, and were not
+      # in this line.
       - name: Test
-        run: node --test --test-timeout=60000 test/wire.test.mjs test/wasm.test.mjs test/e2e.test.mjs
+        run: |
+          node --test --test-timeout=60000 \
+            test/wire.test.mjs \
+            test/wasm.test.mjs \
+            test/selection.test.mjs \
+            test/qr.test.mjs \
+            test/account.test.mjs \
+            test/notify.test.mjs \
+            test/e2e.test.mjs
+
+      # A guard for the problem above: the count of *.test.mjs files must equal
+      # the count named in the step before it. Adding a test file without adding
+      # it to the run is a silent gap, and this turns it into a red build.
+      - name: Every test file is run
+        run: |
+          on_disk=$(ls test/*.test.mjs | wc -l)
+          named=$(grep -o 'test/[a-z0-9]*\.test\.mjs' .github/workflows/ci.yml | sort -u | wc -l)
+          echo "test files on disk: $on_disk, named in ci.yml: $named"
+          if [ "$on_disk" -ne "$named" ]; then
+            echo "::error::a test file exists that ci.yml does not run"
+            ls test/*.test.mjs
+            exit 1
+          fi
 
       - name: Upload the wasm module
         uses: actions/upload-artifact@v4

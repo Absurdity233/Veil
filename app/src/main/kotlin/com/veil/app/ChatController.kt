@@ -52,6 +52,9 @@ class ChatController(context: Context) {
 
     private val appContext = context.applicationContext
     private val vault = IdentityVault(appContext)
+
+    /** System notifications. Holds no message content by construction; see the class. */
+    private val notifier = com.veil.app.notify.MessageNotifier(appContext)
     private val sessions = SessionVault(appContext, "veil.sessions.v1")
     private val peerPins = SessionVault(appContext, "veil.peers.v1")
     private val prekeyState = SessionVault(appContext, "veil.prekeys.v1")
@@ -699,7 +702,20 @@ class ChatController(context: Context) {
         )
         val existing = _groupMessages.value[groupId] ?: emptyList()
         _groupMessages.value = _groupMessages.value + (groupId to (existing + message))
+
+        // The group id, not the message. A notification is rendered by the system
+        // and appears on a lock screen; putting the text there would undo the
+        // encryption of the message it described.
+        if (!outgoing) {
+            notifier.notifyMessage(senderId, isGroup = true, groupId = groupId)
+        }
     }
+
+    /** Whether the notification permission still has to be asked for. */
+    fun notificationsNeedPermission(): Boolean = notifier.needsPermission()
+
+    /** Dismisses the message notification, e.g. once a conversation is opened. */
+    fun clearNotifications() = notifier.clear()
 
     /**
      * Tries a delivery as a group frame.
@@ -1171,6 +1187,13 @@ class ChatController(context: Context) {
             ),
         )
         _messages.value = _messages.value + (peerId to store.loadMessages(peerId))
+
+        // Only an incoming message is worth interrupting for: an outgoing one is
+        // one the user just typed, and notifying them about their own action is
+        // what makes people turn notifications off.
+        if (!outgoing) {
+            notifier.notifyMessage(peerId, isGroup = false, groupId = null)
+        }
     }
 
     /** Updates the delivery state of the newest outgoing message for a peer. */

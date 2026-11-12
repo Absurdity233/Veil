@@ -10,6 +10,7 @@
  */
 
 import { checkPassword, openVault, sealVault, type VaultContents } from "./account.js";
+import { notify } from "./notify.js";
 import { RefreshReason, SessionState, Status, VeilEngine, type StatusCode } from "./engine.js";
 import { RelayClient, type RelayEvent, buildBundle } from "./relay.js";
 import { Reader } from "./wire.js";
@@ -1009,7 +1010,7 @@ export class ChatApp {
    * password before anything is overwritten.
    *
    * The conflict worth knowing about: another device signed in with the old
-   * password still has the old key, so it can still *read* the vault — but its
+   * password still has the old key, so it can still *read* the vault 鈥?but its
    * next write would replace this one. Nothing here prevents that; the generation
    * counter makes it visible, and the honest advice is to sign the other device
    * out first.
@@ -1201,6 +1202,51 @@ export class ChatApp {
     list.push(message);
     this.messages.set(message.peerId, list);
     void this.vault.storeMessages(message.peerId, list);
+
+    // Only an incoming message is worth interrupting for: an outgoing one is one
+    // the user just typed, and notifying them about their own action is the
+    // behaviour that gets notifications switched off.
+    //
+    // The notification carries the sender and nothing else - see notify.ts. A
+    // body with the text in it would put the plaintext on a lock screen, which
+    // would undo the encryption of the message it described.
+    if (!message.outgoing) {
+      notify({
+        from: message.peerId,
+        kind: message.peerId.startsWith("group:") ? "group" : "direct",
+        groupId: message.peerId.startsWith("group:")
+          ? message.peerId.slice("group:".length)
+          : undefined,
+        // The selection lives in the DOM layer, so a click is routed out through
+        // a callback rather than duplicated here: two places deciding what is
+        // selected is two places to disagree about it.
+        onOpen: () => {
+          const groupId = message.peerId.startsWith("group:")
+            ? message.peerId.slice("group:".length)
+            : null;
+          this.onNotificationOpen?.(groupId
+            ? { kind: "group", groupId }
+            : { kind: "peer", peerId: message.peerId });
+        },
+      });
+    }
+
+    this.notify();
+  }
+
+  /**
+   * Set by the DOM layer, to select a conversation when a notification is
+   * clicked.
+   *
+   * A callback rather than a field the engine owns: the selection is a UI
+   * concern, and this class should not grow one just to please a notification.
+   */
+  onNotificationOpen?: (selection: { kind: "peer"; peerId: string }
+    | { kind: "group"; groupId: string }) => void;
+
+  /** Shows a one-off message in the status line, for the DOM layer's own events. */
+  showStatusMessage(text: string): void {
+    this.setStatus(text);
     this.notify();
   }
 
