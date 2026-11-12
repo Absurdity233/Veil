@@ -10,6 +10,22 @@
 
 import { FrameType, MAX_PAYLOAD, Reader, Writer, frame, parseFrame } from "./wire.js";
 
+/**
+ * A sealed vault, as the relay returns it.
+ *
+ * None of it is readable by the relay: the salt and KDF parameters exist so any
+ * client that knows the password can reproduce the key, and the ciphertext is
+ * what that key opens.
+ */
+export interface VaultReply {
+  salt: Uint8Array;
+  memoryKiB: number;
+  passes: number;
+  lanes: number;
+  generation: number;
+  ciphertext: Uint8Array;
+}
+
 export type RelayEvent =
   | { kind: "challenge"; nonce: Uint8Array }
   | { kind: "connected"; userId: string }
@@ -45,6 +61,13 @@ export class RelayClient {
     version: number;
     devices: Array<{ deviceId: string; credential: Uint8Array }>;
   } | null) => void>();
+
+  // Vault requests have no correlation field on the wire: the reply does not
+  // repeat the user id, because the relay answers the connection that asked. So
+  // put and get get their own maps rather than sharing one and guessing at a
+  // suffixed key.
+  private readonly vaultPutWaiters = new Map<string, (generation: number | null) => void>();
+  private readonly vaultGetWaiters = new Map<string, (reply: VaultReply | null) => void>();
 
   constructor(private readonly url: string) {}
 
@@ -197,6 +220,28 @@ export class RelayClient {
           if (waiter) waiter({ version, devices });
           break;
         }
+        case FrameType.VAULT_ACK: {
+          const generation = r.u32();
+          // The reply carries no user id - the relay answers the connection that
+          // asked - so this resolves the single put in flight.
+          const waiter = this.vaultPutWaiters.values().next().value;
+          if (waiter) waiter(generation);
+          break;
+        }
+        case FrameType.VAULT_DATA: {
+          const salt = r.blob();
+          const memoryKiB = r.u32();
+          const passes = r.u32();
+          const lanes = r.u32();
+          const generation = r.u32();
+          const ciphertext = r.blob();
+
+          const waiter = this.vaultGetWaiters.values().next().value;
+          if (waiter) {
+            waiter({ salt, memoryKiB, passes, lanes, generation, ciphertext });
+          }
+          break;
+        }
         case FrameType.ERROR:
           this.emit({ kind: "failed", message: r.string() });
           break;
@@ -313,6 +358,65 @@ export class RelayClient {
 
   acknowledge(outboxId: bigint): boolean {
     return this.send(FrameType.ACK, new Writer().u64(outboxId).build());
+  }
+
+  // ---- Password vault ---------------------------------------------------
+  //
+  // The only requests a client may make before authenticating, because restoring
+  // an identity is exactly the case where it has nothing to authenticate with
+  // yet. The relay stores a blob it cannot open.
+
+  /** Uploads a sealed vault. Resolves with the generation the relay assigned. */
+  putVault(
+    userId: string,
+    salt: Uint8Array,
+    params: { memoryKiB: number; passes: number; lanes: number },
+    ciphertext: Uint8Array,
+    timeoutMs = 20_000,
+  ): Promise<number | null> {
+    const payload = new Writer()
+      .string(userId)
+      .blob(salt)
+      .u32(params.memoryKiB)
+      .u32(params.passes)
+      .u32(params.lanes)
+      .blob(ciphertext)
+      .build();
+
+    if (!this.send(FrameType.PUT_VAULT, payload)) return Promise.resolve(null);
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.vaultPutWaiters.delete(userId);
+        resolve(null);
+      }, timeoutMs);
+
+      this.vaultPutWaiters.set(userId, (generation) => {
+        clearTimeout(timer);
+        this.vaultPutWaiters.delete(userId);
+        resolve(generation);
+      });
+    });
+  }
+
+  /** Fetches a sealed vault, or null when the user has none. */
+  getVault(userId: string, timeoutMs = 20_000): Promise<VaultReply | null> {
+    if (!this.send(FrameType.GET_VAULT, new Writer().string(userId).build())) {
+      return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.vaultGetWaiters.delete(userId);
+        resolve(null);
+      }, timeoutMs);
+
+      this.vaultGetWaiters.set(userId, (reply) => {
+        clearTimeout(timer);
+        this.vaultGetWaiters.delete(userId);
+        resolve(reply);
+      });
+    });
   }
 
   private send(type: number, payload: Uint8Array): boolean {

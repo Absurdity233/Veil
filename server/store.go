@@ -134,6 +134,36 @@ CREATE TABLE IF NOT EXISTS device_lists (
     version     INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
 );
+
+-- Password vaults.
+--
+-- The blob is an encrypted bundle containing the identity, prekeys, group state
+-- and message history, sealed under a key derived from the user's password with
+-- Argon2id. The relay stores it and hands it back; it cannot open it.
+--
+-- Two consequences worth stating, because they are the price of this feature:
+--
+--   * The relay learns that a user exists even before they connect, and roughly
+--     how much data they keep.
+--   * A stolen database is an offline attack surface. Argon2id is what makes that
+--     attack expensive, which is why the derivation parameters travel with the
+--     blob: a future client can raise them without invalidating old vaults.
+CREATE TABLE IF NOT EXISTS vaults (
+    user_id     TEXT PRIMARY KEY,
+    -- The KDF parameters and salt, in the clear. They are not secret - they have
+    -- to be reproducible by any client - and storing them beside the ciphertext
+    -- is what lets the parameters change over time.
+    kdf_salt    BLOB NOT NULL,
+    kdf_memory  INTEGER NOT NULL,
+    kdf_passes  INTEGER NOT NULL,
+    kdf_lanes   INTEGER NOT NULL,
+    blob        BLOB NOT NULL,
+    -- A generation counter so a client can tell a stale read from a current one
+    -- when two devices write at once. Last write wins; this only makes the loss
+    -- visible rather than silent.
+    generation  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
@@ -502,6 +532,74 @@ func (s *Store) SeedDefaultDevice(userID string, deviceID string, credential []b
 
 	_, err := s.PublishDevices(userID, [][]byte{credential}, []string{deviceID})
 	return err
+}
+
+// ---- Password vaults ---------------------------------------------------
+
+// VaultRecord is what a client stores and fetches.
+//
+// The KDF parameters travel with the blob rather than being a server constant:
+// they have to be reproducible by any client that knows the password, and a
+// future version must be able to raise them without making existing vaults
+// unreadable.
+type VaultRecord struct {
+	Salt       []byte
+	MemoryKiB  uint32
+	Passes     uint32
+	Lanes      uint32
+	Blob       []byte
+	Generation uint32
+}
+
+// PutVault stores a vault, replacing whatever was there.
+//
+// The generation is bumped by the server rather than supplied by the client, so a
+// client cannot claim a generation it did not have and make a stale write look
+// current.
+func (s *Store) PutVault(userID string, record VaultRecord) (uint32, error) {
+	var next uint32
+	err := s.db.QueryRow(`SELECT generation FROM vaults WHERE user_id = ?`, userID).
+		Scan(&next)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
+	}
+	next++
+
+	_, err = s.db.Exec(`
+INSERT INTO vaults(user_id, kdf_salt, kdf_memory, kdf_passes, kdf_lanes, blob,
+                   generation, updated_at)
+VALUES(?,?,?,?,?,?,?,strftime('%s','now'))
+ON CONFLICT(user_id) DO UPDATE SET
+    kdf_salt   = excluded.kdf_salt,
+    kdf_memory = excluded.kdf_memory,
+    kdf_passes = excluded.kdf_passes,
+    kdf_lanes  = excluded.kdf_lanes,
+    blob       = excluded.blob,
+    generation = excluded.generation,
+    updated_at = excluded.updated_at`,
+		userID, record.Salt, record.MemoryKiB, record.Passes, record.Lanes,
+		record.Blob, next)
+	if err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+// GetVault reads a vault. Returns nil when the user has none.
+func (s *Store) GetVault(userID string) (*VaultRecord, error) {
+	var record VaultRecord
+	err := s.db.QueryRow(`
+SELECT kdf_salt, kdf_memory, kdf_passes, kdf_lanes, blob, generation
+FROM vaults WHERE user_id = ?`, userID).
+		Scan(&record.Salt, &record.MemoryKiB, &record.Passes, &record.Lanes,
+			&record.Blob, &record.Generation)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &record, nil
 }
 
 // Acknowledge drops everything this recipient has up to and including upTo.

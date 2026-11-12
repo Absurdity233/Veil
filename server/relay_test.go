@@ -1203,6 +1203,192 @@ func TestEmptyDeviceMeansWholeAccount(t *testing.T) {
 	}
 }
 
+// ---- Password vaults --------------------------------------------------
+
+func putVaultPayload(user string, salt []byte, memory, passes, lanes uint32, blob []byte) []byte {
+	var w writer
+	w.str(user)
+	w.blob(salt)
+	w.u32(memory)
+	w.u32(passes)
+	w.u32(lanes)
+	w.blob(blob)
+	return w.bytes()
+}
+
+func TestVaultRoundTrip(t *testing.T) {
+	// The whole feature depends on this: a client restores its identity by
+	// fetching a blob the relay cannot open.
+	h := newHarness(t)
+	c := h.dialRaw(t)  // deliberately *not* authenticated: a vault fetch happens
+	// before HELLO, because the client has no identity to prove yet.
+
+	salt := bytes.Repeat([]byte{0x11}, 16)
+	blob := bytes.Repeat([]byte{0xAB}, 512)
+
+	c.send(typePutVault, putVaultPayload("alice", salt, 65536, 3, 2, blob))
+	ack := c.recvType(typeVaultAck)
+	r := reader{buf: ack}
+	generation, err := r.u32()
+	if err != nil || generation != 1 {
+		t.Fatalf("generation = %d, %v (want 1)", generation, err)
+	}
+
+	var w writer
+	w.str("alice")
+	c.send(typeGetVault, w.bytes())
+
+	payload := c.recvType(typeVaultData)
+	got := reader{buf: payload}
+
+	gotSalt, _ := got.blob()
+	memory, _ := got.u32()
+	passes, _ := got.u32()
+	lanes, _ := got.u32()
+	gen, _ := got.u32()
+	gotBlob, _ := got.blob()
+
+	if !bytes.Equal(gotSalt, salt) {
+		t.Fatalf("salt mismatch")
+	}
+	if memory != 65536 || passes != 3 || lanes != 2 {
+		t.Fatalf("kdf params = %d/%d/%d", memory, passes, lanes)
+	}
+	if gen != 1 {
+		t.Fatalf("generation = %d, want 1", gen)
+	}
+	if !bytes.Equal(gotBlob, blob) {
+		t.Fatalf("blob mismatch")
+	}
+}
+
+func TestVaultGenerationAdvancesOnRewrite(t *testing.T) {
+	// Two devices writing at once is the realistic case for this table. Last write
+	// wins, but the generation has to move so a client can tell its write was
+	// overwritten rather than assume it stuck.
+	h := newHarness(t)
+	c := h.dialRaw(t)
+
+	salt := bytes.Repeat([]byte{0x22}, 16)
+
+	c.send(typePutVault, putVaultPayload("alice", salt, 65536, 3, 2, []byte("first")))
+	r1 := reader{buf: c.recvType(typeVaultAck)}
+	gen1, _ := r1.u32()
+
+	c.send(typePutVault, putVaultPayload("alice", salt, 65536, 3, 2, []byte("second")))
+	r2 := reader{buf: c.recvType(typeVaultAck)}
+	gen2, _ := r2.u32()
+
+	if gen2 != gen1+1 {
+		t.Fatalf("generation = %d -> %d, want an increment", gen1, gen2)
+	}
+}
+
+func TestVaultForUnknownUserIsNotAnError(t *testing.T) {
+	// A user that never set a password has no vault. The client must be able to
+	// tell that apart from a failure, because it falls back to a local identity.
+	h := newHarness(t)
+	c := h.dialRaw(t)
+
+	var w writer
+	w.str("nobody")
+	c.send(typeGetVault, w.bytes())
+
+	payload := c.recvType(typeError)
+	if !strings.Contains(string(payload), "no vault") {
+		t.Fatalf("unexpected error: %q", payload)
+	}
+}
+
+func TestVaultRejectsWeakDerivationParameters(t *testing.T) {
+	// The relay is the one place that can refuse a weak vault without knowing the
+	// password. A client asking for 1 pass or 8 KiB is weakening its own store, and
+	// the price of the feature is that the server holds it.
+	h := newHarness(t)
+	c := h.dialRaw(t)
+
+	salt := bytes.Repeat([]byte{0x33}, 16)
+
+	cases := []struct {
+		name                  string
+		memory, passes, lanes uint32
+	}{
+		{"zero passes", 65536, 0, 2},
+		{"zero memory", 0, 3, 2},
+		{"memory below lanes", 8, 3, 4},
+		{"absurd memory", 1 << 20, 3, 2},
+		{"zero lanes", 65536, 3, 0},
+	}
+
+	for _, tc := range cases {
+		c.send(typePutVault, putVaultPayload("alice", salt, tc.memory, tc.passes, tc.lanes, []byte("x")))
+		c.expectType(typeError)
+	}
+}
+
+func TestVaultRejectsShortSalt(t *testing.T) {
+	// A short salt would let one precomputation attack every account that shares
+	// it, which is the failure this parameter exists to prevent.
+	h := newHarness(t)
+	c := h.dialRaw(t)
+
+	c.send(typePutVault, putVaultPayload("alice", []byte{1, 2, 3}, 65536, 3, 2, []byte("x")))
+	c.expectType(typeError)
+}
+
+func TestVaultRejectsOversizedBlob(t *testing.T) {
+	// Two ceilings, and the vault's must sit below the transport's or it can never
+	// fire. That relationship is asserted here because it is a configuration
+	// invariant, not a behaviour: the previous flat 4 MiB vault limit was above the
+	// 1 MiB frame limit, so a 4 MiB vault would have been refused by the codec with
+	// an error that says nothing about vaults.
+	if maxVaultBlob >= maxPayload {
+		t.Fatalf("maxVaultBlob (%d) must be below maxPayload (%d)",
+			maxVaultBlob, maxPayload)
+	}
+
+	h := newHarness(t)
+	c := h.dialRaw(t)
+
+	salt := bytes.Repeat([]byte{0x44}, 16)
+
+	// A blob just over the vault ceiling, inside a frame the transport accepts.
+	oversized := make([]byte, maxVaultBlob+1)
+	payload := putVaultPayload("alice", salt, 65536, 3, 2, oversized)
+
+	if _, err := frame(typePutVault, payload); err != nil {
+		t.Fatalf("the oversized vault did not fit a frame, so this test cannot "+
+			"reach the vault check: %v", err)
+	}
+
+	c.send(typePutVault, payload)
+	c.expectType(typeError)
+}
+
+func TestAuthenticatedClientCannotWriteAnotherVault(t *testing.T) {
+	// An authenticated connection may only write its own vault. Writing somebody
+	// else's would let one user replace another's encrypted identity with a blob
+	// they control - the victim would then restore into a stranger's account.
+	h := newHarness(t)
+	alice := h.dial(t, "alice", newTestIdentity(t, 200))
+
+	salt := bytes.Repeat([]byte{0x55}, 16)
+	alice.send(typePutVault, putVaultPayload("bob", salt, 65536, 3, 2, []byte("x")))
+
+	payload := alice.expectType(typeError)
+	if !strings.Contains(string(payload), "own device list") {
+		t.Fatalf("unexpected error: %q", payload)
+	}
+
+	stored, err := h.store.GetVault("bob")
+	if err != nil {
+		t.Fatalf("GetVault: %v", err)
+	}
+	if stored != nil {
+		t.Fatal("bob gained a vault from alice's write")
+	}
+}
+
 // ---- Send pacing -------------------------------------------------------
 
 func TestSendRateLimit(t *testing.T) {

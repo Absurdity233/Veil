@@ -37,6 +37,8 @@ const EXPORTED = [
   "_veil_encrypt", "_veil_decrypt", "_veil_safety_number",
   "_veil_set_random_source", "_veil_version",
   "_veil_install_web_rng", "_veil_web_rng_ready",
+  // Password derivation, for the vault feature.
+  "_veil_argon2id",
   // Multi-device.
   "_veil_init_device", "_veil_device_id", "_veil_device_credential",
   "_veil_adopt_device_credential", "_veil_adopt_device_list",

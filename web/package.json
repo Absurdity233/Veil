@@ -10,7 +10,7 @@
     "build:bundle": "esbuild src/main.ts --bundle --format=esm --target=es2022 --outfile=public/app.js",
     "build:wasm": "node scripts/build-wasm.mjs",
     "serve": "node scripts/serve.mjs",
-    "test": "node --test --test-timeout=60000 test/wire.test.mjs test/wasm.test.mjs test/selection.test.mjs test/qr.test.mjs test/e2e.test.mjs",
+    "test": "node --test --test-timeout=60000 test/wire.test.mjs test/wasm.test.mjs test/selection.test.mjs test/qr.test.mjs test/account.test.mjs test/e2e.test.mjs",
     "test:unit": "node --test test/wire.test.mjs test/wasm.test.mjs",
     "test:e2e": "node --test --test-timeout=60000 test/e2e.test.mjs"
   },

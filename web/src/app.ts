@@ -1,4 +1,4 @@
-/**
+﻿/**
  * The web client's application logic.
  *
  * Structurally the same as the Android `ChatController` and the desktop
@@ -9,6 +9,7 @@
  * queued-frame list something to persist rather than keep in memory.
  */
 
+import { checkPassword, openVault, sealVault, type VaultContents } from "./account.js";
 import { RefreshReason, SessionState, Status, VeilEngine, type StatusCode } from "./engine.js";
 import { RelayClient, type RelayEvent, buildBundle } from "./relay.js";
 import { Reader } from "./wire.js";
@@ -871,11 +872,139 @@ export class ChatApp {
     return this.adoptDeviceCredential(credential, accountDhPub, accountSignPub);
   }
 
+  // ---- Accounts ---------------------------------------------------------
+  //
+  // A password that lets the identity be restored on another device. What goes
+  // over the wire is a blob sealed under a key derived from it, so the relay
+  // cannot verify the password and cannot open the vault.
+
+  /**
+   * Uploads this client's whole state, sealed under the password.
+   *
+   * Requires a connection: the vault lives on the relay, which is the point -
+   * another device has to be able to reach it.
+   */
+  async createAccount(password: string): Promise<string | null> {
+    const engine = this.engine;
+    const relay = this.relay;
+    if (!engine) return "the engine is not loaded";
+    if (!relay || !relay.isConnected) return "connect before creating an account";
+    if (!this.selfUserId) return "connect with an id first";
+
+    const problem = checkPassword(password);
+    if (problem) return problem;
+
+    const contents: VaultContents = {
+      identity: engine.identitySecrets(),
+      preKeyState: engine.exportPreKeyState(),
+      peerRegistry: engine.exportPeerRegistry(),
+      groupState: engine.exportGroupState(),
+      history: this.collectHistory(),
+    };
+
+    const sealed = await sealVault(contents, password);
+
+    const generation = await relay.putVault(
+      this.selfUserId,
+      sealed.salt,
+      { memoryKiB: sealed.memoryKiB, passes: sealed.passes, lanes: sealed.lanes },
+      sealed.ciphertext,
+    );
+
+    // The plaintext held the identity secret; it is not left for the collector.
+    contents.identity.fill(0);
+
+    if (generation === null) return "the relay did not accept the vault";
+
+    this.setStatus(
+      `account stored (generation ${generation}): sign in with this password ` +
+        `on another device to restore it`,
+    );
+    return null;
+  }
+
+  /**
+   * Restores this client's state from the vault, and adopts it.
+   *
+   * A wrong password fails to open the vault, which is the only check available:
+   * there is no password hash to compare against, and a wrong key simply fails to
+   * authenticate the ciphertext.
+   */
+  async restoreAccount(userId: string, password: string): Promise<string | null> {
+    const relay = this.relay;
+    if (!relay || !relay.isConnected) return "connect before signing in";
+
+    const vault = await relay.getVault(userId);
+    if (!vault) return `no account stored for ${userId}`;
+
+    const contents = await openVault(
+      {
+        salt: vault.salt,
+        memoryKiB: vault.memoryKiB,
+        passes: vault.passes,
+        lanes: vault.lanes,
+        generation: vault.generation,
+        ciphertext: vault.ciphertext,
+      },
+      password,
+    );
+
+    // A wrong password and a tampered vault are the same event here: AES-GCM
+    // cannot tell them apart, and neither can this client do anything different.
+    if (!contents) return "wrong password, or the stored account is damaged";
+
+    // Replace whatever this browser had. A restore is not a merge: two identities
+    // cannot become one, and pretending otherwise would produce a client whose
+    // keys do not match its messages.
+    this.engine?.close();
+    this.engine = VeilEngine.restore(contents.identity);
+    await this.vault.storeIdentity(contents.identity);
+    contents.identity.fill(0);
+
+    if (contents.preKeyState) this.engine.importPreKeyState(contents.preKeyState);
+    if (contents.peerRegistry) this.engine.importPeerRegistry(contents.peerRegistry);
+    if (contents.groupState) this.engine.importGroupState(contents.groupState);
+
+    await this.vault.storePreKeyState(this.engine.exportPreKeyState() ?? new Uint8Array());
+    await this.vault.storeRegistry(this.engine.exportPeerRegistry() ?? new Uint8Array());
+    const groupState = this.engine.exportGroupState();
+    if (groupState) await this.vault.storeGroupState(groupState);
+
+    this.selfUserId = userId;
+    await this.restorePeers();
+    await this.restoreGroups();
+    this.applyHistory(contents.history);
+
+    this.setStatus(`restored ${userId} from the account store`);
+    this.notify();
+    return null;
+  }
+
+  /** Every conversation, for the vault. */
+  private collectHistory(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [peerId, messages] of this.messages) out[peerId] = messages;
+    for (const [groupId, messages] of this.groupMessages) {
+      out[`group:${groupId}`] = messages;
+    }
+    return out;
+  }
+
+  private applyHistory(history: Record<string, unknown>): void {
+    for (const [key, value] of Object.entries(history)) {
+      if (key.startsWith("group:")) {
+        this.groupMessages.set(key.slice("group:".length), value as GroupMessageView[]);
+      } else {
+        this.messages.set(key, value as StoredMessage[]);
+      }
+    }
+  }
+
   /**
    * Links this client to an existing account.
    *
    * The credential has to arrive over a channel that already authenticates the
-   * account 闁?the whole point is that a relay cannot issue one 闁?so this takes
+   * account 闂?the whole point is that a relay cannot issue one 闂?so this takes
    * an already-signed blob and verifies it against the account keys.
    */
   async adoptDeviceCredential(

@@ -29,6 +29,7 @@
       </label>
       <button id="connect" class="primary">Connect</button>
       <span id="link-badge" class="badge offline" role="status" aria-live="polite">offline</span>
+      <button id="open-account" class="ghost" type="button">Account</button>
       <button id="open-link" class="ghost" type="button">Link device</button>
     </div>
   </header>
@@ -99,6 +100,59 @@
       <p>Select a conversation, or add someone by their id.</p>
     </section>
   </main>
+
+  <!-- Accounts. A password lets one identity be restored on another device.
+
+       The password never leaves this page: what goes to the relay is a blob
+       sealed under a key derived from it with Argon2id. So the relay cannot
+       verify the password and cannot open the vault - and the honest corollary
+       is that password strength is the entire defence against an offline attack
+       on a stolen blob. That is why the length is enforced rather than suggested. -->
+  <dialog id="account-dialog" class="link-dialog">
+    <h2>Account</h2>
+
+    <div class="link-tabs">
+      <button type="button" id="tab-register" class="tab selected">Create account</button>
+      <button type="button" id="tab-restore" class="tab">Sign in elsewhere</button>
+    </div>
+
+    <section id="pane-register">
+      <p class="hint">
+        Protects the identity in this browser so you can restore it on another
+        device. The password is never sent anywhere - if you forget it, the
+        account cannot be recovered.
+      </p>
+      <label class="field">
+        <span>Password</span>
+        <input id="register-password" type="password" autocomplete="new-password">
+      </label>
+      <p id="password-strength" class="hint"></p>
+      <label class="field">
+        <span>Repeat</span>
+        <input id="register-password2" type="password" autocomplete="new-password">
+      </label>
+      <button type="button" id="register" class="primary">Create and upload</button>
+    </section>
+
+    <section id="pane-restore" hidden>
+      <p class="hint">
+        Restores the identity stored for this id. Everything sealed in the vault
+        comes back: contacts, groups and message history.
+      </p>
+      <label class="field">
+        <span>Id</span>
+        <input id="restore-id" type="text" spellcheck="false">
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input id="restore-password" type="password" autocomplete="current-password">
+      </label>
+      <button type="button" id="restore" class="primary">Sign in</button>
+    </section>
+
+    <p id="account-status" class="status" hidden></p>
+    <button type="button" id="close-account" class="ghost">Close</button>
+  </dialog>
 
   <!-- Device linking. Both halves of the flow in one dialog, because the user is
        holding one device and looking at the other.

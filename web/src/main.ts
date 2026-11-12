@@ -1,5 +1,4 @@
 ﻿/**
-void main();
  * The web client's DOM layer.
  *
  * Deliberately thin: [ChatApp] owns every decision worth testing, and this file
@@ -9,6 +8,7 @@ void main();
 
 import { ChatApp } from "./app.js";
 import { SessionState } from "./engine.js";
+import { checkPassword, describeStrength } from "./account.js";
 import { drawQr, encodeQr } from "./qr.js";
 import { encodeSelection, parseSelection, type Selection } from "./selection.js";
 
@@ -77,6 +77,24 @@ const issuedCredential = $<HTMLTextAreaElement>("issued-credential");
 const linkStatus = $<HTMLParagraphElement>("link-status");
 const closeLink = $<HTMLButtonElement>("close-link");
 
+// ---- Accounts ----
+
+const openAccount = $<HTMLButtonElement>("open-account");
+const accountDialog = $<HTMLDialogElement>("account-dialog");
+const tabRegister = $<HTMLButtonElement>("tab-register");
+const tabRestore = $<HTMLButtonElement>("tab-restore");
+const paneRegister = $<HTMLElement>("pane-register");
+const paneRestore = $<HTMLElement>("pane-restore");
+const registerPassword = $<HTMLInputElement>("register-password");
+const registerPassword2 = $<HTMLInputElement>("register-password2");
+const passwordStrength = $<HTMLParagraphElement>("password-strength");
+const registerButton = $<HTMLButtonElement>("register");
+const restoreId = $<HTMLInputElement>("restore-id");
+const restorePassword = $<HTMLInputElement>("restore-password");
+const restoreButton = $<HTMLButtonElement>("restore");
+const accountStatus = $<HTMLParagraphElement>("account-status");
+const closeAccount = $<HTMLButtonElement>("close-account");
+
 /** The conversation on screen. Kept beside the parser so the two agree. */
 let selected: Selection | null = null;
 
@@ -98,9 +116,17 @@ async function main(): Promise<void> {
 
   app.subscribe(render);
 
-  // The relay URL and id are conveniences, not secrets; remembering them makes
+  // The relay address and id are conveniences, not secrets; remembering them makes
   // a reload less annoying without storing anything that matters.
-  relayUrl.value = localStorage.getItem("veil.relay") ?? relayUrl.value;
+  //
+  // The fallback is derived from the page's own origin rather than hard-coded.
+  // A built-in `ws://127.0.0.1:8080/ws` means a page served from anywhere other
+  // than a developer's machine tries to connect to the visitor's own computer,
+  // which fails in a way that looks like the deployment is broken. Whatever host
+  // served this page is the host running the relay: they are one origin by
+  // design, which is what the CSP and the origin allow-list both assume.
+  relayUrl.value =
+    localStorage.getItem("veil.relay") ?? defaultRelayUrl();
   userId.value = localStorage.getItem("veil.userId") ?? "";
 
   render();
@@ -615,5 +641,104 @@ function fromBase64(text: string): Uint8Array | null {
     return null;
   }
 }
+
+/**
+ * The relay that served this page.
+ *
+ * Derived rather than hard-coded: the page and the relay share one origin by
+ * design, so whatever host delivered the HTML is the host with the websocket. A
+ * literal address only works on the machine it was written for, and fails on
+ * every other one in a way that looks like a server problem.
+ *
+ * `ws:` versus `wss:` follows the page's own scheme, because a secure page cannot
+ * open an insecure socket - the browser blocks it as mixed content, and the
+ * failure is easy to miss.
+ */
+function defaultRelayUrl(): string {
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${location.host}/ws`;
+}
+
+// ---- Accounts ---------------------------------------------------------
+
+function showAccountStatus(text: string | null): void {
+  accountStatus.hidden = text === null;
+  accountStatus.textContent = text ?? "";
+}
+
+function selectAccountTab(create: boolean): void {
+  paneRegister.hidden = !create;
+  paneRestore.hidden = create;
+  tabRegister.classList.toggle("selected", create);
+  tabRestore.classList.toggle("selected", !create);
+  showAccountStatus(null);
+}
+
+openAccount.addEventListener("click", () => {
+  restoreId.value = userId.value.trim();
+  accountDialog.showModal();
+  selectAccountTab(true);
+});
+
+closeAccount.addEventListener("click", () => accountDialog.close());
+tabRegister.addEventListener("click", () => selectAccountTab(true));
+tabRestore.addEventListener("click", () => selectAccountTab(false));
+
+// The strength line is the only feedback a user gets on the one thing that
+// matters, so it updates as they type rather than on submit.
+registerPassword.addEventListener("input", () => {
+  const password = registerPassword.value;
+  const problem = checkPassword(password);
+  passwordStrength.textContent = problem ?? `strength: ${describeStrength(password)}`;
+  passwordStrength.style.color = problem ? "var(--danger, #c62828)" : "";
+});
+
+registerButton.addEventListener("click", () => {
+  const password = registerPassword.value;
+
+  if (password !== registerPassword2.value) {
+    showAccountStatus("the two passwords do not match");
+    return;
+  }
+
+  const problem = checkPassword(password);
+  if (problem) {
+    showAccountStatus(problem);
+    return;
+  }
+
+  showAccountStatus("deriving the key (this takes a moment)...");
+
+  void app.createAccount(password).then((error) => {
+    showAccountStatus(error ?? "account created");
+    if (!error) {
+      registerPassword.value = "";
+      registerPassword2.value = "";
+      passwordStrength.textContent = "";
+    }
+  });
+});
+
+restoreButton.addEventListener("click", () => {
+  const id = restoreId.value.trim();
+  if (!id) {
+    showAccountStatus("enter the id to restore");
+    return;
+  }
+
+  showAccountStatus("deriving the key (this takes a moment)...");
+
+  void app.restoreAccount(id, restorePassword.value).then((error) => {
+    showAccountStatus(error ?? "signed in");
+
+    if (!error) {
+      userId.value = id;
+      restorePassword.value = "";
+      // The restored identity is now this browser's; connecting with it is the
+      // next step and the user should see that it is available.
+      render();
+    }
+  });
+});
 
 void main();

@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -662,9 +662,183 @@ func (c *client) handle(data []byte) error {
 		return c.handlePublishDevices(payload)
 	case typeGetDevices:
 		return c.handleGetDevices(payload)
+	case typePutVault:
+		return c.handlePutVault(payload)
+	case typeGetVault:
+		return c.handleGetVault(payload)
 	default:
 		return errUnknownType
 	}
+}
+
+// ---- Password vaults ---------------------------------------------------
+//
+// A vault is the only thing a client can use before authenticating, because a
+// client restoring its identity has no key to sign a challenge with yet. That is
+// not a hole: the vault is sealed under a key derived from a password the relay
+// never sees, so reading it without the password yields nothing.
+//
+// What the relay *does* learn, and the price of this feature:
+//
+//   - that a user id exists, before they ever connect;
+//   - roughly how much data they keep;
+//   - when they last wrote, because a write carries a timestamp.
+//
+// It does not learn the password, the identity, or anything about who they talk
+// to beyond what the outbox already showed.
+
+// maxVaultBlob is the vault ceiling, expressed in terms of the transport's.
+//
+// It used to be a flat 4 MiB, which is *larger* than maxPayload - so the check
+// could never fire, and a 4 MiB vault would have been refused by the frame codec
+// with an error that says nothing about vaults. Deriving it from the transport
+// limit keeps the two consistent by construction: a test asserts the relationship
+// rather than a comment claiming it.
+const maxVaultBlob = maxPayload - 1024  // room for the salt, params and lengths
+
+// handlePutVault stores a sealed vault.
+//
+// Payload: [str] user | [blob] salt | [4] memory | [4] passes | [4] lanes
+//          | [blob] blob
+func (c *client) handlePutVault(payload []byte) error {
+	r := reader{buf: payload}
+
+	userID, err := r.str()
+	if err != nil {
+		return err
+	}
+	if userID == "" || len(userID) > 128 {
+		return errBadUserID
+	}
+
+	// An authenticated connection may only write its own vault; an unauthenticated
+	// one is writing for the first time and has nothing to authenticate with yet.
+	if c.userID != "" && c.userID != userID {
+		c.hub.log.Warn("vault write for another account refused",
+			"authenticated", c.userID, "claimed", userID)
+		c.hub.statRejected.Add(1)
+		return errForeignAccount
+	}
+
+	salt, err := r.blob()
+	if err != nil {
+		return err
+	}
+	memory, err := r.u32()
+	if err != nil {
+		return err
+	}
+	passes, err := r.u32()
+	if err != nil {
+		return err
+	}
+	lanes, err := r.u32()
+	if err != nil {
+		return err
+	}
+	blob, err := r.blob()
+	if err != nil {
+		return err
+	}
+	if !r.done() {
+		return errTruncated
+	}
+
+	// Bounds on the KDF parameters. A client asking for an absurd memory cost is
+	// not this relay's problem to pay for, but a client asking for *too little* is
+	// weakening its own vault - and the relay is the one place that can refuse
+	// without knowing the password.
+	if len(salt) < 8 || len(salt) > 64 {
+		return errBadVault
+	}
+	if memory < 8*lanes || memory > 256*1024 {
+		return errBadVault
+	}
+	if passes < 1 || passes > 10 {
+		return errBadVault
+	}
+	if lanes < 1 || lanes > 8 {
+		return errBadVault
+	}
+	if len(blob) == 0 || len(blob) > maxVaultBlob {
+		return errBadVault
+	}
+
+	generation, err := c.hub.store.PutVault(userID, VaultRecord{
+		Salt:      append([]byte(nil), salt...),
+		MemoryKiB: memory,
+		Passes:    passes,
+		Lanes:     lanes,
+		Blob:      append([]byte(nil), blob...),
+	})
+	if err != nil {
+		return err
+	}
+
+	c.hub.log.Info("vault written", "user", userID,
+		"bytes", len(blob), "generation", generation)
+
+	var w writer
+	w.u32(generation)
+	env, err := frame(typeVaultAck, w.bytes())
+	if err != nil {
+		return err
+	}
+	c.enqueue(env)
+	return nil
+}
+
+// handleGetVault returns a sealed vault for a client restoring its identity.
+//
+// Payload: [str] user
+// Reply:   [blob] salt | [4] memory | [4] passes | [4] lanes
+//          | [4] generation | [blob] blob
+func (c *client) handleGetVault(payload []byte) error {
+	r := reader{buf: payload}
+
+	userID, err := r.str()
+	if err != nil {
+		return err
+	}
+	if !r.done() {
+		return errTruncated
+	}
+
+	record, err := c.hub.store.GetVault(userID)
+	if err != nil {
+		return err
+	}
+	if record == nil {
+		// Not an error the client needs to see as one: "no vault" is the normal
+		// state of a user that never set a password, and a client falls back to
+		// creating a local identity.
+		return errNoVault
+	}
+
+	// A vault fetch is the one pre-authentication read that could be used to probe
+	// for which user ids exist. Rate-limiting it does not stop that - a patient
+	// attacker enumerates anyway - but it stops a fast one, and the same limiter
+	// the send path uses is already per connection.
+	if !c.limit.allow() {
+		c.hub.statRejected.Add(1)
+		c.hub.log.Warn("vault read rate limited", "user", userID)
+		return errRateLimited
+	}
+
+	var w writer
+	w.blob(record.Salt)
+	w.u32(record.MemoryKiB)
+	w.u32(record.Passes)
+	w.u32(record.Lanes)
+	w.u32(record.Generation)
+	w.blob(record.Blob)
+
+	env, err := frame(typeVaultData, w.bytes())
+	if err != nil {
+		return err
+	}
+	c.enqueue(env)
+	return nil
 }
 
 // handlePublishDevices stores an account's device list.

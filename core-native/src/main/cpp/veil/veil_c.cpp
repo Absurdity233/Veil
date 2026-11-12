@@ -1,4 +1,4 @@
-// Veil - C ABI implementation.
+﻿// Veil - C ABI implementation.
 //
 // A thin, careful wrapper. Two things in here deserve attention:
 //
@@ -1069,4 +1069,21 @@ extern "C" void veil_note_device_list_fetched(void* handle, const char* user_id)
     std::string id;
     if (!readPeer(user_id, id)) return;
     engine->noteDeviceListFetched(id);
+}
+
+extern "C" int veil_argon2id(uint8_t* out, size_t out_size,
+                            const uint8_t* password, size_t password_size,
+                            const uint8_t* salt, size_t salt_size,
+                            uint32_t memory_kib, uint32_t passes, uint32_t lanes) {
+    if (out == nullptr || password == nullptr || salt == nullptr) return VEIL_ERR_NULL_ARG;
+
+    veil::crypto::Argon2Params params;
+    params.memory_kib = memory_kib;
+    params.passes = passes;
+    params.lanes = lanes;
+
+    return veil::crypto::argon2id(out, out_size, password, password_size,
+                                  salt, salt_size, params)
+               ? 0
+               : VEIL_ERR_BAD_PARAM;
 }

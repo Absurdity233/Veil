@@ -12,6 +12,7 @@ ciphertext it holds no key for.
 [Architecture](docs/architecture.md) ·
 [Protocol](docs/protocol.md) ·
 [Threat model](docs/threat-model.md) ·
+[Accounts](docs/accounts.md) ·
 [Multi-device](docs/multi-device.md) ·
 [Groups](docs/group.md) ·
 [Building](docs/building.md) ·
@@ -171,9 +172,17 @@ Android has both the group screens and the device-linking dialog; the web client
 has groups; the desktop has groups. Device linking is text-based (a base64 request
 and credential copied between devices) and currently only has a screen on Android.
 
-**Not implemented at all:** push notifications, account recovery, camera-based QR
-scanning (the web client shows a QR; nothing scans one yet), and history transfer
-to a newly linked device.
+**Not implemented at all:** push notifications, camera-based QR scanning (the web
+client shows a QR; nothing scans one yet), password change, and accounts on
+Android and desktop (the derivation and the vault protocol are there; only the web
+client has the screens).
+
+**One deliberate trust assumption:** an optional account password stores a sealed
+vault on the relay so an identity can be restored on another device. The relay
+holds a blob sealed under Argon2id and cannot open or verify it — but a stolen
+database becomes an offline attack on the password, which is why its length is
+enforced rather than suggested. [Accounts](docs/accounts.md) states the cost in
+full, including the metadata the relay learns.
 
 The designs, and the honest account of what is missing from each, are in
 [Multi-device](docs/multi-device.md) and [Groups](docs/group.md).

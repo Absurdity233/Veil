@@ -476,6 +476,16 @@ VEIL_API void veil_note_send_failed(void* handle, const char* user_id);
 // Marks the list fresh, after a successful adoptDeviceList.
 VEIL_API void veil_note_device_list_fetched(void* handle, const char* user_id);
 
+// ---- Password key derivation --------------------------------------------
+//
+// Argon2id, for the vault feature. The password never leaves the caller: what
+// goes to a server is ciphertext under the derived key, so the server cannot
+// verify a password because it never receives one.
+VEIL_API int veil_argon2id(uint8_t* out, size_t out_size,
+                           const uint8_t* password, size_t password_size,
+                           const uint8_t* salt, size_t salt_size,
+                           uint32_t memory_kib, uint32_t passes, uint32_t lanes);
+
 }  // extern "C"
 #endif
 

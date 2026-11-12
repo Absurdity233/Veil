@@ -1872,7 +1872,7 @@ section("groups: out-of-order and skipped keys");
 section("groups survive a restart");
     {
         // Without this, a restart silently drops every group and a member can no
-        // longer read anything sent to a group they are still in — which looks
+        // longer read anything sent to a group they are still in 鈥?which looks
         // exactly like having been removed.
         Engine alice, bob;
         alice.createIdentity(); alice.initDevice("alice");
@@ -1981,7 +1981,7 @@ section("group state rejects a malformed blob");
             if (target.importGroupState(bad.data(), bad.size())) ++accepted;
         }
         // A bit flip inside a chain key or a skipped key is a valid blob and is
-        // legitimately accepted — that is a wrong key, not a malformed one, and
+        // legitimately accepted 鈥?that is a wrong key, not a malformed one, and
         // the MAC catches it later. What must not happen is a crash.
         check(accepted < static_cast<int>(good.size()),
               "not every mutation is accepted");
@@ -2288,6 +2288,141 @@ section("device list refresh has three triggers and no timer");
             check(multi.deviceListNeedsRefresh("erin", 60'000) ==
                       Engine::RefreshSendFailed,
                   "and the send failure asks for a refresh");
+        }
+    }
+
+section("password derived keys");
+    {
+        // Argon2id turns a password into an encryption key. The password never
+        // leaves the device: what a server stores is the output, encrypted under
+        // this key, so the server cannot verify a password because it never sees
+        // one.
+        //
+        // These run at a deliberately small memory cost: the production setting is
+        // 64 MiB and would make the suite slow, and what needs testing is the
+        // plumbing rather than the cost.
+        crypto::Argon2Params fast;
+        fast.memory_kib = 64;
+        fast.passes = 2;
+        fast.lanes = 1;
+
+        const uint8_t password[] = {'c','o','r','r','e','c','t','-','h','o','r','s','e'};
+        const uint8_t salt[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+
+        uint8_t key1[32], key2[32];
+        check(crypto::argon2id(key1, sizeof(key1), password, sizeof(password),
+                               salt, sizeof(salt), fast),
+              "a key is derived");
+        check(crypto::argon2id(key2, sizeof(key2), password, sizeof(password),
+                               salt, sizeof(salt), fast),
+              "and again");
+        check(constant_time_equal(key1, key2, 32),
+              "the same inputs give the same key");
+
+        // ---- Every input matters ----
+        {
+            uint8_t other_salt[16];
+            std::memcpy(other_salt, salt, 16);
+            other_salt[0] ^= 1;
+
+            uint8_t different[32];
+            check(crypto::argon2id(different, sizeof(different), password,
+                                   sizeof(password), other_salt, sizeof(other_salt), fast),
+                  "a different salt derives");
+            check(!constant_time_equal(key1, different, 32),
+                  "a different salt gives a different key");
+        }
+
+        {
+            uint8_t wrong[] = {'c','o','r','r','e','c','t','-','h','o','r','s','E'};
+            uint8_t different[32];
+            check(crypto::argon2id(different, sizeof(different), wrong, sizeof(wrong),
+                                   salt, sizeof(salt), fast),
+                  "a wrong password derives");
+            check(!constant_time_equal(key1, different, 32),
+                  "a one-character difference gives a different key");
+        }
+
+        {
+            // The cost parameters are part of the derivation: a system that later
+            // raises them must not silently accept old blobs, so the difference
+            // has to be observable.
+            crypto::Argon2Params louder = fast;
+            louder.passes = 3;
+
+            uint8_t different[32];
+            check(crypto::argon2id(different, sizeof(different), password,
+                                   sizeof(password), salt, sizeof(salt), louder),
+                  "a higher cost derives");
+            check(!constant_time_equal(key1, different, 32),
+                  "a different cost gives a different key");
+        }
+
+        // ---- A weak salt is refused ----
+        // A four-byte salt would let one precomputation attack every account that
+        // shares it.
+        {
+            uint8_t weak_salt[4] = {1,2,3,4};
+            uint8_t out[32];
+            check(!crypto::argon2id(out, sizeof(out), password, sizeof(password),
+                                    weak_salt, sizeof(weak_salt), fast),
+                  "a salt under 8 bytes is refused");
+        }
+
+        // ---- Parameters this build cannot honour are refused, not downgraded ----
+        // A caller that asked for 1 GiB and quietly got 64 MiB would believe its
+        // ciphertext was stronger than it is.
+        {
+            crypto::Argon2Params absurd;
+            absurd.memory_kib = crypto::kArgon2MaxMemoryKiB * 4;
+            uint8_t out[32];
+            check(!crypto::argon2id(out, sizeof(out), password, sizeof(password),
+                                    salt, sizeof(salt), absurd),
+                  "a memory cost above the supported maximum is refused");
+
+            crypto::Argon2Params zero_passes = fast;
+            zero_passes.passes = 0;
+            check(!crypto::argon2id(out, sizeof(out), password, sizeof(password),
+                                    salt, sizeof(salt), zero_passes),
+                  "zero passes is refused");
+
+            crypto::Argon2Params no_memory = fast;
+            no_memory.memory_kib = 0;
+            check(!crypto::argon2id(out, sizeof(out), password, sizeof(password),
+                                    salt, sizeof(salt), no_memory),
+                  "zero memory is refused");
+        }
+
+        // ---- The output feeds AEAD, which is what it is for ----
+        {
+            uint8_t nonce[kNonceSize] = {};
+            uint8_t cipher[32 + kMacSize];
+            const uint8_t plain[32] = {'s','e','c','r','e','t'};
+
+            crypto::aead_encrypt(cipher, cipher + 32, key1, nonce, nullptr, 0, plain, 32);
+
+            uint8_t recovered[32];
+            check(crypto::aead_decrypt(recovered, cipher + 32, key1, nonce,
+                                       nullptr, 0, cipher, 32),
+                  "the derived key decrypts what it encrypted");
+            check(std::memcmp(recovered, plain, 32) == 0, "and gives the same bytes");
+
+            // A wrong key does not decrypt. This uses a genuinely different key -
+            // key2 is the same inputs and would succeed, which is what the earlier
+            // determinism check established.
+            uint8_t other_password[] = {'w','r','o','n','g','-','h','o','r','s','e'};
+            uint8_t wrong_key[32];
+            check(crypto::argon2id(wrong_key, sizeof(wrong_key),
+                                   other_password, sizeof(other_password),
+                                   salt, sizeof(salt), fast),
+                  "a key from a different password derives");
+            check(!crypto::aead_decrypt(recovered, cipher + 32, wrong_key, nonce,
+                                        nullptr, 0, cipher, 32),
+                  "a different key does not decrypt");
+
+            veil::wipe(key1, sizeof(key1));
+            veil::wipe(key2, sizeof(key2));
+            veil::wipe(wrong_key, sizeof(wrong_key));
         }
     }
 

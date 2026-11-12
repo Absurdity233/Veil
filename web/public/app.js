@@ -31,6 +31,110 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   mod
 ));
 
+// src/crypto.ts
+function attachCrypto(module) {
+  wasm = module;
+}
+function requireWasm() {
+  if (!wasm) {
+    throw new Error("crypto: the engine is not loaded yet");
+  }
+  return wasm;
+}
+function randomBytes(length) {
+  const out = new Uint8Array(length);
+  crypto.getRandomValues(out);
+  return out;
+}
+async function argon2id(password, salt, params) {
+  const mod = requireWasm();
+  const outSize = 32;
+  const out = mod._malloc(outSize);
+  const passwordPtr = mod._malloc(password.length || 1);
+  const saltPtr = mod._malloc(salt.length || 1);
+  if (!out || !passwordPtr || !saltPtr) {
+    mod._free(out);
+    mod._free(passwordPtr);
+    mod._free(saltPtr);
+    throw new Error("crypto: out of memory");
+  }
+  try {
+    if (password.length) mod.HEAPU8.set(password, passwordPtr);
+    if (salt.length) mod.HEAPU8.set(salt, saltPtr);
+    const status = mod._veil_argon2id(
+      out,
+      outSize,
+      passwordPtr,
+      password.length,
+      saltPtr,
+      salt.length,
+      params.memoryKiB,
+      params.passes,
+      params.lanes
+    );
+    if (status !== 0) {
+      throw new Error(
+        `crypto: argon2id refused its parameters (status ${status})`
+      );
+    }
+    return mod.HEAPU8.slice(out, out + outSize);
+  } finally {
+    mod._free(out);
+    mod._free(passwordPtr);
+    mod._free(saltPtr);
+  }
+}
+async function sealAead(key, plain, aad) {
+  const cryptoKey = await importAesKey(key, "encrypt");
+  const nonce = randomBytes(12);
+  const sealed = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: nonce,
+      ...aad ? { additionalData: aad } : {}
+    },
+    cryptoKey,
+    plain
+  );
+  const out = new Uint8Array(12 + sealed.byteLength);
+  out.set(nonce, 0);
+  out.set(new Uint8Array(sealed), 12);
+  return out;
+}
+async function openAead(key, sealed, aad) {
+  if (sealed.length < 12 + 16) return null;
+  const nonce = sealed.slice(0, 12);
+  const body = sealed.slice(12);
+  try {
+    const cryptoKey = await importAesKey(key, "decrypt");
+    const plain = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: nonce,
+        ...aad ? { additionalData: aad } : {}
+      },
+      cryptoKey,
+      body
+    );
+    return new Uint8Array(plain);
+  } catch {
+    return null;
+  }
+}
+async function importAesKey(raw, usage) {
+  if (raw.length !== 32) {
+    throw new Error("crypto: an AES-256 key must be 32 bytes");
+  }
+  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, [usage]);
+}
+var wasm;
+var init_crypto = __esm({
+  "src/crypto.ts"() {
+    "use strict";
+    wasm = null;
+  }
+});
+
 // src/engine.ts
 var engine_exports = {};
 __export(engine_exports, {
@@ -39,10 +143,16 @@ __export(engine_exports, {
   Status: () => Status,
   VeilEngine: () => VeilEngine
 });
+function resolveModuleUrl(specifier) {
+  const base = typeof document !== "undefined" && document.baseURI ? document.baseURI : void 0;
+  if (base === void 0) return specifier;
+  return new URL(specifier, base).href;
+}
 var Status, RefreshReason, SessionState, utf8, VeilEngine;
 var init_engine = __esm({
   "src/engine.ts"() {
     "use strict";
+    init_crypto();
     Status = {
       OK: 0,
       BAD_BUNDLE: 1,
@@ -81,7 +191,7 @@ var init_engine = __esm({
       /**
        * Loads the module.
        *
-       * `wasmUrl` is a URL the page can fetch 鈥?in the browser it is a relative
+       * `wasmUrl` is a URL the page can fetch 閳?in the browser it is a relative
        * path that resolves against the document. `jsUrl` is where the Emscripten
        * glue lives, and is separate because the two play different games: the glue
        * is an ES module import (so it must be a real specifier), while the .wasm is
@@ -93,13 +203,18 @@ var init_engine = __esm({
         const jsUrl = options.jsUrl ?? wasmUrl.replace(/\.wasm$/, ".js");
         const factory = (await import(
           /* @vite-ignore */
-          jsUrl
+          resolveModuleUrl(jsUrl)
         )).default;
         const mod = await factory({
           // Node cannot fetch a file:// URL, so a runner may hand the bytes in
           // directly. In a browser this is undefined and the module fetches.
           ...options.wasmBinary ? { wasmBinary: options.wasmBinary } : {},
-          locateFile: (path) => path.endsWith(".wasm") ? wasmUrl : path,
+          locateFile: (path) => (
+            // Emscripten fetches this itself. A relative path would resolve against
+            // whatever it considers the base, which is not necessarily the document;
+            // resolving it here makes both halves of the module agree.
+            path.endsWith(".wasm") ? resolveModuleUrl(wasmUrl) : path
+          ),
           print: () => {
           },
           printErr: () => {
@@ -112,6 +227,7 @@ var init_engine = __esm({
         }
         mod._veil_install_web_rng();
         _VeilEngine.module = mod;
+        attachCrypto(mod);
       }
       /** The ABI version, so a stale .wasm is loud rather than subtle. */
       static version() {
@@ -2945,6 +3061,119 @@ var require_browser = __commonJS({
   }
 });
 
+// src/account.ts
+init_crypto();
+var MIN_PASSWORD_LENGTH = 12;
+var KDF_MEMORY_KIB = 64 * 1024;
+var KDF_PASSES = 3;
+var KDF_LANES = 2;
+var SALT_SIZE = 16;
+function checkPassword(password) {
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return `at least ${MIN_PASSWORD_LENGTH} characters: this password is the only thing protecting the account, because the server cannot check it for you`;
+  }
+  return null;
+}
+function describeStrength(password) {
+  if (password.length < MIN_PASSWORD_LENGTH) return "too short";
+  const classes = (/[a-z]/.test(password) ? 1 : 0) + (/[A-Z]/.test(password) ? 1 : 0) + (/[0-9]/.test(password) ? 1 : 0) + (/[^a-zA-Z0-9]/.test(password) ? 1 : 0);
+  const unique = new Set(password).size;
+  const variety = unique / password.length;
+  if (variety < 0.3) return "weak: too repetitive";
+  if (password.length >= 20 && classes >= 3) return "strong";
+  if (password.length >= 16 || classes >= 3) return "reasonable";
+  return "weak: add length or variety";
+}
+async function deriveVaultKey(password, salt, params = {
+  memoryKiB: KDF_MEMORY_KIB,
+  passes: KDF_PASSES,
+  lanes: KDF_LANES
+}) {
+  const encoder = new TextEncoder();
+  return argon2id(encoder.encode(password), salt, params);
+}
+async function sealVault(contents, password, params = {
+  memoryKiB: KDF_MEMORY_KIB,
+  passes: KDF_PASSES,
+  lanes: KDF_LANES
+}) {
+  const salt = randomBytes(SALT_SIZE);
+  const key = await deriveVaultKey(password, salt, params);
+  try {
+    const plain = encodeContents(contents);
+    const ciphertext = await sealAead(key, plain);
+    return {
+      salt,
+      memoryKiB: params.memoryKiB,
+      passes: params.passes,
+      lanes: params.lanes,
+      generation: 0,
+      ciphertext
+    };
+  } finally {
+    key.fill(0);
+  }
+}
+async function openVault(vault, password) {
+  const key = await deriveVaultKey(password, vault.salt, {
+    memoryKiB: vault.memoryKiB,
+    passes: vault.passes,
+    lanes: vault.lanes
+  });
+  try {
+    const plain = await openAead(key, vault.ciphertext);
+    return plain === null ? null : decodeContents(plain);
+  } finally {
+    key.fill(0);
+  }
+}
+function encodeContents(contents) {
+  const parts = [];
+  const putBlob = (bytes) => {
+    const length = bytes?.length ?? 0;
+    const head = new Uint8Array(4);
+    new DataView(head.buffer).setUint32(0, length, false);
+    parts.push(head);
+    if (bytes) parts.push(bytes);
+  };
+  putBlob(contents.identity);
+  putBlob(contents.preKeyState);
+  putBlob(contents.peerRegistry);
+  putBlob(contents.groupState);
+  putBlob(new TextEncoder().encode(JSON.stringify(contents.history)));
+  return concat(parts);
+}
+function decodeContents(plain) {
+  let offset = 0;
+  const readBlob = () => {
+    if (plain.length - offset < 4) throw new Error("vault is truncated");
+    const length = new DataView(plain.buffer, plain.byteOffset + offset, 4).getUint32(0, false);
+    offset += 4;
+    if (plain.length - offset < length) throw new Error("vault is truncated");
+    const out = plain.slice(offset, offset + length);
+    offset += length;
+    return length === 0 ? null : out;
+  };
+  const identity = readBlob();
+  if (!identity) throw new Error("vault has no identity");
+  const preKeyState = readBlob();
+  const peerRegistry = readBlob();
+  const groupState = readBlob();
+  const historyJson = readBlob();
+  const history = historyJson ? JSON.parse(new TextDecoder().decode(historyJson)) : {};
+  return { identity, preKeyState, peerRegistry, groupState, history };
+}
+function concat(parts) {
+  const total = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
 // src/app.ts
 init_engine();
 
@@ -2966,7 +3195,13 @@ var FrameType = {
   // Device lists. See docs/multi-device.md.
   PUBLISH_DEVICES: 13,
   GET_DEVICES: 14,
-  DEVICES: 15
+  DEVICES: 15,
+  // Password vaults. The only types usable before authenticating: restoring an
+  // identity is exactly the case where a client has nothing to sign with yet.
+  PUT_VAULT: 16,
+  GET_VAULT: 17,
+  VAULT_DATA: 18,
+  VAULT_ACK: 19
 };
 var MAX_PAYLOAD = 1 << 20;
 function frame(type, payload) {
@@ -3092,6 +3327,12 @@ var RelayClient = class {
   // a page that will eventually get it wrong.
   bundleWaiters = /* @__PURE__ */ new Map();
   deviceWaiters = /* @__PURE__ */ new Map();
+  // Vault requests have no correlation field on the wire: the reply does not
+  // repeat the user id, because the relay answers the connection that asked. So
+  // put and get get their own maps rather than sharing one and guessing at a
+  // suffixed key.
+  vaultPutWaiters = /* @__PURE__ */ new Map();
+  vaultGetWaiters = /* @__PURE__ */ new Map();
   get isConnected() {
     return this.connected && this.socket !== null && !this.closed;
   }
@@ -3223,6 +3464,25 @@ var RelayClient = class {
           if (waiter) waiter({ version, devices });
           break;
         }
+        case FrameType.VAULT_ACK: {
+          const generation = r.u32();
+          const waiter = this.vaultPutWaiters.values().next().value;
+          if (waiter) waiter(generation);
+          break;
+        }
+        case FrameType.VAULT_DATA: {
+          const salt = r.blob();
+          const memoryKiB = r.u32();
+          const passes = r.u32();
+          const lanes = r.u32();
+          const generation = r.u32();
+          const ciphertext = r.blob();
+          const waiter = this.vaultGetWaiters.values().next().value;
+          if (waiter) {
+            waiter({ salt, memoryKiB, passes, lanes, generation, ciphertext });
+          }
+          break;
+        }
         case FrameType.ERROR:
           this.emit({ kind: "failed", message: r.string() });
           break;
@@ -3314,6 +3574,44 @@ var RelayClient = class {
   }
   acknowledge(outboxId) {
     return this.send(FrameType.ACK, new Writer().u64(outboxId).build());
+  }
+  // ---- Password vault ---------------------------------------------------
+  //
+  // The only requests a client may make before authenticating, because restoring
+  // an identity is exactly the case where it has nothing to authenticate with
+  // yet. The relay stores a blob it cannot open.
+  /** Uploads a sealed vault. Resolves with the generation the relay assigned. */
+  putVault(userId2, salt, params, ciphertext, timeoutMs = 2e4) {
+    const payload = new Writer().string(userId2).blob(salt).u32(params.memoryKiB).u32(params.passes).u32(params.lanes).blob(ciphertext).build();
+    if (!this.send(FrameType.PUT_VAULT, payload)) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.vaultPutWaiters.delete(userId2);
+        resolve(null);
+      }, timeoutMs);
+      this.vaultPutWaiters.set(userId2, (generation) => {
+        clearTimeout(timer);
+        this.vaultPutWaiters.delete(userId2);
+        resolve(generation);
+      });
+    });
+  }
+  /** Fetches a sealed vault, or null when the user has none. */
+  getVault(userId2, timeoutMs = 2e4) {
+    if (!this.send(FrameType.GET_VAULT, new Writer().string(userId2).build())) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.vaultGetWaiters.delete(userId2);
+        resolve(null);
+      }, timeoutMs);
+      this.vaultGetWaiters.set(userId2, (reply) => {
+        clearTimeout(timer);
+        this.vaultGetWaiters.delete(userId2);
+        resolve(reply);
+      });
+    });
   }
   send(type, payload) {
     if (!this.connected || this.closed) return false;
@@ -4198,11 +4496,112 @@ var ChatApp = class {
   async adoptLinking(credential, accountDhPub, accountSignPub) {
     return this.adoptDeviceCredential(credential, accountDhPub, accountSignPub);
   }
+  // ---- Accounts ---------------------------------------------------------
+  //
+  // A password that lets the identity be restored on another device. What goes
+  // over the wire is a blob sealed under a key derived from it, so the relay
+  // cannot verify the password and cannot open the vault.
+  /**
+   * Uploads this client's whole state, sealed under the password.
+   *
+   * Requires a connection: the vault lives on the relay, which is the point -
+   * another device has to be able to reach it.
+   */
+  async createAccount(password) {
+    const engine = this.engine;
+    const relay = this.relay;
+    if (!engine) return "the engine is not loaded";
+    if (!relay || !relay.isConnected) return "connect before creating an account";
+    if (!this.selfUserId) return "connect with an id first";
+    const problem = checkPassword(password);
+    if (problem) return problem;
+    const contents = {
+      identity: engine.identitySecrets(),
+      preKeyState: engine.exportPreKeyState(),
+      peerRegistry: engine.exportPeerRegistry(),
+      groupState: engine.exportGroupState(),
+      history: this.collectHistory()
+    };
+    const sealed = await sealVault(contents, password);
+    const generation = await relay.putVault(
+      this.selfUserId,
+      sealed.salt,
+      { memoryKiB: sealed.memoryKiB, passes: sealed.passes, lanes: sealed.lanes },
+      sealed.ciphertext
+    );
+    contents.identity.fill(0);
+    if (generation === null) return "the relay did not accept the vault";
+    this.setStatus(
+      `account stored (generation ${generation}): sign in with this password on another device to restore it`
+    );
+    return null;
+  }
+  /**
+   * Restores this client's state from the vault, and adopts it.
+   *
+   * A wrong password fails to open the vault, which is the only check available:
+   * there is no password hash to compare against, and a wrong key simply fails to
+   * authenticate the ciphertext.
+   */
+  async restoreAccount(userId2, password) {
+    const relay = this.relay;
+    if (!relay || !relay.isConnected) return "connect before signing in";
+    const vault = await relay.getVault(userId2);
+    if (!vault) return `no account stored for ${userId2}`;
+    const contents = await openVault(
+      {
+        salt: vault.salt,
+        memoryKiB: vault.memoryKiB,
+        passes: vault.passes,
+        lanes: vault.lanes,
+        generation: vault.generation,
+        ciphertext: vault.ciphertext
+      },
+      password
+    );
+    if (!contents) return "wrong password, or the stored account is damaged";
+    this.engine?.close();
+    this.engine = VeilEngine.restore(contents.identity);
+    await this.vault.storeIdentity(contents.identity);
+    contents.identity.fill(0);
+    if (contents.preKeyState) this.engine.importPreKeyState(contents.preKeyState);
+    if (contents.peerRegistry) this.engine.importPeerRegistry(contents.peerRegistry);
+    if (contents.groupState) this.engine.importGroupState(contents.groupState);
+    await this.vault.storePreKeyState(this.engine.exportPreKeyState() ?? new Uint8Array());
+    await this.vault.storeRegistry(this.engine.exportPeerRegistry() ?? new Uint8Array());
+    const groupState = this.engine.exportGroupState();
+    if (groupState) await this.vault.storeGroupState(groupState);
+    this.selfUserId = userId2;
+    await this.restorePeers();
+    await this.restoreGroups();
+    this.applyHistory(contents.history);
+    this.setStatus(`restored ${userId2} from the account store`);
+    this.notify();
+    return null;
+  }
+  /** Every conversation, for the vault. */
+  collectHistory() {
+    const out = {};
+    for (const [peerId, messages] of this.messages) out[peerId] = messages;
+    for (const [groupId, messages] of this.groupMessages) {
+      out[`group:${groupId}`] = messages;
+    }
+    return out;
+  }
+  applyHistory(history) {
+    for (const [key, value] of Object.entries(history)) {
+      if (key.startsWith("group:")) {
+        this.groupMessages.set(key.slice("group:".length), value);
+      } else {
+        this.messages.set(key, value);
+      }
+    }
+  }
   /**
    * Links this client to an existing account.
    *
    * The credential has to arrive over a channel that already authenticates the
-   * account 闁?the whole point is that a relay cannot issue one 闁?so this takes
+   * account 闂?the whole point is that a relay cannot issue one 闂?so this takes
    * an already-signed blob and verifies it against the account keys.
    */
   async adoptDeviceCredential(credential, accountDhPub, accountSignPub) {
@@ -4453,6 +4852,21 @@ var approveRequest = $("approve-request");
 var issuedCredential = $("issued-credential");
 var linkStatus = $("link-status");
 var closeLink = $("close-link");
+var openAccount = $("open-account");
+var accountDialog = $("account-dialog");
+var tabRegister = $("tab-register");
+var tabRestore = $("tab-restore");
+var paneRegister = $("pane-register");
+var paneRestore = $("pane-restore");
+var registerPassword = $("register-password");
+var registerPassword2 = $("register-password2");
+var passwordStrength = $("password-strength");
+var registerButton = $("register");
+var restoreId = $("restore-id");
+var restorePassword = $("restore-password");
+var restoreButton = $("restore");
+var accountStatus = $("account-status");
+var closeAccount = $("close-account");
 var selected = null;
 var STORAGE_KEY = "veil.selected";
 async function main() {
@@ -4465,7 +4879,7 @@ async function main() {
   versionLabel.textContent = `protocol engine ${await engineVersion()}`;
   restoreSelection();
   app.subscribe(render);
-  relayUrl.value = localStorage.getItem("veil.relay") ?? relayUrl.value;
+  relayUrl.value = localStorage.getItem("veil.relay") ?? defaultRelayUrl();
   userId.value = localStorage.getItem("veil.userId") ?? "";
   render();
 }
@@ -4834,4 +5248,70 @@ function fromBase64(text) {
     return null;
   }
 }
+function defaultRelayUrl() {
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${location.host}/ws`;
+}
+function showAccountStatus(text) {
+  accountStatus.hidden = text === null;
+  accountStatus.textContent = text ?? "";
+}
+function selectAccountTab(create) {
+  paneRegister.hidden = !create;
+  paneRestore.hidden = create;
+  tabRegister.classList.toggle("selected", create);
+  tabRestore.classList.toggle("selected", !create);
+  showAccountStatus(null);
+}
+openAccount.addEventListener("click", () => {
+  restoreId.value = userId.value.trim();
+  accountDialog.showModal();
+  selectAccountTab(true);
+});
+closeAccount.addEventListener("click", () => accountDialog.close());
+tabRegister.addEventListener("click", () => selectAccountTab(true));
+tabRestore.addEventListener("click", () => selectAccountTab(false));
+registerPassword.addEventListener("input", () => {
+  const password = registerPassword.value;
+  const problem = checkPassword(password);
+  passwordStrength.textContent = problem ?? `strength: ${describeStrength(password)}`;
+  passwordStrength.style.color = problem ? "var(--danger, #c62828)" : "";
+});
+registerButton.addEventListener("click", () => {
+  const password = registerPassword.value;
+  if (password !== registerPassword2.value) {
+    showAccountStatus("the two passwords do not match");
+    return;
+  }
+  const problem = checkPassword(password);
+  if (problem) {
+    showAccountStatus(problem);
+    return;
+  }
+  showAccountStatus("deriving the key (this takes a moment)...");
+  void app.createAccount(password).then((error) => {
+    showAccountStatus(error ?? "account created");
+    if (!error) {
+      registerPassword.value = "";
+      registerPassword2.value = "";
+      passwordStrength.textContent = "";
+    }
+  });
+});
+restoreButton.addEventListener("click", () => {
+  const id = restoreId.value.trim();
+  if (!id) {
+    showAccountStatus("enter the id to restore");
+    return;
+  }
+  showAccountStatus("deriving the key (this takes a moment)...");
+  void app.restoreAccount(id, restorePassword.value).then((error) => {
+    showAccountStatus(error ?? "signed in");
+    if (!error) {
+      userId.value = id;
+      restorePassword.value = "";
+      render();
+    }
+  });
+});
 void main();

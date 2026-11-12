@@ -20,4 +20,6 @@ var (
 	errBadDevices        = errors.New("malformed device list")
 	errForeignAccount    = errors.New("a connection may only publish its own device list")
 	errBadDeviceID       = errors.New("invalid device id")
+	errBadVault          = errors.New("malformed vault")
+	errNoVault           = errors.New("no vault stored for that user")
 )

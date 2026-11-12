@@ -86,6 +86,58 @@ void blake2b(uint8_t* out, size_t out_size,
     ::crypto_blake2b(out, out_size, message, message_size);
 }
 
+bool argon2id(uint8_t* out, size_t out_size,
+              const uint8_t* password, size_t password_size,
+              const uint8_t* salt, size_t salt_size,
+              const Argon2Params& params) {
+    if (out == nullptr || out_size == 0) return false;
+    if (password == nullptr || password_size == 0) return false;
+    // A short salt defeats the point: two accounts with the same password would
+    // derive the same key, and one precomputation would attack both.
+    if (salt == nullptr || salt_size < 8) return false;
+
+    // Refuse rather than silently downgrade. A caller that asked for parameters
+    // this build cannot honour would otherwise believe its ciphertext is stronger
+    // than it is, which is the one thing it cannot check for itself.
+    if (params.memory_kib < 8 * params.lanes) return false;
+    if (params.memory_kib > kArgon2MaxMemoryKiB) return false;
+    if (params.passes < 1) return false;
+    if (params.lanes < 1 || params.lanes > 255) return false;
+
+    crypto_argon2_config config{};
+    config.algorithm = CRYPTO_ARGON2_ID;
+    config.nb_blocks = params.memory_kib;
+    config.nb_passes = params.passes;
+    config.nb_lanes = params.lanes;
+
+    crypto_argon2_inputs inputs{};
+    inputs.pass = password;
+    inputs.pass_size = static_cast<uint32_t>(password_size);
+    inputs.salt = salt;
+    inputs.salt_size = static_cast<uint32_t>(salt_size);
+
+    // No secret key and no associated data: both would have to be shared with
+    // whoever needs to derive the same key, which makes them part of the salt
+    // with extra steps.
+    crypto_argon2_extras extras{};
+    extras.key = nullptr;
+    extras.key_size = 0;
+    extras.ad = nullptr;
+    extras.ad_size = 0;
+
+    // The work area is the memory cost, and Argon2 writes 1024 bytes per block.
+    std::vector<uint8_t> work(static_cast<size_t>(params.memory_kib) * 1024);
+
+    ::crypto_argon2(out, static_cast<uint32_t>(out_size), work.data(),
+                    config, inputs, extras);
+
+    // The work area holds derived state for the whole cost of the run, which is
+    // as close to the password as this function gets. Wiped rather than left for
+    // the allocator to hand to something else.
+    veil::wipe(work.data(), work.size());
+    return true;
+}
+
 void ed25519_keypair(uint8_t pub[32], uint8_t secret[64], const uint8_t seed[32]) {
     uint8_t seed_copy[32];
     std::memcpy(seed_copy, seed, 32);

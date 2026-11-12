@@ -62,6 +62,44 @@ void hmac_sha512_32(uint8_t out[32],
 void blake2b(uint8_t* out, size_t out_size,
              const uint8_t* message, size_t message_size);
 
+// ---- Password key derivation -------------------------------------------
+//
+// Argon2id, for turning a password into an encryption key.
+//
+// The password never leaves the device it was typed on: what goes to a server is
+// the *output*, encrypted under this key. So the server cannot verify a password
+// because it never sees one, and a database leak hands an attacker an Argon2id
+// result rather than a hash to compare against - which is the whole reason
+// Argon2 exists.
+//
+// The cost is that password strength is the only defence against an offline
+// attack on a stolen blob. Argon2id makes each guess expensive; it cannot make a
+// short password long.
+struct Argon2Params {
+    // Memory in KiB. 64 MiB is the OWASP minimum for Argon2id and is what a
+    // browser can afford once, at login.
+    uint32_t memory_kib = 64 * 1024;
+    uint32_t passes = 3;
+    uint32_t lanes = 2;
+};
+
+// Derives `out_size` bytes from a password and a salt.
+//
+// `salt` must be at least 8 bytes and should be per-account; a shared salt lets
+// one precomputation attack every account at once.
+//
+// Returns false when the parameters are outside what this build supports, rather
+// than silently using weaker ones: a caller that asked for 1 GiB and got 64 MiB
+// would believe its ciphertext was stronger than it is.
+bool argon2id(uint8_t* out, size_t out_size,
+              const uint8_t* password, size_t password_size,
+              const uint8_t* salt, size_t salt_size,
+              const Argon2Params& params = Argon2Params{});
+
+// The largest memory cost this build will honour, in KiB. Exposed so a caller can
+// ask for "the strongest available" without guessing at a constant.
+constexpr uint32_t kArgon2MaxMemoryKiB = 256 * 1024;
+
 // ---- Signatures --------------------------------------------------------
 void ed25519_keypair(uint8_t pub[32], uint8_t secret[64], const uint8_t seed[32]);
 void ed25519_sign(uint8_t sig[kSigSize],

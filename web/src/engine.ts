@@ -1,15 +1,17 @@
-/**
+﻿/**
  * The WebAssembly build of the protocol engine, behind the C ABI.
  *
  * The module is the same C++ the phone runs. Nothing in this file implements
  * any cryptography: it allocates buffers in the wasm heap, calls the ABI, and
- * copies the result back out. That is the whole design goal 鈥?one engine, three
+ * copies the result back out. That is the whole design goal 閳?one engine, three
  * clients, no second implementation to drift.
  *
  * Entropy deserves a note. A wasm module has no syscall and no /dev/urandom, so
  * before any engine is created this module installs crypto.getRandomValues as
- * the engine's RNG. If the browser refuses it 鈥?a non-secure origin disables it 鈥? * key generation fails rather than proceeding with predictable bytes.
+ * the engine's RNG. If the browser refuses it 閳?a non-secure origin disables it 閳? * key generation fails rather than proceeding with predictable bytes.
  */
+
+import { attachCrypto } from "./crypto.js";
 
 interface EmscriptenModule {
   HEAPU8: Uint8Array;
@@ -191,6 +193,33 @@ export enum SessionState {
 const utf8 = new TextEncoder();
 
 /**
+ * Turns a path into something `import()` will accept.
+ *
+ * `import("wasm/veil.js")` is not a relative path to the browser: a specifier
+ * that does not start with `./`, `../` or a scheme is a *bare specifier*, which
+ * means "look in node_modules via an import map" - and in a browser with no
+ * import map that fails with `Failed to resolve module specifier`. The dynamic
+ * import had the same problem with the previous hard-coded value only because it
+ * happened to start with a scheme; a relative path does not.
+ *
+ * `new URL(specifier, document.baseURI)` resolves it against the page, which is
+ * what a caller writing `"wasm/veil.js"` means. Anything already absolute - an
+ * `https:` URL from a CDN, or a `file:` URL from a test runner - is left alone,
+ * because `new URL` returns it unchanged.
+ */
+function resolveModuleUrl(specifier: string): string {
+  // A test runner in Node has no document, and its callers already pass absolute
+  // file: URLs, so the fallback only needs to not throw.
+  const base =
+    typeof document !== "undefined" && document.baseURI
+      ? document.baseURI
+      : undefined;
+
+  if (base === undefined) return specifier;
+  return new URL(specifier, base).href;
+}
+
+/**
  * A handle plus the scratch space a call needs.
  *
  * wasm has no garbage collector and this module deliberately does not hand out
@@ -204,7 +233,7 @@ export class VeilEngine {
   /**
    * Loads the module.
    *
-   * `wasmUrl` is a URL the page can fetch 鈥?in the browser it is a relative
+   * `wasmUrl` is a URL the page can fetch 閳?in the browser it is a relative
    * path that resolves against the document. `jsUrl` is where the Emscripten
    * glue lives, and is separate because the two play different games: the glue
    * is an ES module import (so it must be a real specifier), while the .wasm is
@@ -218,14 +247,18 @@ export class VeilEngine {
     if (VeilEngine.module) return;
 
     const jsUrl = options.jsUrl ?? wasmUrl.replace(/\.wasm$/, ".js");
-    const factory = (await import(/* @vite-ignore */ jsUrl))
+    const factory = (await import(/* @vite-ignore */ resolveModuleUrl(jsUrl)))
       .default as typeof createVeilModule;
 
     const mod = await factory({
       // Node cannot fetch a file:// URL, so a runner may hand the bytes in
       // directly. In a browser this is undefined and the module fetches.
       ...(options.wasmBinary ? { wasmBinary: options.wasmBinary } : {}),
-      locateFile: (path: string) => (path.endsWith(".wasm") ? wasmUrl : path),
+      locateFile: (path: string) =>
+        // Emscripten fetches this itself. A relative path would resolve against
+        // whatever it considers the base, which is not necessarily the document;
+        // resolving it here makes both halves of the module agree.
+        path.endsWith(".wasm") ? resolveModuleUrl(wasmUrl) : path,
       print: () => {},
       printErr: () => {},
     });
@@ -241,6 +274,14 @@ export class VeilEngine {
     mod._veil_install_web_rng();
 
     VeilEngine.module = mod;
+
+    // Argon2id lives in the engine's wasm because the browser has no
+    // implementation, and two implementations of a key-derivation function is
+    // two chances for them to disagree about a key. Attached here rather than
+    // imported by the caller so there is exactly one module instance: a second
+    // load would mean a second copy of Argon2's work area, and only one of them
+    // would be wiped on teardown.
+    attachCrypto(mod as unknown as Parameters<typeof attachCrypto>[0]);
   }
 
   /** The ABI version, so a stale .wasm is loud rather than subtle. */
@@ -631,7 +672,7 @@ export class VeilEngine {
     return this.withPeer(groupId, (ptr) => {
       const d = mod._malloc(record.length || 1);
       // The plaintext is always smaller than the record that carries it, so
-      // sizing from the frame needs no probe 鈥?which matters because a probe
+      // sizing from the frame needs no probe 閳?which matters because a probe
       // must not consume the message key.
       const out = mod._malloc(record.length || 1);
       const outLen = mod._malloc(4);

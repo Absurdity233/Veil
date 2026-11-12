@@ -50,6 +50,16 @@ const (
 	typePublishDevices = 0x0D
 	typeGetDevices     = 0x0E
 	typeDevices        = 0x0F
+
+	// Password vaults. See the note on the vaults table.
+	//
+	// These are the only types a client may use before authenticating, because a
+	// client restoring its identity cannot sign a challenge yet - that is the
+	// whole point of the vault.
+	typePutVault  = 0x10
+	typeGetVault  = 0x11
+	typeVaultData = 0x12
+	typeVaultAck  = 0x13
 )
 
 const (

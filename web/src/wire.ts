@@ -26,6 +26,12 @@ export const FrameType = {
   PUBLISH_DEVICES: 0x0d,
   GET_DEVICES: 0x0e,
   DEVICES: 0x0f,
+  // Password vaults. The only types usable before authenticating: restoring an
+  // identity is exactly the case where a client has nothing to sign with yet.
+  PUT_VAULT: 0x10,
+  GET_VAULT: 0x11,
+  VAULT_DATA: 0x12,
+  VAULT_ACK: 0x13,
 } as const;
 
 export type FrameTypeValue = (typeof FrameType)[keyof typeof FrameType];
