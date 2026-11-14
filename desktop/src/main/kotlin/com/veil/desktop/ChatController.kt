@@ -1345,18 +1345,35 @@ class Vault(private val dir: Path) {
         }
     }
 
+    /**
+     * Writes one file durably, with the tight mode applied before the content.
+     *
+     * `synchronized` because the crypto thread persists a session while the
+     * message store persists a transcript, and the two can name the same file.
+     * The temporary name is unique per write as well, so a second guard exists if
+     * the lock is ever removed: with a fixed "<name>.tmp", both writers delete
+     * and create the same path and the loser gets AccessDeniedException - which
+     * is exactly what happened on Linux, where the delete-then-create window is
+     * far narrower than on Windows.
+     */
+    @Synchronized
     private fun write(name: String, bytes: ByteArray) {
         val path = dir.resolve(name)
-        val tmp = dir.resolve("$name.tmp")
+        val tmp = Files.createTempFile(dir, "$name.", ".tmp")
 
-        // Create with the tight mode first, then write, then move into place:
-        // creating the file readable and fixing it afterwards leaves a window
-        // where the secrets are on disk with the wrong permissions.
-        Files.deleteIfExists(tmp)
-        Files.createFile(tmp)
-        restrictPermissions(tmp)
-        Files.write(tmp, bytes)
-        Files.move(tmp, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        try {
+            // Create with the tight mode first, then write, then move into place:
+            // creating the file readable and fixing it afterwards leaves a window
+            // where the secrets are on disk with the wrong permissions.
+            restrictPermissions(tmp)
+            Files.write(tmp, bytes)
+            Files.move(tmp, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        } catch (e: Exception) {
+            // A failed write must not leave its temporary file behind; nothing
+            // would pick it up, and it holds plaintext.
+            Files.deleteIfExists(tmp)
+            throw e
+        }
     }
 
     private fun restrictPermissions(path: Path) {
