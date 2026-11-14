@@ -1,6 +1,11 @@
 package com.veil.desktop
 
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermission
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 /**
@@ -16,6 +21,82 @@ import org.junit.Test
  * could arrive, so there is no escaping rule to get wrong later.
  */
 class TrayNotifierTest {
+
+    // ---- Vault permissions ------------------------------------------------
+
+    @Test
+    fun `the vault directory is created and writable`() {
+        // A regression test for a Linux-only failure: init() restricted the
+        // directory with "rw-------", which drops the execute bit. A directory
+        // without execute cannot be entered, so every create inside it failed
+        // with AccessDeniedException - including the temporary file a write
+        // needs. Windows ignores POSIX modes, so the mistake was invisible there.
+        val dir = Files.createTempDirectory("veil-vault-test")
+        try {
+            val vault = Vault(dir.resolve("state"))
+
+            // The property under test: a write succeeds, which requires the
+            // directory to be enterable. If permissions are wrong this throws.
+            vault.storeIdentity(ByteArray(96) { 0x11 })
+            assertTrue(Files.exists(dir.resolve("state").resolve("identity.bin")))
+        } finally {
+            dir.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `a vault file is not group or world readable`() {
+        // The other half of the same rule: files must stay private even though
+        // directories need the execute bit.
+        assumeTrue(
+            "POSIX permissions only",
+            java.io.File.separatorChar == '/',
+        )
+
+        val dir = Files.createTempDirectory("veil-vault-perm")
+        try {
+            val vault = Vault(dir.resolve("state"))
+            vault.storeIdentity(ByteArray(96) { 0x22 })
+
+            val file = dir.resolve("state").resolve("identity.bin")
+            val perms = Files.getPosixFilePermissions(file)
+
+            assertTrue("group must not read the identity",
+                PosixFilePermission.GROUP_READ !in perms)
+            assertTrue("others must not read the identity",
+                PosixFilePermission.OTHERS_READ !in perms)
+        } finally {
+            dir.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `concurrent writes to one vault do not collide`() {
+        // The temporary name is unique per write and the method is synchronized,
+        // so two threads writing different files at once must both succeed. With
+        // a fixed "<name>.tmp" one of them got AccessDeniedException.
+        val dir = Files.createTempDirectory("veil-vault-race")
+        try {
+            val vault = Vault(dir.resolve("state"))
+            val errors = java.util.Collections.synchronizedList(mutableListOf<Throwable>())
+
+            val threads = (0 until 8).map { i ->
+                Thread {
+                    try {
+                        vault.storeSession("peer$i", ByteArray(64) { i.toByte() })
+                    } catch (e: Throwable) {
+                        errors.add(e)
+                    }
+                }
+            }
+            threads.forEach { it.start() }
+            threads.forEach { it.join() }
+
+            assertEquals("no write should fail: $errors", 0, errors.size)
+        } finally {
+            dir.toFile().deleteRecursively()
+        }
+    }
 
     @Test
     fun `a headless environment reports no tray rather than failing`() {

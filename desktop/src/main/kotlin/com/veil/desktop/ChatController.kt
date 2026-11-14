@@ -1376,9 +1376,21 @@ class Vault(private val dir: Path) {
         }
     }
 
+    /**
+     * Tightens permissions on a file or a directory.
+     *
+     * A directory needs the execute bit and a file does not. Applying "rw-------"
+     * to a directory removes its execute bit, which means it cannot be entered -
+     * so every create inside it fails with AccessDeniedException. That is what
+     * happened on Linux: `Vault.init` restricted its own directory, and the first
+     * write afterwards could not create a temporary file in it.
+     *
+     * Windows ignores POSIX modes, so the mistake was invisible there.
+     */
     private fun restrictPermissions(path: Path) {
+        val mode = if (Files.isDirectory(path)) "rwx------" else "rw-------"
         try {
-            Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-------"))
+            Files.setPosixFilePermissions(path, PosixFilePermissions.fromString(mode))
         } catch (e: UnsupportedOperationException) {
             // Windows: POSIX modes do not apply. The file inherits the user
             // profile's ACL, which is the best a desktop can do without a
