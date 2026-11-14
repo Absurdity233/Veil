@@ -161,11 +161,14 @@ jobs:
         run: |
           cmake -S desktop -B build/abi -DCMAKE_BUILD_TYPE=Release
           cmake --build build/abi --parallel
-          # Where the library actually landed. The Gradle task searches several
-          # directories and it is worth seeing the answer in the log rather than
-          # inferring it from a linker error.
-          echo "--- build/abi ---"
+          echo "--- where it landed ---"
           find build/abi -name 'libveilc*' -o -name 'veilc*' | head
+          # The exported symbols, because a JNA UnsatisfiedLinkError is the same
+          # error whether the file is missing, unloadable, or present with every
+          # entry point hidden. Printing this separates those three.
+          echo "--- exported veil_ symbols ---"
+          nm -D --defined-only build/abi/libveilc.so 2>/dev/null | grep -c ' T veil_' || echo 0
+          nm -D --defined-only build/abi/libveilc.so 2>/dev/null | grep ' T veil_' | head -5 || true
 
       - name: Build the relay the tests start
         run: |
@@ -256,8 +259,11 @@ jobs:
       # same line.
       - name: Every test file is run
         run: |
-          on_disk=$(ls test/*.test.mjs | tr '\n' ' ' | sed 's/ *$//')
-          in_script=$(node -p "require('./package.json').scripts.test.match(/test\/[a-z0-9]+\.test\.mjs/g).join(' ')")
+          # Compare as sorted lists: the order in the script is the order the
+          # suites were written, and requiring the filesystem to enumerate in that
+          # order was the bug - `ls` sorts differently.
+          on_disk=$(ls test/*.test.mjs | sort | tr '\n' ' ' | sed 's/ *$//')
+          in_script=$(node -p "require('./package.json').scripts.test.match(/test\/[a-z0-9]+\.test\.mjs/g).sort().join(' ')")
           echo "on disk:   $on_disk"
           echo "in script: $in_script"
           if [ "$on_disk" != "$in_script" ]; then
