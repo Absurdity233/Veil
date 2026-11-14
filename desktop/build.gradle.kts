@@ -128,6 +128,16 @@ tasks.withType<Test>().configureEach {
         logger.lifecycle("test JNA path: $nativeLibDir")
         nativeLibDir.listFiles()?.forEach { logger.lifecycle("  ${it.name}") }
     }
+
+    // The JNA error is one line with a stack trace that points at the call site
+    // rather than at the loader. The actual message ("no libveilc in java.library.path"
+    // or "undefined symbol: ...") is what says which of the three possible failures
+    // happened, so it is printed in full.
+    testLogging {
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        showStackTraces = true
+        events("failed")
+    }
 }
 
 tasks.named<Jar>("jar") {
