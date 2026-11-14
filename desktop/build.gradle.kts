@@ -136,7 +136,9 @@ tasks.withType<Test>().configureEach {
     testLogging {
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
         showStackTraces = true
-        events("failed")
+        showExceptions = true
+        showCauses = true
+        events("failed", "passed")
     }
 }
 

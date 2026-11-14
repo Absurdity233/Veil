@@ -1192,12 +1192,25 @@ func (c *client) handlePublishPreKeys(payload []byte) error {
 		return err
 	}
 
-	return c.hub.store.PublishPreKeys(c.userID, preKeyRow{
+	if err := c.hub.store.PublishPreKeys(c.userID, preKeyRow{
 		SignedID:  signedID,
 		SignedPub: signedPub,
 		Signature: signature,
 		OneTime:   set.encode(),
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Acknowledged after the write, not before. A client that fetches a bundle
+	// immediately after publishing is otherwise racing this: without a reply it
+	// has no way to know the keys are readable, and the only alternative is a
+	// sleep long enough to be wrong on a slow machine.
+	env, err := frame(typePreKeysAck, nil)
+	if err != nil {
+		return err
+	}
+	c.enqueue(env)
+	return nil
 }
 
 func (c *client) handleGetBundle(payload []byte) error {

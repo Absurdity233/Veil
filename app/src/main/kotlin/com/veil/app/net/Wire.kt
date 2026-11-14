@@ -1,4 +1,4 @@
-package com.veil.app.net
+﻿package com.veil.app.net
 
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -44,6 +44,9 @@ object Wire {
     const val TYPE_GET_VAULT = 0x11
     const val TYPE_VAULT_DATA = 0x12
     const val TYPE_VAULT_ACK = 0x13
+    // Acknowledges a stored prekey publish, so a client can know its keys are
+    // readable rather than sleeping and hoping.
+    const val TYPE_PREKEYS_ACK = 0x14
 
     const val MAX_PAYLOAD = 1 shl 20
 

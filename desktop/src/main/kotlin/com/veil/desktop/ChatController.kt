@@ -368,7 +368,14 @@ class ChatController(private val stateDir: Path) {
         val oneTime = r.raw(r.remaining)
 
         if (client.publishPreKeys(signedId, signedPub, signature, oneTime)) {
-            hasPublishedPreKeys = true
+            // Confirm rather than assume. `send` returning true only means the
+            // frame was queued to the socket; the relay can still refuse it, and
+            // a client that believed it had published would go a whole session
+            // without a single bundle being available.
+            hasPublishedPreKeys = client.awaitPreKeysAck()
+            if (!hasPublishedPreKeys) {
+                _status.value = "the relay did not acknowledge this device's prekeys"
+            }
         }
     }
 

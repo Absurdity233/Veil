@@ -60,6 +60,15 @@ const (
 	typeGetVault  = 0x11
 	typeVaultData = 0x12
 	typeVaultAck  = 0x13
+
+	// Acknowledges that a prekey publish was stored.
+	//
+	// PUBLISH_PREKEYS had no reply, so a client could only guess whether its keys
+	// were available - and a client that fetches a bundle immediately after
+	// publishing was racing the relay's own write. That raced in the interop test
+	// on a fast machine and never on a slow one, which is the signature of a
+	// missing handshake rather than a flaky test.
+	typePreKeysAck = 0x14
 )
 
 const (

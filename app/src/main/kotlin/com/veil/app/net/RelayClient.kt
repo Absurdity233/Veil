@@ -72,6 +72,9 @@ class RelayClient(private val url: String) {
      */
     private val vaultReply = java.util.concurrent.ArrayBlockingQueue<Event>(1)
 
+    /** Prekey-publish acknowledgements. A channel because they can arrive early. */
+    private val preKeysAck = Channel<Boolean>(Channel.CONFLATED)
+
     // ---- Password vault ---------------------------------------------------
 
     /** Uploads a sealed vault, returning the generation the relay assigned. */
@@ -237,6 +240,8 @@ class RelayClient(private val url: String) {
                 }
                 Wire.TYPE_ERROR -> events.trySend(Event.Failed(r.string()))
 
+                Wire.TYPE_PREKEYS_ACK -> preKeysAck.trySend(true)
+
                 Wire.TYPE_VAULT_ACK -> vaultReply.offer(Event.VaultStored(r.u32()))
 
                 Wire.TYPE_VAULT_DATA -> {
@@ -267,6 +272,23 @@ class RelayClient(private val url: String) {
             .blob(oneTimeSet)
             .build()
         return send(Wire.TYPE_PUBLISH_PREKEYS, payload)
+    }
+
+    /**
+     * Waits for the relay to confirm a prekey publish.
+     *
+     * Returns false on timeout, which the caller treats as "not published" and
+     * retries on the next connect. Without this the only way to know was to
+     * sleep, and a sleep is wrong on whichever machine is slower.
+     */
+    suspend fun awaitPreKeysAck(timeoutMs: Long = 5_000): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (!isConnected) return false
+            val event = withTimeoutOrNull(200) { preKeysAck.receive() } ?: continue
+            if (event) return true
+        }
+        return false
     }
 
     fun requestBundle(userId: String): Boolean =

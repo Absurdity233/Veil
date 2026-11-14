@@ -549,10 +549,12 @@ class DesktopInteropTest {
             val published = client.publishPreKeys(signedId, signedPub, signature, oneTime)
             assertTrue("the prekeys must reach the relay", published)
 
-            // PUBLISH_PREKEYS is processed on the relay's reader goroutine, so
-            // a GET_BUNDLE sent immediately afterwards can arrive before the
-            // row exists. Give it a moment rather than racing it.
-            Thread.sleep(200)
+            // Wait for the relay to confirm the write rather than sleeping and
+            // hoping. The previous version slept 200 ms, which is a guess: it
+            // passes on a fast machine and fails on a loaded one, and neither
+            // outcome says anything about whether the code is correct.
+            val acked = kotlinx.coroutines.runBlocking { client.awaitPreKeysAck() }
+            assertTrue("the relay must acknowledge the prekey publish", acked)
         }
 
         fun fetchBundle(target: String): ByteArray? {

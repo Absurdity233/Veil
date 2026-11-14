@@ -300,7 +300,16 @@ class RelayInteropTest {
 
         fun publishPreKeys(signedId: Int, signedPub: ByteArray, signature: ByteArray,
                            oneTime: ByteArray) {
-            client.publishPreKeys(signedId, signedPub, signature, oneTime)
+            check(client.publishPreKeys(signedId, signedPub, signature, oneTime)) {
+                "publish was refused"
+            }
+            // Wait for the relay to confirm the write. A fetch issued before this
+            // could see the previous set, or none - which is what made this test
+            // pass locally and fail in CI, where the machine is faster and the
+            // window smaller but not zero.
+            check(kotlinx.coroutines.runBlocking { client.awaitPreKeysAck() }) {
+                "the relay did not acknowledge the prekey publish"
+            }
         }
 
         fun fetchBundle(userId: String): BundleInfo? {

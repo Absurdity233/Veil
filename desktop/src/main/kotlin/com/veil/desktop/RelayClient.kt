@@ -1,4 +1,4 @@
-﻿package com.veil.desktop
+package com.veil.desktop
 
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -161,6 +161,8 @@ class RelayClient(private val url: String) {
                 }
                 Wire.TYPE_ERROR -> events.trySend(Event.Failed(r.string()))
 
+                Wire.TYPE_PREKEYS_ACK -> preKeysAck.offer(true)
+
                 Wire.TYPE_VAULT_ACK -> {
                     val generation = r.u32()
                     vaultReply.offer(Event.VaultStored(generation))
@@ -190,6 +192,28 @@ class RelayClient(private val url: String) {
             Wire.TYPE_PUBLISH_PREKEYS,
             Writer().u32(signedId).blob(signedPub).blob(signature).blob(oneTimeSet).build(),
         )
+
+    /**
+     * Waits for the relay to confirm a prekey publish.
+     *
+     * Without this the only way to know the keys were readable was to sleep, and
+     * a sleep is wrong on whichever machine is slower - the interop test fetched
+     * a bundle immediately after publishing and raced the relay's own write.
+     */
+    suspend fun awaitPreKeysAck(timeoutMs: Long = 5_000): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (!isConnected) return false
+            // poll with a short timeout, on the I/O dispatcher: blocking the
+            // caller's thread inside a suspend function would be a lie about what
+            // suspend means.
+            val reply = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                preKeysAck.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } ?: continue
+            if (reply) return true
+        }
+        return false
+    }
 
     fun requestBundle(userId: String): Boolean =
         send(Wire.TYPE_GET_BUNDLE, Writer().string(userId).build())
@@ -286,6 +310,9 @@ class RelayClient(private val url: String) {
      * first, and a lost message is worse than a slow account dialog.
      */
     private val vaultReply = java.util.concurrent.ArrayBlockingQueue<Event>(1)
+
+    /** Prekey-publish acknowledgements, kept off the event channel. */
+    private val preKeysAck = java.util.concurrent.ArrayBlockingQueue<Boolean>(1)
 
     /** Waits up to [timeoutMs] for the vault reply that a request asked for. */
     private suspend fun awaitVaultReply(timeoutMs: Long): Event? {
