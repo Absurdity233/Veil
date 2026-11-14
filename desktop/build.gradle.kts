@@ -42,15 +42,66 @@ tasks.register<Copy>("stageNativeLibrary") {
 
     // Candidate locations, in the order a developer is likely to have them:
     // the CMake build tree, then a manual build under core-native/build.
+    //
+    // The list is scanned at execution time rather than at configuration time.
+    // Filtering at configuration time was the bug that made CI fail on every
+    // push while passing locally: on a fresh checkout the CMake output does not
+    // exist yet when Gradle configures, so `from()` was given an empty list and
+    // the copy silently staged nothing. Windows hid it because
+    // `cmake --build` had already run in the same working tree from an earlier
+    // local build; a CI runner starts clean.
     val candidates = listOf(
         rootProject.file("build/abi"),
+        rootProject.file("build/abi/Release"),
         rootProject.file("core-native/build/abi"),
         rootProject.file("core-native/src/main/cpp/build"),
     )
 
-    from(candidates.filter { it.exists() })
-    include("libveilc.so", "libveilc.dylib", "veilc.dll", "veil.dll")
+    doFirst {
+        candidates.filter { it.exists() }.forEach { dir ->
+            logger.lifecycle("staging native libraries from $dir")
+        }
+    }
+
+    from(candidates) {
+        include("libveilc.so", "libveilc.dylib", "veilc.dll", "veil.dll", "libveilc.dylib")
+        // A missing candidate directory is normal, not an error: the copy task
+        // is asked to look in several places and only one of them will have run.
+        duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
     into(nativeLibDir)
+
+    // JNA is asked for "veilc", which becomes veilc.dll / libveilc.so. Moving
+    // the library to exactly that name is what makes the loader find the staged
+    // copy; the same platform difference that hid the configuration-time bug
+    // also means the file on disk is not always named what JNA looks for.
+    doLast {
+        val staged = nativeLibDir.listFiles() ?: return@doLast
+        for (file in staged) {
+            val wanted = when (file.extension.lowercase()) {
+                "so" -> "libveilc.so"
+                "dylib" -> "libveilc.dylib"
+                "dll" -> "veilc.dll"
+                else -> continue
+            }
+            if (file.name != wanted) {
+                val target = File(nativeLibDir, wanted)
+                file.copyTo(target, overwrite = true)
+                file.delete()
+                logger.lifecycle("renamed ${file.name} -> $wanted")
+            }
+        }
+
+        if (staged.none { it.extension.lowercase() in setOf("so", "dylib", "dll") }) {
+            // Loud rather than silent: the failure mode this replaces was a JNA
+            // UnsatisfiedLinkError forty seconds later, which said nothing about
+            // why the file was missing.
+            logger.warn(
+                "no native library was staged into $nativeLibDir - run the CMake " +
+                    "build for :desktop, or the JNA test will fail with a link error",
+            )
+        }
+    }
 }
 
 tasks.named<JavaExec>("run") {

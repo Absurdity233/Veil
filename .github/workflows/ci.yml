@@ -1,4 +1,4 @@
-﻿name: ci
+name: ci
 
 on:
   push:
@@ -73,8 +73,37 @@ jobs:
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
 
+      - name: Check the source list is complete
+        run: |
+          # Every .cpp under veil/ that the engine itself needs has to appear in
+          # the compile line below, or the fuzzer links against a partial engine
+          # and fails with an undefined reference to a symbol only some code path
+          # reaches. That is how group.cpp went missing: the unit tests do not
+          # exercise every symbol the engine references, so the ordinary build
+          # stayed green while this one did not link.
+          #
+          # veil_c.cpp is excluded by name: it is the other language binding, not
+          # part of the engine, and the fuzzer drives the C++ API directly.
+          missing=0
+          for f in core-native/src/main/cpp/veil/*.cpp; do
+            base=$(basename "$f")
+            case "$base" in
+              veil_c.cpp) continue ;;
+            esac
+            if ! grep -q "veil/$base" .github/workflows/ci.yml; then
+              echo "::error::veil/$base is not in the fuzzer's compile line"
+              missing=1
+            fi
+          done
+          exit $missing
+
       - name: Build fuzzer
         run: |
+          # Every translation unit the engine needs, listed explicitly because
+          # this build does not go through CMake. The list was missing
+          # group.cpp, so the link failed on `GroupMembership::signedPayload`
+          # - a symbol only group messages and invitations reach, which is why
+          # the ordinary unit-test build did not surface it.
           clang++ -g -O1 -std=c++17 -fsanitize=fuzzer,address \
             -Icore-native/src/main/cpp \
             -Icore-native/src/main/cpp/third_party/monocypher \
@@ -83,6 +112,7 @@ jobs:
             core-native/src/main/cpp/veil/keys.cpp \
             core-native/src/main/cpp/veil/random.cpp \
             core-native/src/main/cpp/veil/ratchet.cpp \
+            core-native/src/main/cpp/veil/group.cpp \
             core-native/src/main/cpp/veil/engine.cpp \
             core-native/src/main/cpp/third_party/monocypher/monocypher.c \
             core-native/src/main/cpp/third_party/monocypher/monocypher-ed25519.c \
@@ -173,8 +203,16 @@ jobs:
       - name: Build the wasm module
         run: npm run build:wasm
 
+      # The tests import from dist/, so the compiler has to emit - `--noEmit`
+      # type-checks and produces nothing, which is why every web job failed with
+      # "Cannot find module dist/app.js". The check and the emit are separate
+      # steps so a type error is reported as itself rather than as a missing
+      # module four steps later.
       - name: Type-check
         run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Compile for the tests
+        run: npx tsc -p tsconfig.json
 
       - name: Bundle
         run: npm run build:bundle
@@ -299,17 +337,28 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Install NDK and CMake
+      # The runner image already carries an Android SDK and the NDK. Installing
+      # them with setup-android was slower and broke: the action judged the
+      # preinstalled cmdline-tools to be the wrong version, downloaded another,
+      # and then failed on the NDK install. Using what is installed avoids both
+      # the download and the version check that was wrong about it.
+      - name: Locate the Android SDK
         run: |
-          sdkmanager --install "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME/ndk" || true
+
+      - name: Accept licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Assemble
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleDebug --console=plain
 
+      # Lint is separate from assemble because the two fail for different
+      # reasons, and a single step that does both makes the log say "build
+      # failed" whether the code does not compile or merely has a warning.
       - name: Lint
         run: ./gradlew :app:lintDebug --console=plain
 
