@@ -31,6 +31,11 @@ const (
 	// How long a graceful shutdown waits for connections to close politely
 	// before the process exits anyway.
 	drainGraceful = 5 * time.Second
+
+	// How long goodbye() waits for writeLoop to put the close frame on the wire.
+	// Shorter than drainGraceful because it is one write to one socket, and a
+	// peer that cannot accept it in a second is not going to accept it in five.
+	goodbyeWait = time.Second
 )
 
 // allowedOrigins is an explicit allow-list. Browsers send an Origin header on
@@ -435,11 +440,13 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := &client{
-		hub:    h,
-		conn:   conn,
-		send:   make(chan []byte, 256),
-		closed: make(chan struct{}),
-		limit:  newRateLimiter(sendBurst, sendRefill),
+		hub:          h,
+		conn:         conn,
+		send:         make(chan []byte, 256),
+		closed:       make(chan struct{}),
+		goodbyeCh:    make(chan struct{}),
+		wroteGoodbye: make(chan struct{}),
+		limit:        newRateLimiter(sendBurst, sendRefill),
 	}
 	go c.writeLoop()
 	c.readLoop()
@@ -464,6 +471,13 @@ type client struct {
 	send    chan []byte
 	closed  chan struct{}
 	closeMu sync.Once
+
+	// A polite shutdown has to be written by the one writer, so it is signalled
+	// rather than written. goodbyeCh tells writeLoop to send a close frame;
+	// wroteGoodbye reports that it did, so goodbye can wait for it to be on the
+	// wire instead of closing the socket underneath it.
+	goodbyeCh    chan struct{}
+	wroteGoodbye chan struct{}
 
 	// ---- HELLO challenge ----
 	//
@@ -556,12 +570,29 @@ func (c *client) shutdown() {
 
 // goodbye closes politely: a real close frame with "going away", which tells
 // the client to reconnect instead of assuming the network died.
+//
+// The frame is written by writeLoop, not here. gorilla/websocket allows one
+// concurrent writer, and calling WriteMessage from the shutdown goroutine while
+// writeLoop was mid-frame is a data race - the -race detector saw it on the ping
+// path, where the ticker fired during shutdown and overlapped the close frame. A
+// test that only checks that the close frame arrives would not have caught it;
+// running the suite with -race did.
+//
+// So this signals, and lets the existing writer do the writing. The wait keeps
+// the caller's contract: goodbye returns once the frame is on the wire or the
+// deadline passed, because Shutdown's next step is to stop accepting.
 func (c *client) goodbye() {
 	c.closeMu.Do(func() {
-		// Best effort: the peer may already be gone.
-		_ = c.conn.SetWriteDeadline(time.Now().Add(time.Second))
-		_ = c.conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseGoingAway, "relay shutting down"))
+		// Closed rather than sent, so the signal works even if writeLoop is
+		// about to exit; a panic from closing twice cannot happen because
+		// closeMu runs this once.
+		close(c.goodbyeCh)
+
+		select {
+		case <-c.wroteGoodbye:
+		case <-time.After(goodbyeWait):
+		}
+
 		close(c.closed)
 		_ = c.conn.Close()
 	})
@@ -578,6 +609,16 @@ func (c *client) writeLoop() {
 		select {
 		case <-c.closed:
 			return
+
+		case <-c.goodbyeCh:
+			// The one place a close frame is written, so it cannot overlap
+			// another write.
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			_ = c.conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseGoingAway, "relay shutting down"))
+			close(c.wroteGoodbye)
+			return
+
 		case b := <-c.send:
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.BinaryMessage, b); err != nil {

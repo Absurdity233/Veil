@@ -1,4 +1,4 @@
-#include "veil/engine.h"
+﻿#include "veil/engine.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -417,11 +417,11 @@ bool Engine::importPeerRegistry(const uint8_t* data, size_t size) {
 
     std::map<std::string, std::array<uint8_t, kIdentitySize>> loaded;
     for (uint32_t i = 0; i < count; ++i) {
-        if (size < off + 4) return false;
+        if (off > size || size - off < 4) return false;
         const uint32_t id_len = get_u32(data + off);
         off += 4;
         if (id_len == 0 || id_len > 128) return false;
-        if (size < off + id_len + kIdentitySize) return false;
+        if (off > size || id_len > size - off || size - off - id_len < kIdentitySize) return false;
 
         std::string peer(reinterpret_cast<const char*>(data + off), id_len);
         off += id_len;

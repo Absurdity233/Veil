@@ -161,6 +161,11 @@ jobs:
         run: |
           cmake -S desktop -B build/abi -DCMAKE_BUILD_TYPE=Release
           cmake --build build/abi --parallel
+          # Where the library actually landed. The Gradle task searches several
+          # directories and it is worth seeing the answer in the log rather than
+          # inferring it from a linker error.
+          echo "--- build/abi ---"
+          find build/abi -name 'libveilc*' -o -name 'veilc*' | head
 
       - name: Build the relay the tests start
         run: |
@@ -170,6 +175,9 @@ jobs:
       - name: Test
         run: |
           chmod +x gradlew
+          # What the Gradle task staged, before the tests ask JNA to load it.
+          echo "--- staged ---"
+          find desktop/build/native -type f 2>/dev/null || echo "(nothing staged)"
           ./gradlew :desktop:test --console=plain
 
   # The web client: the engine compiled to wasm, plus the TypeScript that drives
@@ -239,17 +247,21 @@ jobs:
             test/notify.test.mjs \
             test/e2e.test.mjs
 
-      # A guard for the problem above: the count of *.test.mjs files must equal
-      # the count named in the step before it. Adding a test file without adding
-      # it to the run is a silent gap, and this turns it into a red build.
+      # A guard for the problem above: the suites this job runs must be the
+      # suites that exist. Adding a test file without adding it to the run is a
+      # silent gap, and this turns it into a red build.
+      #
+      # The source of truth is package.json's own test script, so there is one
+      # list rather than two that can drift. `npm test` and this step read the
+      # same line.
       - name: Every test file is run
         run: |
-          on_disk=$(ls test/*.test.mjs | wc -l)
-          named=$(grep -o 'test/[a-z0-9]*\.test\.mjs' .github/workflows/ci.yml | sort -u | wc -l)
-          echo "test files on disk: $on_disk, named in ci.yml: $named"
-          if [ "$on_disk" -ne "$named" ]; then
-            echo "::error::a test file exists that ci.yml does not run"
-            ls test/*.test.mjs
+          on_disk=$(ls test/*.test.mjs | tr '\n' ' ' | sed 's/ *$//')
+          in_script=$(node -p "require('./package.json').scripts.test.match(/test\/[a-z0-9]+\.test\.mjs/g).join(' ')")
+          echo "on disk:   $on_disk"
+          echo "in script: $in_script"
+          if [ "$on_disk" != "$in_script" ]; then
+            echo "::error::the suites on disk and the suites npm test runs differ"
             exit 1
           fi
 

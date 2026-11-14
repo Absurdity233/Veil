@@ -1,4 +1,4 @@
-#include "veil/ratchet.h"
+﻿#include "veil/ratchet.h"
 
 #include <cstring>
 
@@ -639,7 +639,7 @@ bool Session::deserialize(const uint8_t* data, size_t size) {
     skipped_.clear();
     skipped_total_ = 0;
     for (uint32_t i = 0; i < peer_count; ++i) {
-        if (size < off + 32 + 4) return false;
+        if (off > size || size - off < 32 + 4) return false;
         std::array<uint8_t, 32> peer_key;
         std::memcpy(peer_key.data(), data + off, 32); off += 32;
         uint32_t count = get_u32(data + off); off += 4;
@@ -648,7 +648,7 @@ bool Session::deserialize(const uint8_t* data, size_t size) {
 
         std::map<uint32_t, std::array<uint8_t, 32>> bucket;
         for (uint32_t j = 0; j < count; ++j) {
-            if (size < off + 4 + 32) return false;
+            if (off > size || size - off < 4 + 32) return false;
             uint32_t idx = get_u32(data + off); off += 4;
             std::array<uint8_t, 32> mk;
             std::memcpy(mk.data(), data + off, 32); off += 32;

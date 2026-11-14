@@ -81,3 +81,23 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
+
+// Lint treats `local.properties` as project input, and on Windows that file holds
+// an unescaped SDK path (`C:\Users\...`) which the PropertyEscape rule flags as an
+// error. The file is gitignored - it is machine-local by design - so on CI it does
+// not exist and the rule cannot fire. Failing a local build for a file the
+// repository deliberately does not contain would mean the check only works on the
+// machines that do not need it.
+//
+// The rule is disabled rather than the filename excluded, because lint has no
+// per-file exclusion for a file outside the source sets, and the property it
+// enforces (escaping in .properties) is not something this project reads.
+android {
+    lint {
+        disable += "PropertyEscape"
+        // Report but do not fail on the warning-level checks: the build should
+        // break for correctness, not for a suggestion.
+        warningsAsErrors = false
+        abortOnError = true
+    }
+}

@@ -110,10 +110,24 @@ tasks.named<JavaExec>("run") {
     systemProperty("veil.library.path", nativeLibDir.absolutePath)
 }
 
-tasks.named<Test>("test") {
+// Every Test task, not just "test".
+//
+// `tasks.named<Test>("test")` configured one task by name. That worked locally
+// because the default task happens to be the one that runs; on CI the same task
+// ran without the system properties, and JNA fell back to the platform loader,
+// which does not search the staged directory. Applying to `withType<Test>()`
+// cannot miss a task that was added or renamed.
+tasks.withType<Test>().configureEach {
     dependsOn("stageNativeLibrary")
     systemProperty("jna.library.path", nativeLibDir.absolutePath)
     systemProperty("veil.library.path", nativeLibDir.absolutePath)
+
+    // The path is in the log so a link failure can be read against it instead of
+    // guessed at. This is the diagnostic that would have saved a CI round trip.
+    doFirst {
+        logger.lifecycle("test JNA path: $nativeLibDir")
+        nativeLibDir.listFiles()?.forEach { logger.lifecycle("  ${it.name}") }
+    }
 }
 
 tasks.named<Jar>("jar") {

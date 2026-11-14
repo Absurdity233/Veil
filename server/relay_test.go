@@ -1510,6 +1510,81 @@ func TestShutdownClosesSocketsCleanly(t *testing.T) {
 	}
 }
 
+func TestShutdownWritesCloseFrameOnce(t *testing.T) {
+	// A regression test for a real data race, written so that it fails on a
+	// machine that cannot run -race (which needs a C compiler this project's
+	// build does not always have).
+	//
+	// The race was: goodbye() called conn.WriteMessage from the shutdown
+	// goroutine while writeLoop was mid-frame. gorilla/websocket allows one
+	// concurrent writer, and the detector found it on the ping path - a ticker
+	// firing during shutdown overlapping the close frame.
+	//
+	// What this asserts is the shape that makes the race impossible: the close
+	// frame is produced by writeLoop, and goodbye only signals it. If a future
+	// change puts WriteMessage back into goodbye, goodbyeCh stops being consumed
+	// and goodbye blocks until its deadline - which shows up here as a slow
+	// shutdown rather than as an intermittent crash in production.
+	h := newHarness(t)
+	c := h.dial(t, "alice", newTestIdentity(t, 71))
+
+	// A frame in flight when the shutdown starts: this is the overlap the race
+	// detector caught, made deterministic.
+	_ = c.conn.WriteMessage(websocket.BinaryMessage,
+		append([]byte{1, typeGetBundle, 0, 0, 0, 4}, []byte("self")...))
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.hub.Shutdown(context.Background())
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown did not finish: goodbye is waiting for a close frame " +
+			"that writeLoop never wrote")
+	}
+
+	if elapsed := time.Since(start); elapsed >= goodbyeWait {
+		t.Fatalf("shutdown took %v: the close frame was not written by writeLoop",
+			elapsed)
+	}
+}
+
+func TestGoodbyeIsIdempotent(t *testing.T) {
+	// closeMu makes goodbye run once, so a double shutdown - which happens when
+	// readLoop and writeLoop both exit at the same moment - must not panic by
+	// closing the signal channel twice.
+	h := newHarness(t)
+	_ = h.dial(t, "alice", newTestIdentity(t, 72))
+
+	// The server-side client, not the test wrapper: goodbye is what the hub
+	// calls, and it is the one whose channel must not be closed twice.
+	sessions := h.hub.sessions("alice")
+	if len(sessions) != 1 {
+		t.Fatalf("expected one connection, got %d", len(sessions))
+	}
+	c := sessions[0]
+
+	done := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			c.goodbye()
+			done <- struct{}{}
+		}()
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a concurrent goodbye blocked")
+		}
+	}
+}
+
 // ---- Outbox paging -----------------------------------------------------
 
 // floor the ceiling for the duration of one test, so a test can flood the

@@ -269,7 +269,7 @@ bool PreKeyBundle::deserialize(PreKeyBundle& out, const uint8_t* data, size_t si
     out.one_time_id = 0;
     std::memset(out.one_time_pub, 0, sizeof(out.one_time_pub));
     if (out.has_one_time) {
-        if (size < off + 4 + 32) return false;
+        if (off > size || size - off < 4 + 32) return false;
         out.one_time_id = get_u32(data + off); off += 4;
         std::memcpy(out.one_time_pub, data + off, 32);
     }
@@ -319,7 +319,14 @@ void putSignedPreKey(Bytes& out, const SignedPreKey& spk) {
 }
 
 bool readSignedPreKey(SignedPreKey& out, const uint8_t* data, size_t size, size_t& off) {
-    if (size < off + 4 + kKeySize + kKeySize + kSigSize) return false;
+    // `size - off < X` rather than `size < off + X`: the second form overflows
+    // when off is near SIZE_MAX, and an overflowed comparison reads as "there is
+    // room" - which turns a bounds check into a no-op. off is bounded in practice
+    // by the callers, but a check that is only correct for values it happens to
+    // see is not a check.
+    const size_t need = 4 + kKeySize + kKeySize + kSigSize;
+    if (off > size || size - off < need) return false;
+
     out.id = get_u32(data + off); off += 4;
     std::memcpy(out.pub, data + off, kKeySize); off += kKeySize;
     std::memcpy(out.priv, data + off, kKeySize); off += kKeySize;
@@ -368,9 +375,19 @@ bool PreKeys::deserialize(const uint8_t* data, size_t size) {
     if (!readSignedPreKey(current, data, size, off)) return false;
     if (current.id == 0 || current.id >= next_signed_id) return false;
 
+    // Every read below is range-checked against `size` before it happens.
+    //
+    // The check at the top of this function only guarantees room for the *first*
+    // signed prekey. Once `readSignedPreKey` advances `off`, and again after the
+    // retired block, the remaining length is whatever the input happened to
+    // contain - and `get_u32` reads four bytes without looking. The fuzzer found
+    // this as a heap-buffer-overflow reading one byte past a 272-byte input, on
+    // a path that a corrupted or hostile prekey state from the relay reaches.
+    if (off > size || size - off < 1) return false;
     has_retired = data[off++] != 0;
     if (has_retired && !readSignedPreKey(retired, data, size, off)) return false;
 
+    if (off > size || size - off < 4) return false;
     uint32_t count = get_u32(data + off); off += 4;
     // Each entry is a fixed size, so a count that cannot fit is malformed
     // rather than merely large.
@@ -379,10 +396,10 @@ bool PreKeys::deserialize(const uint8_t* data, size_t size) {
     one_time.clear();
     one_time.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
-        if (size < off + 4) return false;
+        if (off > size || size - off < 4) return false;
         OneTimePreKey ot;
         ot.id = get_u32(data + off); off += 4;
-        if (size < off + kKeySize * 2 + 1) return false;
+        if (off > size || size - off < kKeySize * 2 + 1) return false;
         std::memcpy(ot.pub, data + off, kKeySize); off += kKeySize;
         std::memcpy(ot.priv, data + off, kKeySize); off += kKeySize;
         ot.consumed = data[off++] != 0;

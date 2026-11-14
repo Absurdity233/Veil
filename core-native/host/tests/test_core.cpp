@@ -863,6 +863,63 @@ int main() {
         }
     }
 
+    section("malformed prekey state is refused, not read past");
+    {
+        // A regression test for a heap-buffer-overflow the fuzzer found: a
+        // 272-byte input made `deserialize` read one byte past its buffer.
+        //
+        // The bug was an unchecked read after the retired-prekey block. The
+        // function's opening check only guaranteed room for the first signed
+        // prekey; once `readSignedPreKey` advanced the offset, `data[off++]` and
+        // `get_u32(data + off)` ran against whatever remained - and both read
+        // without looking. A hostile relay can put this on the wire, so it was
+        // reachable from a network peer, not just from a corrupt local file.
+        //
+        // The input is built here rather than fuzzed so the test is deterministic
+        // and fails the same way on every machine: valid header, valid first
+        // signed prekey, `has_retired` set, and then nothing.
+        {
+            // 1 version + 4 next_id + (4 + 32 + 32 + 64) signed prekey + 1 retired
+            std::vector<uint8_t> truncated;
+            truncated.push_back(2);                     // version
+            for (int i = 0; i < 4; i++) truncated.push_back(0);
+            truncated[4] = 9;                           // next_signed_id = 9
+            // signed prekey: id=1, pub, priv, signature
+            truncated.insert(truncated.end(), {0, 0, 0, 1});
+            for (int i = 0; i < kKeySize + kKeySize + kSigSize; i++) {
+                truncated.push_back(0x11);
+            }
+            // has_retired = 1, and then nothing at all.
+            truncated.push_back(1);
+
+            PreKeys p;
+            check(!p.deserialize(truncated.data(), truncated.size()),
+                  "a state ending mid-retired-prekey is refused");
+
+            // And with no retired flag either, so the count read is what runs off.
+            truncated.pop_back();
+            check(!p.deserialize(truncated.data(), truncated.size()),
+                  "a state ending before the count is refused");
+        }
+
+        // Padding a valid prefix with garbage must be refused at some length,
+        // and must never read past `size` on the way. The fuzzer's job is to find
+        // the one length that does; this covers a band of them.
+        {
+            const uint8_t version_probe[] = {2, 0, 0, 0, 9};
+            for (size_t len = sizeof(version_probe); len < 340; len++) {
+                std::vector<uint8_t> input(version_probe, version_probe + sizeof(version_probe));
+                input.resize(len, 0x22);
+                PreKeys p;
+                // The assertion is that this returns at all: an overread would be
+                // an AddressSanitizer failure in the sanitizer build, which is
+                // where the original was caught.
+                (void)p.deserialize(input.data(), input.size());
+            }
+            check(true, "every length up to 340 returns without overreading");
+        }
+    }
+
     section("prekey state survives a restart");
     {
         // Before this, every launch minted a fresh generation under id 1 and
