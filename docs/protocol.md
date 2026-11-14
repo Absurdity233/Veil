@@ -24,8 +24,19 @@ producing a partially populated message.
 | `AUTH_RESPONSE` | client → relay | Ed25519 signature over that nonce |
 | `HELLO_OK` | relay → client | id bound; the connection is usable |
 | `PUBLISH_PREKEYS` | client → relay | store the signed prekey and one-time prekeys |
+| `PREKEYS_ACK` | relay → client | the publish was stored and is readable |
 | `GET_BUNDLE` | client → relay | fetch a peer's prekey bundle |
 | `BUNDLE` | relay → client | identity, signed prekey, one one-time prekey |
+
+`PREKEYS_ACK` exists because `PUBLISH_PREKEYS` had no reply. A client could only
+assume its keys were available, and a client that fetched a bundle immediately
+after publishing was racing the relay's own write — which is a bug that passes on
+a fast machine and fails on a loaded one. It is framed *after* the store write, so
+the acknowledgement means "readable", not "received".
+
+Without it, a relay that refused the frame left the client believing it had
+published for the rest of the session, and its peers saw "no bundle" with nothing
+to explain it.
 | `SEND` | client → relay | opaque body for a recipient |
 | `DELIVER` | relay → client | `[8] sequence \| [sender] \| [body]` |
 | `MORE_PENDING` | relay → client | the last page was full; the next ACK pulls more |

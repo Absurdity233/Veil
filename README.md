@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 # Veil
 
@@ -86,10 +86,11 @@ to the reasoning.
 | | |
 |---|---|
 | Protocol engine | C++17, no I/O, and no allocation between handshake and message |
-| Primitive layer | vendored Monocypher 鈥?X25519, XChaCha20-Poly1305, Ed25519, HKDF-SHA512, BLAKE2b |
+| Primitive layer | vendored Monocypher — X25519, XChaCha20-Poly1305, Ed25519, HKDF-SHA512, BLAKE2b, Argon2id |
 | Relay | Go, single static binary, distroless image, non-root, read-only root |
-| Clients | Android (JNI), desktop (JNA), browser (121 KB wasm) |
-| Tests | 226 host + 62 C ABI assertions, 29 relay tests, 13 interop, 24 web, 8 fuzz targets |
+| Clients | Android (JNI), desktop (JNA), browser (wasm) |
+| Tests | 461 host + 216 C ABI, 52 relay, 59 web, 17 desktop, 3 interop, 8 fuzz targets |
+| CI | 9 jobs: host, asan+ubsan, fuzz, C ABI, relay, interop, web, desktop, android |
 | Wire overhead | 257 bytes on the first frame (prekey header), 57 bytes thereafter |
 
 ## Quick start
