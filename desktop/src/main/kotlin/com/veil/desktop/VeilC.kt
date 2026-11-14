@@ -169,19 +169,21 @@ interface VeilC : Library {
          * The search order is deliberate: an explicit `veil.library.path`
          * property first, so a test or a packaged build can point at a staged
          * copy, then whatever the platform loader finds.
+         *
+         * `OPTION_OPEN_FLAGS` is deliberately *not* set. It used to be set to 0
+         * whenever a path was given, on the reasoning that the path already said
+         * where to look. On Windows that is harmless - LoadLibrary ignores the
+         * flags - but on Linux JNA passes the value straight to dlopen, and
+         * `dlopen(path, 0)` is EINVAL: "invalid mode for dlopen(): Invalid
+         * argument". So the library loaded everywhere except the platform the CI
+         * runs on, which is the worst place for a difference like that to hide.
+         *
+         * Leaving the option out lets JNA use its default (RTLD_LAZY), which is
+         * what every other JNA user gets.
          */
-        fun load(): VeilC {
-            val explicit = System.getProperty("veil.library.path")
-            val options = if (explicit != null) {
-                mapOf(Library.OPTION_OPEN_FLAGS to 0)
-            } else {
-                emptyMap()
-            }
-
-            return Native.load(LIBRARY_NAME, VeilC::class.java, mapOf(
-                Library.OPTION_STRING_ENCODING to Charsets.UTF_8.name(),
-            ) + options)
-        }
+        fun load(): VeilC = Native.load(LIBRARY_NAME, VeilC::class.java, mapOf(
+            Library.OPTION_STRING_ENCODING to Charsets.UTF_8.name(),
+        ))
 
         private val LIBRARY_NAME: String =
             System.getProperty("veil.library.name") ?: "veilc"
